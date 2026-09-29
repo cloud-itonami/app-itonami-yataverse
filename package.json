@@ -1,0 +1,12 @@
+{
+  "name": "@kotoba-lang/yataverse",
+  "version": "0.1.0",
+  "description": "CLI and MCP server for the yataverse bytes plane (formerly kotobase): content-addressed blocks, verified on read and after every write.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "bin": { "yataverse": "bin/yataverse.mjs" },
+  "engines": { "node": ">=18" },
+  "files": ["bin", "src", "README.md", "LICENSE"],
+  "scripts": { "test": "node --test \"test/*.test.mjs\"" },
+  "repository": { "type": "git", "url": "git+https://github.com/kotoba-lang/yataverse.git" }
+}
