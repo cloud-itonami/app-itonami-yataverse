@@ -7,6 +7,6 @@
   "bin": { "yataverse": "bin/yataverse.mjs" },
   "engines": { "node": ">=18" },
   "files": ["bin", "src", "README.md", "LICENSE"],
-  "scripts": { "test": "node --test \"test/*.test.mjs\"" },
+  "scripts": { "test": "node --test" },
   "repository": { "type": "git", "url": "git+https://github.com/kotoba-lang/yataverse.git" }
 }
