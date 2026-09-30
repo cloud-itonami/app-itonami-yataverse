@@ -7,6 +7,7 @@ import { rawCid } from './cid.mjs';
 import { loadConfig, status } from './config.mjs';
 import { makeAuthorizer } from './auth.mjs';
 import { makeClient } from './client.mjs';
+import { makeAdmin, adminStatus } from './admin.mjs';
 
 const SERVER = { name: 'yataverse', version: '0.1.0' };
 const PROTOCOL = '2024-11-05';
@@ -31,7 +32,27 @@ export const TOOLS = [
     inputSchema: { type: 'object', properties: { cid: str('CIDv1 (base32)') }, required: ['cid'], additionalProperties: false } },
   { name: 'yataverse_put', description: `Publish content (up to ${PUT_CAP} bytes) as a block, then read it back and verify. This writes to a SHARED, content-addressed plane and cannot be undone; requires confirm=true and a configured authorisation.`,
     inputSchema: { type: 'object', properties: { ...CONTENT, confirm: { type: 'boolean', description: 'must be true' } }, required: ['confirm'], additionalProperties: false } },
+  // --- Authn administration. Mutating tools need confirm=true. The one-time service-account secret is
+  // stored 0600 on this machine and NEVER returned: results carry metadata only.
+  { name: 'yataverse_admin_status', description: 'Whether an admin key exists on this machine, its did:key, and whether a session exists. Never a secret.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'yataverse_admin_login', description: 'Sign in to Authn with this machine\'s admin key. The FIRST sign-in creates the account. Requires confirm=true.',
+    inputSchema: { type: 'object', properties: { confirm: { type: 'boolean', description: 'must be true' } }, required: ['confirm'], additionalProperties: false } },
+  { name: 'yataverse_tenant_list', description: 'Tenants the signed-in account belongs to.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'yataverse_tenant_create', description: 'Create a tenant (the signed-in account becomes its owner). Requires confirm=true.',
+    inputSchema: { type: 'object', properties: { name: str('tenant name (letters, digits, space . _ -; up to 64)'), confirm: { type: 'boolean', description: 'must be true' } }, required: ['name', 'confirm'], additionalProperties: false } },
+  { name: 'yataverse_sa_list', description: 'Service accounts of a tenant (metadata only).',
+    inputSchema: { type: 'object', properties: { tenant: str('tenant id, t_...') }, required: ['tenant'], additionalProperties: false } },
+  { name: 'yataverse_sa_create', description: 'Issue a tenant service account. Its one-time secret is stored 0600 on this machine as the write credential and is NOT returned. Requires confirm=true.',
+    inputSchema: { type: 'object', properties: { tenant: str('tenant id, t_...'), name: str('service account name'), role: str('optional role'), storage: str('optional default storage name'), confirm: { type: 'boolean', description: 'must be true' } }, required: ['tenant', 'name', 'confirm'], additionalProperties: false } },
+  { name: 'yataverse_sa_rotate', description: 'Rotate a service account\'s secret; the new secret is stored 0600 and not returned. Requires confirm=true.',
+    inputSchema: { type: 'object', properties: { tenant: str('tenant id, t_...'), id: str('service account id, sa_...'), confirm: { type: 'boolean', description: 'must be true' } }, required: ['tenant', 'id', 'confirm'], additionalProperties: false } },
+  { name: 'yataverse_sa_revoke', description: 'Revoke a service account. Requires confirm=true.',
+    inputSchema: { type: 'object', properties: { tenant: str('tenant id, t_...'), id: str('service account id, sa_...'), confirm: { type: 'boolean', description: 'must be true' } }, required: ['tenant', 'id', 'confirm'], additionalProperties: false } },
 ];
+
+const CONFIRMED = new Set(['yataverse_put', 'yataverse_admin_login', 'yataverse_tenant_create', 'yataverse_sa_create', 'yataverse_sa_rotate', 'yataverse_sa_revoke']);
 
 function bytesFrom(a, cap) {
   const hasText = a.text !== undefined, hasB64 = a.base64 !== undefined;
@@ -67,6 +88,18 @@ export async function callTool(name, a, deps = {}) {
     const j = (x) => ({ text: JSON.stringify(x), isError: false });
     if (name === 'yataverse_status') return j(status(cfg));
     if (name === 'yataverse_cid') return j({ cid: rawCid(bytesFrom(a, PUT_CAP)) });
+    if (CONFIRMED.has(name) && a.confirm !== true) return { text: JSON.stringify({ refused: 'confirm-required' }), isError: true };
+    if (name.startsWith('yataverse_admin_') || name.startsWith('yataverse_tenant_') || name.startsWith('yataverse_sa_')) {
+      if (name === 'yataverse_admin_status') return j(adminStatus(deps.env));
+      const admin = makeAdmin(cfg, { env: deps.env ?? process.env, ...deps.admin });
+      if (name === 'yataverse_admin_login') return j(await admin.login());
+      if (name === 'yataverse_tenant_list') return j(await admin.tenantList());
+      if (name === 'yataverse_tenant_create') return j(await admin.tenantCreate(a.name));
+      if (name === 'yataverse_sa_list') return j(await admin.saList(a.tenant));
+      if (name === 'yataverse_sa_create') return j(await admin.saCreate(a.tenant, { name: a.name, role: a.role, storage: a.storage }));
+      if (name === 'yataverse_sa_rotate') return j(await admin.saRotate(a.tenant, a.id));
+      if (name === 'yataverse_sa_revoke') return j(await admin.saRevoke(a.tenant, a.id));
+    }
     const authorize = makeAuthorizer(cfg, deps.auth);
     const client = makeClient(cfg, { authorize, ...deps.client });
     if (name === 'yataverse_get') {
@@ -75,7 +108,6 @@ export async function callTool(name, a, deps = {}) {
     }
     if (name === 'yataverse_verify') return j(await client.verifyRemote(a.cid));
     if (name === 'yataverse_put') {
-      if (a.confirm !== true) return { text: JSON.stringify({ refused: 'confirm-required' }), isError: true };
       return j(await client.putBytes(bytesFrom(a, PUT_CAP)));
     }
   } catch (e) {

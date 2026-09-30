@@ -45,13 +45,34 @@ and Authn issues a Biscuit only to a tenant member — so the secret has to come
 Config lives in `~/.config/yataverse` (`$YATAVERSE_CONFIG_DIR`): `config.json` (non-secret) and
 `sa-token` / `auth` (0600 — a secret file readable by group or other is **refused**).
 
+## Administration: tenants and service-account secrets
+
+Everything up to the secret can be done from the CLI or the MCP server, with **your own** key:
+
+```sh
+yataverse admin keygen                  # ~/.config/yataverse/admin.key (0600); prints only the did:key
+yataverse admin login                   # signs in to Authn with that key — the FIRST sign-in creates the account
+yataverse tenant create "My tenant"     # you become its owner        -> t_...
+yataverse sa create --tenant t_... --name web-node --storage blocks
+                                        # issues a service account; its one-time kb_sa_ secret is stored
+                                        # 0600 as this machine's write credential and NOT printed (--print to see it)
+yataverse sa list|rotate|revoke --tenant t_... [--id sa_...]
+yataverse member list|add --tenant t_... [--user-id U --role R]
+```
+
+Authn decides who may do what: a caller who is not an admin of the tenant is refused by Authn. Two things
+this tool cannot do for you: writing bytes also needs the account to hold a **`storage/pin` grant** (the
+plane's quota gate — it is granted by the operator, not by a tenant), and a fresh account is not a member of
+anyone else's tenant. Signing in creates an account, so `admin login` and every mutating MCP tool
+(`yataverse_admin_login`, `yataverse_tenant_create`, `yataverse_sa_create|rotate|revoke`) require `confirm: true`.
+
 ## MCP
 
 ```sh
 claude mcp add yataverse -- node /path/to/yataverse/bin/yataverse.mjs mcp
 ```
 
-Tools: `yataverse_status`, `yataverse_cid`, `yataverse_get`, `yataverse_verify`, `yataverse_put`.
+Tools: `yataverse_status`, `yataverse_cid`, `yataverse_get`, `yataverse_verify`, `yataverse_put`, and the administration set `yataverse_admin_status`, `yataverse_admin_login`, `yataverse_tenant_list`, `yataverse_tenant_create`, `yataverse_sa_list`, `yataverse_sa_create`, `yataverse_sa_rotate`, `yataverse_sa_revoke`. A service-account secret issued through MCP is stored on this machine and is **never returned** in a tool result.
 Credentials come from the operator's config and **never pass through a tool argument or result**:
 any argument named like a credential is refused. `yataverse_put` requires `confirm: true` (it writes to a
 shared plane and cannot be undone). Bytes returned by `yataverse_get` are untrusted data.
@@ -59,7 +80,7 @@ shared plane and cannot be undone). Bytes returned by `yataverse_get` are untrus
 ## Test
 
 ```sh
-npm test        # 25 tests: CID vectors, redirect policy, Authn exchange/caching, config permissions, MCP
+npm test        # 37 tests: CID vectors, redirect policy, Authn exchange/caching, sign-in CACAO verified by a fake Authn, admin flow, config permissions, MCP
 ```
 
 Apache-2.0.
