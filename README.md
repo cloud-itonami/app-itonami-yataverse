@@ -60,6 +60,18 @@ yataverse sa list|rotate|revoke --tenant t_... [--id sa_...]
 yataverse member list|add --tenant t_... [--user-id U --role R]
 ```
 
+### One command, per node (decentralized)
+
+```sh
+yataverse bootstrap --yes --tenant-name my-node --sa-name web-node --storage blocks
+```
+
+Idempotent: admin key -> sign in -> tenant -> service account -> secret stored 0600. **`--yes` is required
+because the first sign-in creates an account.** Run it on each machine that writes, and every node holds its
+**own** identity and its **own** secret — no shared secret is copied around, and revoking one node is one
+`sa revoke`. (murakumo's `web_node` picks up `~/.config/yataverse` on its own; a bot may run
+`yataverse_bootstrap` over MCP only after the operator approves that node.)
+
 Authn decides who may do what: a caller who is not an admin of the tenant is refused by Authn. Two things
 this tool cannot do for you: writing bytes also needs the account to hold a **`storage/pin` grant** (the
 plane's quota gate — it is granted by the operator, not by a tenant), and a fresh account is not a member of
@@ -80,7 +92,7 @@ shared plane and cannot be undone). Bytes returned by `yataverse_get` are untrus
 ## Test
 
 ```sh
-npm test        # 37 tests: CID vectors, redirect policy, Authn exchange/caching, sign-in CACAO verified by a fake Authn, admin flow, config permissions, MCP
+npm test        # 40 tests: CID vectors, redirect policy, Authn exchange/caching, sign-in CACAO verified by a fake Authn, admin flow, config permissions, MCP
 ```
 
 Apache-2.0.

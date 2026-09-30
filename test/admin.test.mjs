@@ -36,7 +36,7 @@ test('login signs a CACAO Authn verifies, stores the session 0600', async () => 
   try {
     const { did } = keygen(env);
     const admin = makeAdmin({ ...baseCfg(a.origin), authnUrl: a.origin }, { env, ...T });
-    assert.deepEqual(await admin.login(), { did, signedIn: true });
+    assert.deepEqual(await admin.login(), { did, signedIn: true, userId: 'u_1' });
     assert.equal(a.state.did, did);                                     // the fake verified the ed25519 signature
     assert.equal(mode(path.join(dir, 'session')), 0o600);
     assert.equal(adminStatus(env).session.fresh, true);
@@ -146,4 +146,52 @@ test('CLI: admin keygen / whoami never print the seed', async () => {
     assert.ok(!/[0-9a-f]{64}/.test(out));
     assert.match(out, /did:key:z6Mk/);
   } finally { if (prev === undefined) delete process.env.YATAVERSE_CONFIG_DIR; else process.env.YATAVERSE_CONFIG_DIR = prev; }
+});
+
+test('bootstrap: key -> sign in -> tenant -> service account, secret stored not returned, idempotent', async () => {
+  const a = await startAuthn(); const { dir, env } = tmp();
+  try {
+    const admin = makeAdmin({ ...baseCfg(a.origin), authnUrl: a.origin }, { env, ...T });
+    await assert.rejects(admin.bootstrap({}), (e) => e.code === 'confirmation-required');
+    assert.equal(a.state.log.length, 0, 'no request may leave before --yes');
+    assert.equal(fs.existsSync(path.join(dir, 'admin.key')), false, 'nor any key be made');
+
+    const r = await admin.bootstrap({ yes: true, tenantName: 'murakumo-web', saName: 'web-node', storage: 'blocks' });
+    assert.match(r.tenantId, /^t_/); assert.match(r.serviceAccountId, /^sa_/);
+    assert.deepEqual(r.steps.map((s) => s.step), ['keygen', 'login', 'tenant', 'service-account']);
+    assert.ok(!JSON.stringify(r).includes('kb_sa_'));
+    assert.equal(mode(path.join(dir, 'sa-token')), 0o600);
+    const cfg = loadConfig(env);
+    assert.equal(cfg.tenantId, r.tenantId); assert.equal(cfg.storage, 'blocks'); assert.match(cfg.saToken, /^kb_sa_ISSUED_/);
+
+    const again = await admin.bootstrap({ yes: true, tenantName: 'murakumo-web', saName: 'web-node', storage: 'blocks' });
+    assert.equal(again.tenantId, r.tenantId);
+    assert.equal(again.serviceAccountId, r.serviceAccountId);
+    assert.equal(a.state.tenants.length, 1); assert.equal(a.state.sas.length, 1);   // nothing duplicated
+    assert.ok(again.steps.find((s) => s.step === 'service-account').skipped);
+  } finally { await a.close(); }
+});
+
+test('bootstrap never issues a service account whose secret it could not store', async () => {
+  const a = await startAuthn(); const { dir, env } = tmp();
+  try {
+    const admin = makeAdmin({ ...baseCfg(a.origin), authnUrl: a.origin }, { env, ...T });
+    const r = await admin.bootstrap({ yes: true, saName: 'web-node' });
+    fs.rmSync(path.join(dir, 'sa-token'));               // the secret is lost; Authn shows it only once
+    const again = await admin.bootstrap({ yes: true, saName: 'web-node' });
+    // it re-issues (the old secret is unrecoverable) rather than pretend the account is usable
+    assert.ok(again.steps.find((s) => s.step === 'service-account').created);
+    assert.equal(mode(path.join(dir, 'sa-token')), 0o600);
+  } finally { await a.close(); }
+});
+
+test('MCP bootstrap needs confirm and returns no secret', async () => {
+  const a = await startAuthn(); const { env } = tmp();
+  try {
+    const deps = { cfg: { ...baseCfg(a.origin), authnUrl: a.origin }, env, admin: T };
+    assert.match((await callTool('yataverse_bootstrap', { confirm: false }, deps)).text, /confirm-required/);
+    assert.equal(a.state.log.length, 0);
+    const r = await callTool('yataverse_bootstrap', { tenant_name: 'agent-made', confirm: true }, deps);
+    assert.equal(r.isError, false); assert.ok(!r.text.includes('kb_sa_'));
+  } finally { await a.close(); }
 });

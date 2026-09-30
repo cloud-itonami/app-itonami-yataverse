@@ -20,6 +20,9 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse mcp                        run as an MCP server on stdio
 
 Administration (Authn) — uses YOUR ed25519 key; the first sign-in creates the account:
+  yataverse bootstrap --yes [--tenant-name N] [--sa-name N] [--storage S]
+                                       keygen -> sign in -> tenant -> service account, idempotent. --yes is required:
+                                       the first sign-in CREATES AN ACCOUNT. The secret is stored (0600), never printed.
   yataverse admin keygen               create ~/.config/yataverse/admin.key (0600); prints the did:key only
   yataverse admin whoami               did:key and whether a session exists
   yataverse admin login                sign in to Authn with that key (creates the account on first use)
@@ -45,7 +48,8 @@ function flags(argv) {
     const a = argv[i];
     if (a === '-o') out.o = argv[++i];
     else if (a === '--sa-token-stdin') out.saTokenStdin = true
-    else if (a === '--print') out.print = true;
+    else if (a === '--print') out.print = true
+    else if (a === '--yes') out.yes = true;
     else if (a.startsWith('--')) out[a.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = argv[++i];
     else out._.push(a);
   }
@@ -84,6 +88,10 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         const r = await client.putBytes(readInput(f._[0])); out(r); return 0;
       }
       case 'mcp': serve(); return await new Promise(() => {});
+      case 'bootstrap': {
+        out(await makeAdmin(loadConfig()).bootstrap({ yes: Boolean(f.yes), tenantName: f.tenantName, saName: f.saName, storage: f.storage, role: f.role }));
+        return 0;
+      }
       case 'admin': {
         if (f._[0] === 'keygen') { out(keygen()); return 0; }
         if (f._[0] === 'whoami') { out(adminStatus()); return 0; }

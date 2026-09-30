@@ -94,7 +94,10 @@ export function makeAdmin(cfg, { fetchImpl = fetch, env = process.env, authnHost
     const m = new RegExp(`(?:^|[,;\\s])${SESSION_COOKIE}=([^;,\\s]+)`).exec(setCookie);
     if (!m) throw new AdminError('login-no-session-cookie');
     writeSecret(f.session, m[1] + '\n', f.dir);
-    return { did: key.did, signedIn: true };
+    let viewer = null; try { viewer = await res.json(); } catch { /* cookie is what matters */ }
+    // Authn's viewer JSON names the account; a node's owner needs it to add the node to a tenant.
+    const userId = viewer?.user?.id ?? viewer?.id ?? null;
+    return { did: key.did, signedIn: true, ...(userId ? { userId } : {}) };
   }
 
   async function call(method, urlPath, body) {
@@ -127,8 +130,48 @@ export function makeAdmin(cfg, { fetchImpl = fetch, env = process.env, authnHost
     writeSecret(f.json, JSON.stringify(next, null, 2) + '\n', f.dir);
   }
 
+  /**
+   * One idempotent pass: admin key -> sign in -> tenant -> service account -> secret stored 0600.
+   * SIGN-IN CREATES AN ACCOUNT on first use, so `yes` must be passed deliberately (the CLI's --yes, the
+   * MCP tool's confirm=true). Re-running reuses the tenant and service account it made; it never issues a
+   * second service account it could not store the secret of. Returns names and ids, never a secret.
+   */
+  async function bootstrap({ yes = false, tenantName = 'yataverse', saName = 'yataverse-node', storage, role } = {}) {
+    if (yes !== true) throw new AdminError('confirmation-required', 'sign-in creates an account: pass --yes');
+    const steps = [];
+    if (!loadKey(env)) { steps.push({ step: 'keygen', did: keygen(env).did }); } else steps.push({ step: 'keygen', skipped: 'key exists' });
+    const who = await login(); steps.push({ step: 'login', did: who.did, ...(who.userId ? { userId: who.userId } : {}) });
+
+    const cfgFile = fs.existsSync(f.json) ? JSON.parse(fs.readFileSync(f.json, 'utf8')) : {};
+    const memberships = await (async () => (await call('GET', '/v1/tenants')).memberships ?? [])();
+    const known = cfgFile.tenantId && memberships.some((m) => (m.tenantId ?? m.tenant_id) === cfgFile.tenantId);
+    let tenantId = known ? cfgFile.tenantId : null;
+    if (tenantId) steps.push({ step: 'tenant', tenantId, skipped: 'already a member' });
+    else { const t = await (async () => { const j = await call('POST', '/v1/tenants', { name: name(tenantName) }); return j.tenant; })();
+           tenantId = t.id; steps.push({ step: 'tenant', tenantId, created: true }); }
+
+    const haveSecret = Boolean(readSecret(f.saToken));
+    const existing = (await call('GET', `/v1/tenants/${tenant(tenantId)}/service-accounts`)).serviceAccounts ?? [];
+    let saId = existing.find((x) => x.name === saName)?.id ?? null;
+    if (saId && haveSecret) steps.push({ step: 'service-account', id: saId, skipped: 'exists and its secret is stored here' });
+    else {
+      const made = await (async () => {
+        const j = await call('POST', `/v1/tenants/${tenantId}/service-accounts`, { name: name(saName), ...(role ? { role } : {}) });
+        storeSecret(j.token, tenantId, storage); return j.serviceAccount;
+      })();
+      saId = made.id; steps.push({ step: 'service-account', id: saId, created: true, secretStored: true });
+    }
+    if (storage) tenantUseInternal(tenantId, storage);
+    return { did: who.did, ...(who.userId ? { userId: who.userId } : {}), tenantId, serviceAccountId: saId, secretStored: true, steps };
+  }
+
+  function tenantUseInternal(t, storage) {
+    const cur = fs.existsSync(f.json) ? JSON.parse(fs.readFileSync(f.json, 'utf8')) : {};
+    writeSecret(f.json, JSON.stringify({ ...cur, tenantId: t, ...(storage ? { storage } : {}) }, null, 2) + '\n', f.dir);
+  }
+
   return {
-    login,
+    login, bootstrap,
     tenantList: async () => (await call('GET', '/v1/tenants')).memberships ?? [],
     tenantCreate: async (n) => { const j = await call('POST', '/v1/tenants', { name: name(n) }); return { tenant: j.tenant, membership: j.membership }; },
     memberList: async (t) => (await call('GET', `/v1/tenants/${tenant(t)}/members`)).members ?? [],
