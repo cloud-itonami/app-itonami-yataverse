@@ -1,6 +1,6 @@
 # yataverse
 
-CLI and MCP server for the **yataverse** bytes plane (formerly kotobase): content-addressed
+CLI and MCP server for the **yataverse** bytes plane (the bytes plane was formerly called kotobase; kotobase now names the datom/graph plane, root ADR-2610101900): content-addressed
 blocks, **verified on every read and after every write**. Zero dependencies, Node 18+.
 
 A block is named by the sha2-256 of its bytes (CIDv1). `yataverse` never trusts the route or a
