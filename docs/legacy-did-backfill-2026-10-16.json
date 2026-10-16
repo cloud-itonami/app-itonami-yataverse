@@ -79,13 +79,18 @@
       "verificationStatus": "unavailable; file not present in the inspected workspace"
     },
     "manifestRootCandidateIndex": {
-      "file": "workspaces/codex/yataverse-training-did-index/lake-inventory-root-did-candidates-epoch0-through6.jsonl",
+      "file": "docs/lake-inventory-root-did-candidates-epoch0-through6.jsonl",
       "records": 7,
       "sha256": "525b4aaf6d12755b698aa563f7a7553e46ba7c3a8e9c1f2adf55b4370388a08d",
       "source": "inventory.cid references from epoch manifests 0 through 6",
       "verificationStatus": "manifest references only; roots not resolved or read back",
       "uploadedToYataverse": false,
-      "rewardStatus": "not-eligible-unverified-inventory-roots"
+      "rewardStatus": "not-eligible-unverified-inventory-roots",
+      "manifestFile": "docs/lake-inventory-root-did-candidates-epoch0-through6.manifest.json",
+      "trackedInRepository": true,
+      "registryStatus": "unregistered",
+      "resolverStatus": "unverified; current production Worker predates the DID route",
+      "registrationMeaning": "Repository tracking records candidate identifiers only; it does not register asset claims or establish rights, contributors, or reward eligibility."
     },
     "recordStatus": "unregistered",
     "evidenceStatus": "cid-only-unverified",
