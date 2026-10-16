@@ -39,13 +39,6 @@
       "inventoryBytes": 14520
     },
     {
-      "file": "epoch-5.json",
-      "sha256": "625c2a2fa27df09830db4e5e29f1071300eb69b8638bd8509cf696adb83e0129",
-      "inventoryCid": "bafkreibxfw2orehfo76sd73upc56oonuxithkobknftq7bfao6ezgwwqie",
-      "inventoryRows": 1,
-      "inventoryBytes": 563
-    },
-    {
       "file": "epoch-6.json",
       "sha256": "9963d75ded51989dd4b0377f9247b5b578e44d2b41a7c8f92cb165c154e58d9e",
       "inventoryCid": "bafkreiatoqsucmlvs3ktvtrmkglx6vlqauiodzj26mqwnt2flcpggmnce4",
@@ -55,12 +48,22 @@
   ],
   "output": {
     "file": "lake-inventory-root-did-candidates-epoch0-through6.jsonl",
-    "records": 7,
-    "bytes": 6321,
-    "sha256": "525b4aaf6d12755b698aa563f7a7553e46ba7c3a8e9c1f2adf55b4370388a08d"
+    "records": 6,
+    "bytes": 5424,
+    "sha256": "7b18c430a12325a06a9464c9205ec556b2db4998a0527beb7a381b966ae2fd5c"
   },
   "recordStatus": "unregistered",
   "uploadedToYataverse": false,
-  "scopeLimit": "manifest inventory roots only; this does not enumerate, resolve, verify, or claim the lake block CIDs inside the inventories",
-  "rewardStatus": "not-eligible-unverified-inventory-roots"
+  "scopeLimit": "Manifest inventory roots only; excludes epoch 5 because it is a P6 drill action, and does not enumerate, resolve, verify, or claim the lake block CIDs inside the inventories.",
+  "rewardStatus": "not-eligible-unverified-inventory-roots",
+  "excludedSources": [
+    {
+      "file": "epoch-5.json",
+      "sha256": "625c2a2fa27df09830db4e5e29f1071300eb69b8638bd8509cf696adb83e0129",
+      "inventoryCid": "bafkreibxfw2orehfo76sd73upc56oonuxithkobknftq7bfao6ezgwwqie",
+      "inventoryRows": 1,
+      "inventoryBytes": 563,
+      "reason": "P6 drill action; not a lake-listing capture"
+    }
+  ]
 }
