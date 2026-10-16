@@ -87,3 +87,27 @@ Therefore the maximum payout is the funded pool, independent of the USD cost rec
 This review inspected source and metadata only. It ran no tests, performed no deployment or transfer,
 and read no secret values. Production bindings and payout activation were not rechecked here; source
 presence does not establish that the DID, registration, cron, or claim routes are live.
+
+## Read-only node hash attempt (2026-10-17)
+
+The later API main readback was `aadd17fc18136b3c64058e8ecd20f97d4c059709` (PR #330). Its model
+registry still declares the same Ling SHA-256 and candidate CID recorded above. The current
+[provider catalog](https://github.com/network-awai/cloud-murakumo-api/blob/aadd17fc18136b3c64058e8ecd20f97d4c059709/src/local_murakumo/provider_catalog.cljk)
+has a 2026-09-13 note of `4,823,894,940` bytes with the `246d67d4…` hash prefix. The
+[edge-ring reference](https://github.com/network-awai/cloud-murakumo-api/blob/aadd17fc18136b3c64058e8ecd20f97d4c059709/hermes/profiles/murakumo-tier-routing/skills/murakumo-edge-ring/references/murakumo-tiers.md)
+lists `/root/models/Ling-3.0-tiny-Q4_K_M.gguf` and a historical size of `4,823,894,944` bytes,
+four bytes larger. These are source records, not a current file readback; the size discrepancy is
+unresolved.
+
+Read-only SSH was attempted with only `stat` and `sha256sum` for that path. `root@aiueos-node-260910-usagi`
+failed before connection because the hostname did not resolve. The source's SSH alias
+`root@aiueos-node-260910` then failed because the local Tailscaled process was unavailable, and SSH
+closed before running the remote command. A local `tailscale status` query reported the same missing
+daemon. No remote size or digest was obtained, and no host setting or file was changed.
+
+The Qwen Image candidate was not probed: its registry entry supplies a component filename and hash,
+plus fleet labels, but no concrete filesystem path on a named node. No path was inferred. The checked-in
+weight candidate index therefore remains unchanged and marked
+`registry-declared-sha256-no-file-readback`; no byte-derived CID was verified. Yataverse public
+readback, rights, consent, contributor shares, and actual training use also remain unverified, so
+neither weight candidate is reward eligible.
