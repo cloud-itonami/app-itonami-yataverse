@@ -130,9 +130,8 @@ payout configuration is absent from the current production Worker.
 The checked `wrangler.toml` documents the YATA settings only as commented
 placeholders. Its `PAY_CHAIN` and `TREASURY_ADDR` variables belong to the
 separate `/itonami/pay` USDC payment route; they are not YATA chain or treasury
-configuration and must not be substituted. The checked API main and current Worker configuration expose no configured
-value for the YATA token contract, CAIP-2 chain, distributor address, treasury
-Safe, or distributor-owner Safe. An independent on-chain deployment, if any,
+configuration and must not be substituted. The checked API main and current Worker configuration expose no configured value for the YATA token contract,
+CAIP-2 chain, distributor address, treasury Safe, or distributor-owner Safe. An independent on-chain deployment, if any,
 remains unverified; no chain lookup was made. No address is inferred from a
 token symbol or unrelated payment setting.
 
@@ -141,10 +140,10 @@ token symbol or unrelated payment setting.
 | Contributor attribution, consent, rights, and actual use | Contribution records require a supported license, versioned consent, rights declaration, contributor DID/share, and operator review of readback, rights, deduplication, and actual training use. | The legacy index is not uploaded; its records are unregistered and CID-only/unverified. No verified rights, consent, contributor shares, or actual-use evidence is present. |
 | World ID and Human Passport | Source implements wallet-bound World ID uniqueness verification and a fail-closed Passport score threshold. | Required training bindings and rate limiters are absent from production; live registration is unavailable. |
 | Wallet registration and claims | Source supports wallet-bound registration, prefunded epoch claims, and one-time on-chain recipient registration. | YATA chain/token/distributor/Safe configuration is absent. No production claim or recipient-registration evidence is recorded. |
-| Epoch costs and YATA pool | Source records measured training costs as USD micros with receipts/meter attestations; allocation uses an explicit prefunded YATA pool. USD costs do not define a YATA price or conversion formula. | No live funded YATA epoch or funding receipt was observed. Historical costs without receipts remain `unmeasured`, not zero. |
+| Epoch costs and YATA pool | The source records training-job costs in USD micros with meter/invoice evidence; the explicit prefunded YATA pool is separate. The existing inference-credit/provider payout rail is not a YATA pool, and USD costs do not define a YATA price or conversion formula. | Training bindings are absent, so no live funded epoch or cost receipt is exposed by the current Worker. No on-chain pool receipt was checked. Historical costs without receipts remain `unmeasured`, not zero. |
 | Existing model and data DIDs | Source derives model-catalog DIDs and separate artifact DIDs; a DID does not verify bytes or rights. | The nine catalog candidates include eight with no artifact CID. Two weight-derived candidates have no byte readback; legacy inventory roots are not remotely verified. |
 | Retroactive reward eligibility | Source requires verified asset/manifest, rights, complete contributor shares, eligible humans, and actual epoch use before allocation. | Legacy audit records zero legacy claims and zero YATA transfers; candidates remain ineligible. |
-| Automatic payouts | Source supports allocations and claim-root/keeper relays after required configuration, Safe authorization, prefunding, and wallet registration. | No training bindings, distributor deployment, prefunded pool, keeper, or confirmed transfer was read back in production. Automatic payouts are not active. |
+| Automatic payouts | Source supports allocations and claim-root/keeper relays after required configuration, Safe authorization, prefunding, and wallet registration. | Training bindings are absent; distributor, keeper, prefunding, and settlement are unverified. Automatic payouts are not active in the checked production Worker. |
 
 This refresh is evidence documentation only. It did not read secret values,
 create claims, start a keeper, deploy a Worker or contract, or perform an
