@@ -112,7 +112,6 @@ weight candidate index therefore remains unchanged and marked
 readback, rights, consent, contributor shares, and actual training use also remain unverified, so
 neither weight candidate is reward eligible.
 
-
 ## Live YATA configuration readback (2026-10-17)
 
 The current source heads checked for this follow-up are
@@ -131,10 +130,11 @@ payout configuration is absent from the current production Worker.
 The checked `wrangler.toml` documents the YATA settings only as commented
 placeholders. Its `PAY_CHAIN` and `TREASURY_ADDR` variables belong to the
 separate `/itonami/pay` USDC payment route; they are not YATA chain or treasury
-configuration and must not be substituted. No authoritative production
-configuration or deployment record was found for the YATA token contract,
-CAIP-2 chain, distributor address, treasury Safe, or distributor-owner Safe.
-No address is inferred from a token symbol or unrelated payment setting.
+configuration and must not be substituted. The checked API main and current Worker configuration expose no configured
+value for the YATA token contract, CAIP-2 chain, distributor address, treasury
+Safe, or distributor-owner Safe. An independent on-chain deployment, if any,
+remains unverified; no chain lookup was made. No address is inferred from a
+token symbol or unrelated payment setting.
 
 | Workstream | Source and documentation | Production or evidence status |
 |---|---|---|
