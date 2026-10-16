@@ -155,6 +155,10 @@ the complete multi-file model. Neither candidate is reward eligible. See the
 [backfill audit snapshot](docs/legacy-did-backfill-2026-10-16.json) and generated indexes under
 `workspaces/codex/yataverse-training-did-index`. No legacy reward claims or transfers were created.
 
+The model DID and weight CID candidate records are now checked in as
+[metadata-only indexes](docs/model-catalog-did-follow-up-2026-10-17.md). The bulk lake candidate
+indexes remain under `workspaces/codex/yataverse-training-did-index`.
+
 The 2026-10-16 public bytes-plane check also found that the configured
 `https://ipfs.yataverse.com` read host had no base-host DNS record, Worker custom
 domain, or Worker route in the checked Cloudflare account. The wildcard CID
