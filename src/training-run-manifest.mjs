@@ -28,7 +28,7 @@ function cidList(value, field) {
       !value.every(isCidShape)) {
     throw new Error(`${field} must contain 1..${CID_LIST_LIMIT} Yataverse CIDs`);
   }
-  return [...new Set(value.map((entry) => cid(entry, `${field} entry`))].sort();
+  return [...new Set(value.map((entry) => cid(entry, `${field} entry`)))].sort();
 }
 
 function validIsoUtcTimestamp(value, field) {
@@ -113,5 +113,5 @@ export function canonicalTrainingRunManifest(input) {
     operatorDid,
     claimStatus: 'unverified',
   };
-  return JSON.stringify(canonical(manifest)) + '\\n';
+  return JSON.stringify(canonical(manifest)) + '\n';
 }
