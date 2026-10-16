@@ -111,3 +111,41 @@ weight candidate index therefore remains unchanged and marked
 `registry-declared-sha256-no-byte-readback`; no byte-derived CID was verified. Yataverse public
 readback, rights, consent, contributor shares, and actual training use also remain unverified, so
 neither weight candidate is reward eligible.
+
+
+## Live YATA configuration readback (2026-10-17)
+
+The current source heads checked for this follow-up are
+`network-awai/cloud-murakumo-api` main
+`aadd17fc18136b3c64058e8ecd20f97d4c059709` and this repository's main
+`b27d2abe24df9b5bb860a2d081d77b9441f6fa28`.
+
+A read-only Cloudflare settings/deployment readback of the production
+`local-murakumo` Worker returned 65 bindings. Its latest deployment is
+100% on version `68734dad-51cb-40d8-bda9-5a4048385581`, created
+2026-10-13. No binding names were present for `TRAINING_*`, `WORLD_ID`,
+`HUMAN_PASSPORT`, `YATA_*`, or the training challenge rate limiters.
+Secret values were not read. This confirms the training registration and YATA
+payout configuration is absent from the current production Worker.
+
+The checked `wrangler.toml` documents the YATA settings only as commented
+placeholders. Its `PAY_CHAIN` and `TREASURY_ADDR` variables belong to the
+separate `/itonami/pay` USDC payment route; they are not YATA chain or treasury
+configuration and must not be substituted. No authoritative production
+configuration or deployment record was found for the YATA token contract,
+CAIP-2 chain, distributor address, treasury Safe, or distributor-owner Safe.
+No address is inferred from a token symbol or unrelated payment setting.
+
+| Workstream | Source and documentation | Production or evidence status |
+|---|---|---|
+| Contributor attribution, consent, rights, and actual use | Contribution records require a supported license, versioned consent, rights declaration, contributor DID/share, and operator review of readback, rights, deduplication, and actual training use. | The legacy index is not uploaded; its records are unregistered and CID-only/unverified. No verified rights, consent, contributor shares, or actual-use evidence is present. |
+| World ID and Human Passport | Source implements wallet-bound World ID uniqueness verification and a fail-closed Passport score threshold. | Required training bindings and rate limiters are absent from production; live registration is unavailable. |
+| Wallet registration and claims | Source supports wallet-bound registration, prefunded epoch claims, and one-time on-chain recipient registration. | YATA chain/token/distributor/Safe configuration is absent. No production claim or recipient-registration evidence is recorded. |
+| Epoch costs and YATA pool | Source records measured training costs as USD micros with receipts/meter attestations; allocation uses an explicit prefunded YATA pool. USD costs do not define a YATA price or conversion formula. | No live funded YATA epoch or funding receipt was observed. Historical costs without receipts remain `unmeasured`, not zero. |
+| Existing model and data DIDs | Source derives model-catalog DIDs and separate artifact DIDs; a DID does not verify bytes or rights. | The nine catalog candidates include eight with no artifact CID. Two weight-derived candidates have no byte readback; legacy inventory roots are not remotely verified. |
+| Retroactive reward eligibility | Source requires verified asset/manifest, rights, complete contributor shares, eligible humans, and actual epoch use before allocation. | Legacy audit records zero legacy claims and zero YATA transfers; candidates remain ineligible. |
+| Automatic payouts | Source supports allocations and claim-root/keeper relays after required configuration, Safe authorization, prefunding, and wallet registration. | No training bindings, distributor deployment, prefunded pool, keeper, or confirmed transfer was read back in production. Automatic payouts are not active. |
+
+This refresh is evidence documentation only. It did not read secret values,
+create claims, start a keeper, deploy a Worker or contract, or perform an
+on-chain transaction. No tests were added or run.
