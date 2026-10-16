@@ -108,6 +108,6 @@ daemon. No remote size or digest was obtained, and no host setting or file was c
 The Qwen Image candidate was not probed: its registry entry supplies a component filename and hash,
 plus fleet labels, but no concrete filesystem path on a named node. No path was inferred. The checked-in
 weight candidate index therefore remains unchanged and marked
-`registry-declared-sha256-no-file-readback`; no byte-derived CID was verified. Yataverse public
+`registry-declared-sha256-no-byte-readback`; no byte-derived CID was verified. Yataverse public
 readback, rights, consent, contributor shares, and actual training use also remain unverified, so
 neither weight candidate is reward eligible.
