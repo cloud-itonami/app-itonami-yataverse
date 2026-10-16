@@ -148,3 +148,20 @@ token symbol or unrelated payment setting.
 This refresh is evidence documentation only. It did not read secret values,
 create claims, start a keeper, deploy a Worker or contract, or perform an
 on-chain transaction. No tests were added or run.
+
+
+## Reconciliation after API PRs #333 and #334 (2026-10-17 JST)
+
+The API code source now read back at `c2cda36bd415d81b229bcf25c28b247fca242c01`; API `main` is `5e20e035894a7732c2fcddfc1dfceffecd194a13` after the documentation-only production-preflight PR #334. Yataverse `main` remains `7c9dbf6d4e5afe2452f0b0d2d8ac1bb00fbd6070`.
+
+API PR #333 narrows training operator writes to the exact passkey-rooted Biscuit action and disables new raw-wallet manual payout requests by default. PR #334 records the current deployment/readback gates in the [YATA production preflight](https://github.com/network-awai/cloud-murakumo-api/blob/main/docs/runbooks/yata-production-preflight.md). Neither PR deployed a Worker, changed production configuration, created an allocation, or performed a transfer. The production state recorded in the current [API ADR](https://github.com/network-awai/cloud-murakumo-api/blob/main/docs/adr/ADR-261016-training-data-yata-rewards.md) remains v393 at 100%; training routes and the wallet limiter are not active.
+
+### Material DID result
+
+The current candidate index still contains nine catalog-record DIDs, two model-weight-derived CID candidates, and six inventory-manifest-root candidates. No additional input-data artifact with a verified byte CID, rights evidence, contributor shares, and named training-run evidence was found in the checked public source trees.
+
+Catalog DIDs identify registry entries, not training materials. The two weight CIDs encode registry-declared SHA-256 values; the exact model files and Yataverse readbacks remain unverified. A model checkpoint such as a GGUF is an output artifact, not proof of which source data trained it. The six inventory-root DIDs identify manifest references and remain unregistered; a root reference does not establish the rights or contents of the underlying blocks.
+
+The manifest implementation requires a rights-evidence CID and contributor claims but explicitly treats these declarations as unverified claims, not signatures or proof of copyright. Its trainingRunIds list may be empty; actual use remains a separate operator-reviewed gate. No new material DID or reward claim is added by this reconciliation.
+
+For a new candidate, retain the raw source and license/permission evidence, verify the exact bytes and CID, publish the asset and canonical manifest to Yataverse, read both back, identify contributors and complete shares, and link a named training run with verifiable input-manifest evidence. Murakumo review must then confirm rights, deduplication, quality, and actual use before the asset can become reward eligible.
