@@ -27,6 +27,29 @@ function cid(value, field) {
   return canonical;
 }
 
+function validDid(value) {
+  // DID Core generic syntax: method-name is lowercase ASCII letters/digits;
+  // method-specific-id consists of idchars separated by colons, with a
+  // non-empty final idchar sequence. Percent escapes must be complete.
+  return /^did:[a-z0-9]+:(?:(?:[A-Za-z0-9._-]|%[0-9A-Fa-f]{2})*:)*(?:[A-Za-z0-9._-]|%[0-9A-Fa-f]{2})+$/.test(value);
+}
+
+function validIsoUtcTimestamp(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth[month - 1] &&
+    hour <= 23 && minute <= 59 && second <= 59;
+}
+
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
   if (plainObject(value)) {
@@ -81,7 +104,7 @@ export function canonicalAssetManifest(input) {
       if (!['did', 'role', 'shareBps'].includes(key)) throw new Error(`unknown contributor field: ${key}`);
     }
     const did = text(claim.did, `contributors[${index}].did`, 512);
-    if (!/^did:[a-z0-9]+:[A-Za-z0-9._:%-]+$/.test(did)) throw new Error(`contributors[${index}].did must be a DID`);
+    if (!validDid(did)) throw new Error(`contributors[${index}].did must be a DID`);
     if (seen.has(did)) throw new Error(`duplicate contributor DID: ${did}`);
     seen.add(did);
     const role = text(claim.role, `contributors[${index}].role`, 32);
@@ -92,11 +115,11 @@ export function canonicalAssetManifest(input) {
     }
     shares += shareBps;
     return { did, role, shareBps };
-  }).sort((a, b) => a.did.localeCompare(b.did));
+  }).sort((a, b) => (a.did < b.did ? -1 : a.did > b.did ? 1 : 0));
   if (shares > 10000) throw new Error('contributor shareBps values must total at most 10000');
 
   const createdAt = value.createdAt === undefined ? undefined : text(value.createdAt, 'createdAt', 40);
-  if (createdAt !== undefined && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(createdAt)) {
+  if (createdAt !== undefined && !validIsoUtcTimestamp(createdAt)) {
     throw new Error('createdAt must be an ISO 8601 UTC timestamp');
   }
 

@@ -94,9 +94,7 @@ export async function callTool(name, a, deps = {}) {
   const bad = validateArgs(tool, a ?? {});
   if (bad) return { text: JSON.stringify({ refused: 'bad-arguments', detail: bad }), isError: true };
   try {
-    const cfg = deps.cfg ?? loadConfig();
     const j = (x) => ({ text: JSON.stringify(x), isError: false });
-    if (name === 'yataverse_status') return j(status(cfg));
     if (name === 'yataverse_cid') return j({ cid: rawCid(bytesFrom(a, PUT_CAP)) });
     if (name === 'yataverse_cid_normalize') {
       const cid = normalizeCid(a.cid);
@@ -110,8 +108,10 @@ export async function callTool(name, a, deps = {}) {
         claimStatus: 'unverified', note: 'CID binds these bytes only; it does not prove contributor identity, rights, or consent.' });
     }
     if (CONFIRMED.has(name) && a.confirm !== true) return { text: JSON.stringify({ refused: 'confirm-required' }), isError: true };
+    if (name === 'yataverse_admin_status') return j(adminStatus(deps.env));
+    const cfg = deps.cfg ?? loadConfig();
+    if (name === 'yataverse_status') return j(status(cfg));
     if (name === 'yataverse_bootstrap' || name.startsWith('yataverse_admin_') || name.startsWith('yataverse_tenant_') || name.startsWith('yataverse_sa_')) {
-      if (name === 'yataverse_admin_status') return j(adminStatus(deps.env));
       const admin = makeAdmin(cfg, { env: deps.env ?? process.env, ...deps.admin });
       if (name === 'yataverse_bootstrap') return j(await admin.bootstrap({ yes: true, tenantName: a.tenant_name, saName: a.sa_name, storage: a.storage }));
       if (name === 'yataverse_admin_login') return j(await admin.login());
