@@ -22,8 +22,8 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse asset-manifest <json|->    validate and canonicalize a training-asset manifest
   yataverse training-run-manifest <json|-> validate and canonicalize run provenance (unverified)
   yataverse asset-did <cid> [--domain host]  derive the deterministic Murakumo did:web for a CID
-  yataverse asset-did-index <jsonl|-> [--domain host]
-                                       stream unique CIDs to JSONL DID records (CID-only, unverified)
+  yataverse asset-did-index <jsonl|-> [--domain host] [--summary file]
+                                       stream unique CID DIDs and bind input/index hashes
   yataverse status                     how this machine is configured (names only, no secrets)
   yataverse config init [--url U] [--read-url U] [--prefix P] [--tenant-id t_..] [--storage S]
                         [--sa-token-stdin]   write ~/.config/yataverse (secret from stdin, 0600)
