@@ -212,7 +212,7 @@ hash, row count, and byte total was validated, and the gzip output passed integr
 narrower 822,510-CID fence-B snapshot is also retained. Both indexes are outside the repository and
 have not been uploaded. Each block-CID entry remains `unregistered` and `cid-only-unverified`, with
 `not-eligible-unregistered` reward status. Epochs 4–6 add 132 rows (79,818 bytes), but their row CID
-lists are absent; seven manifest inventory-root DID candidates are recorded separately as
+lists are absent; six manifest inventory-root DID candidates are recorded separately as
 unverified references and are not reward eligible. The inventory does not identify complete asset
 roots, contributors, rights, or actual training use.
 Three older epoch inventory blocks have locally verified CID/SHA-256 bytes, but remote Yataverse
