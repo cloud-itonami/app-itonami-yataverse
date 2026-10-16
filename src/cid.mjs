@@ -9,6 +9,34 @@ export const CODEC_DAG_PB = 0x70;
 export const CODEC_DAG_CBOR = 0x71;
 export const SHA2_256 = 0x12;
 
+function decodeVarint(bytes, offset) {
+  let value = 0n;
+  for (let i = 0; i < 9; i++) {
+    const index = offset + i;
+    if (index >= bytes.length) return null;
+    const byte = bytes[index];
+    value |= BigInt(byte & 0x7f) << BigInt(i * 7);
+    if ((byte & 0x80) === 0) {
+      // Multiformats unsigned varints must use their shortest representation.
+      if (i > 0 && byte === 0) return null;
+      return { value, nextOffset: index + 1 };
+    }
+  }
+  return null;
+}
+
+function encodeVarint(value) {
+  let n = BigInt(value);
+  if (n < 0n || n > 0x7fffffffffffffffn) throw new RangeError('varint is outside the supported unsigned 63-bit range');
+  const bytes = [];
+  while (n >= 0x80n) {
+    bytes.push(Number((n & 0x7fn) | 0x80n));
+    n >>= 7n;
+  }
+  bytes.push(Number(n));
+  return Buffer.from(bytes);
+}
+
 export function base32(buf) {
   let bits = 0, value = 0, out = '';
   for (const b of buf) {
@@ -37,7 +65,7 @@ export function rawCid(bytes) {
   return 'b' + base32(Buffer.concat([Buffer.from([0x01, CODEC_RAW, SHA2_256, 0x20]), sha256(bytes)]));
 }
 
-/** CIDv0 (implicit dag-pb/sha2-256) or lower-case base32 CIDv1. */
+/** CIDv0 (implicit dag-pb/sha2-256) or lower-case base32 CIDv1/sha2-256. */
 export const CIDV0_PATTERN = /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/;
 export const CID_PATTERN = /^(?:b[a-z2-7]{20,120}|Qm[1-9A-HJ-NP-Za-km-z]{44})$/;
 export const isCidShape = (cid) => typeof cid === 'string' && CID_PATTERN.test(cid);
@@ -72,9 +100,20 @@ export function parseCid(cid) {
   // used in deterministic DIDs and manifests, so each byte string needs one
   // canonical spelling.
   if (`b${base32(bytes)}` !== cid) return null;
-  const [version, codec, hashCode, len] = bytes;
-  if (version !== 1 || hashCode !== SHA2_256 || len !== bytes.length - 4 || len !== 32) return null;
-  return { version, codec, hashCode, digest: bytes.subarray(4) };
+  const version = decodeVarint(bytes, 0);
+  if (!version || version.value !== 1n) return null;
+  const codec = decodeVarint(bytes, version.nextOffset);
+  if (!codec || codec.value > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  const hashCode = decodeVarint(bytes, codec.nextOffset);
+  if (!hashCode || hashCode.value !== BigInt(SHA2_256)) return null;
+  const length = decodeVarint(bytes, hashCode.nextOffset);
+  if (!length || length.value !== 32n || bytes.length - length.nextOffset !== 32) return null;
+  return {
+    version: 1,
+    codec: Number(codec.value),
+    hashCode: SHA2_256,
+    digest: bytes.subarray(length.nextOffset),
+  };
 }
 
 /** Normalize a supported CID to its canonical lower-case base32 CIDv1 form. */
@@ -83,7 +122,10 @@ export function normalizeCid(cid) {
   if (!parsed) return null;
   if (parsed.version === 1) return cid;
   const bytes = Buffer.concat([
-    Buffer.from([1, parsed.codec, parsed.hashCode, parsed.digest.length]),
+    encodeVarint(1),
+    encodeVarint(parsed.codec),
+    encodeVarint(parsed.hashCode),
+    encodeVarint(parsed.digest.length),
     parsed.digest,
   ]);
   return `b${base32(bytes)}`;

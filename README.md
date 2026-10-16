@@ -4,8 +4,9 @@ CLI and MCP server for the **yataverse** bytes plane (the bytes plane was former
 blocks, **verified on every read and after every write**. Zero dependencies, Node 18+.
 
 New uploads use CIDv1/raw/sha2-256. Reads also accept legacy CIDv0 dag-pb blocks and other supported
-CIDv1 sha2-256 blocks. `yataverse` requests the raw block representation and refuses any response
-whose bytes do not match the CID's multihash.
+CIDv1 sha2-256 blocks, including multi-byte codec IDs in the Multiformats unsigned-varint format.
+`yataverse` requests the raw block representation and refuses any response whose bytes do not match
+the CID's multihash.
 
 ```sh
 yataverse cid file.bin                 # the CID a file would have (local)
