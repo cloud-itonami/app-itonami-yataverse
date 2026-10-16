@@ -1,0 +1,69 @@
+{
+  "schema": "yataverse.inventory-root-did-candidate-index/v1",
+  "generatedAt": "2026-10-16T11:14:09.944Z",
+  "didDomain": "api.murakumo.cloud",
+  "sources": [
+    {
+      "file": "epoch-0.json",
+      "sha256": "242df5897fa0a1bb007e278df3f3aba6d7eafb0e9dcc7d7a7321fa156dd223ae",
+      "inventoryCid": "bafybeicgcsswotqjrts3awqegzark4fqygvtqa7k35aewqdp6xkaskndnu",
+      "inventoryRows": 821533,
+      "inventoryBytes": 88410406176
+    },
+    {
+      "file": "epoch-1.json",
+      "sha256": "7ef36f4d801d831e505e98592febb35429669a8d5c09bfaac54c445978f6ff0e",
+      "inventoryCid": "bafkreiejtz7cmcd6tcu4nbm5wtgws52t6jtulznmi3od6oqhdic4lbph2e",
+      "inventoryRows": 977,
+      "inventoryBytes": 1482355570
+    },
+    {
+      "file": "epoch-2.json",
+      "sha256": "16f8033fb86c4367072cb37728f5875f5aa7c40402fe7503cabf28d87b799cae",
+      "inventoryCid": "bafkreigvzf5xeka5e2ekayrziougranb2nwf4kskwjsn33cz456kdng6p4",
+      "inventoryRows": 2700,
+      "inventoryBytes": 1502215498
+    },
+    {
+      "file": "epoch-3.json",
+      "sha256": "16b648f192e062fe8ce02ec621fd1125620260464d08e70fc228b8f00139576e",
+      "inventoryCid": "bafkreigee73ngsuzj2fqlnzygqhz3mmvgk6xopsf4icyvdqvngrmdwycvq",
+      "inventoryRows": 48,
+      "inventoryBytes": 29040
+    },
+    {
+      "file": "epoch-4.json",
+      "sha256": "2517d4f2a6c9d1d48fb7065205862921576263f186df5b3917ab18f27a1ed445",
+      "inventoryCid": "bafkreia7apwkvsjh5be5v3sonkkq3jq4hxiiooymk2arxu2x6tfvphuuwa",
+      "inventoryRows": 24,
+      "inventoryBytes": 14520
+    },
+    {
+      "file": "epoch-6.json",
+      "sha256": "9963d75ded51989dd4b0377f9247b5b578e44d2b41a7c8f92cb165c154e58d9e",
+      "inventoryCid": "bafkreiatoqsucmlvs3ktvtrmkglx6vlqauiodzj26mqwnt2flcpggmnce4",
+      "inventoryRows": 107,
+      "inventoryBytes": 64735
+    }
+  ],
+  "output": {
+    "file": "lake-inventory-root-did-candidates-epoch0-through6.jsonl",
+    "records": 6,
+    "bytes": 5424,
+    "sha256": "7b18c430a12325a06a9464c9205ec556b2db4998a0527beb7a381b966ae2fd5c"
+  },
+  "recordStatus": "unregistered",
+  "uploadedToYataverse": false,
+  "scopeLimit": "Manifest inventory roots only; excludes epoch 5 because it is a P6 drill action, and does not enumerate, resolve, verify, or claim the lake block CIDs inside the inventories.",
+  "rewardStatus": "not-eligible-unverified-inventory-roots",
+  "excludedSources": [
+    {
+      "file": "epoch-5.json",
+      "sha256": "625c2a2fa27df09830db4e5e29f1071300eb69b8638bd8509cf696adb83e0129",
+      "inventoryCid": "bafkreibxfw2orehfo76sd73upc56oonuxithkobknftq7bfao6ezgwwqie",
+      "inventoryRows": 1,
+      "inventoryBytes": 563,
+      "reason": "P6 drill action; not a lake-listing capture"
+    }
+  ]
+}

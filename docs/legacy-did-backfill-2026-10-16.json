@@ -79,13 +79,22 @@
       "verificationStatus": "unavailable; file not present in the inspected workspace"
     },
     "manifestRootCandidateIndex": {
-      "file": "workspaces/codex/yataverse-training-did-index/lake-inventory-root-did-candidates-epoch0-through6.jsonl",
-      "records": 7,
-      "sha256": "525b4aaf6d12755b698aa563f7a7553e46ba7c3a8e9c1f2adf55b4370388a08d",
+      "file": "docs/lake-inventory-root-did-candidates-epoch0-through6.jsonl",
+      "records": 6,
+      "sha256": "7b18c430a12325a06a9464c9205ec556b2db4998a0527beb7a381b966ae2fd5c",
       "source": "inventory.cid references from epoch manifests 0 through 6",
       "verificationStatus": "manifest references only; roots not resolved or read back",
       "uploadedToYataverse": false,
-      "rewardStatus": "not-eligible-unverified-inventory-roots"
+      "rewardStatus": "not-eligible-unverified-inventory-roots",
+      "manifestFile": "docs/lake-inventory-root-did-candidates-epoch0-through6.manifest.json",
+      "trackedInRepository": true,
+      "registryStatus": "unregistered",
+      "resolverStatus": "unverified; current production Worker predates the DID route",
+      "registrationMeaning": "Repository tracking records candidate identifiers only; it does not register asset claims or establish rights, contributors, or reward eligibility.",
+      "excludedEpochs": [
+        5
+      ],
+      "exclusionReason": "Epoch 5 is a P6 drill action, not a lake-listing capture."
     },
     "recordStatus": "unregistered",
     "evidenceStatus": "cid-only-unverified",
