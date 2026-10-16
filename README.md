@@ -165,7 +165,8 @@ domain, or Worker route in the checked Cloudflare account. The wildcard CID
 subdomain DNS record existed, but direct CID-subdomain HTTPS readback failed.
 The CLI could not fetch the three inventory roots. A repository Wrangler file
 that declares these hosts is configuration evidence only; it does not establish
-that the Worker or domain is deployed. The audit snapshot records these limits.
+that the Worker or domain is deployed. The audit snapshot records these limits. An additional read-only Cloudflare configuration snapshot is in the
+[2026-10-17 bytes-plane readback](docs/public-bytes-plane-cloudflare-readback-2026-10-17.md).
 
 The MCP tools `yataverse_asset_manifest` and `yataverse_asset_did` perform local validation and
 deterministic derivation. They do not upload a manifest or prove an asset claim.
