@@ -73,8 +73,8 @@ CID, so adding a DID never requires rewriting the artifact bytes. Legacy CIDv0 v
 to their equivalent CIDv1/dag-pb base32 representation in the canonical manifest.
 
 `yataverse asset-did <cid>` derives the deterministic asset DID that the Murakumo training feature
-resolves at `GET /training/assets/<cid>/did.json` when deployed. A read-only production readback on 2026-10-17 returned 404 for `/training/policy` on the active
-`local-murakumo` v393 Worker; the training feature routes are not established as served. To enumerate a supplied JSONL inventory, use
+resolves at `GET /training/assets/<cid>/did.json` when deployed. An earlier read-only production readback on 2026-10-17 returned 404 for `/training/policy` on the active
+`local-murakumo` v393 Worker. A later direct probe could not resolve `api.murakumo.cloud` (curl status `000`), so current route availability is unresolved; see the [historical DID runtime status](docs/legacy-did-runtime-status-2026-10-17.md). To enumerate a supplied JSONL inventory, use
 `yataverse asset-did-index <jsonl|-> [--domain host] [--summary file]`; each input line may be a CID string or an
 object with `cid` and optional `bytes`. It streams one canonical JSON record per unique CID, including
 the DID, resolver URL, `recordStatus: unregistered`, `evidenceStatus: cid-only-unverified`, and
@@ -133,7 +133,8 @@ repository (43,829,349 compressed bytes) and has not been uploaded to Yataverse.
 for epoch 4 (24 rows) and epoch 6 (107 rows) is absent from the inspected workspace; epoch 5 is
 excluded because it is a P6 drill action, not a lake listing. The six tracked roots cover inventory
 epochs 0–4 and 6, but do not enumerate or verify the contained blocks. Do not describe the 825,258
-rows or root DIDs as a complete asset catalog.
+rows or root DIDs as a complete asset catalog. The latest source-schedule and live-readback distinction is in the
+[historical DID runtime status](docs/legacy-did-runtime-status-2026-10-17.md).
 
 No verified rights-evidence CID, complete contributor-DID/share claims, or actual training-run
 manifest has been found for the historical candidates. Therefore none is eligible for retroactive
