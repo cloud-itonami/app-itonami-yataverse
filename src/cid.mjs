@@ -3,7 +3,9 @@
 import crypto from 'node:crypto';
 
 const ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567';
+const BASE58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 export const CODEC_RAW = 0x55;
+export const CODEC_DAG_PB = 0x70;
 export const CODEC_DAG_CBOR = 0x71;
 export const SHA2_256 = 0x12;
 
@@ -35,18 +37,56 @@ export function rawCid(bytes) {
   return 'b' + base32(Buffer.concat([Buffer.from([0x01, CODEC_RAW, SHA2_256, 0x20]), sha256(bytes)]));
 }
 
-/** A CID string is only ever used as a URL path segment and a filename: keep it strict. */
-export const CID_PATTERN = /^b[a-z2-7]{20,120}$/;
+/** CIDv0 (implicit dag-pb/sha2-256) or lower-case base32 CIDv1. */
+export const CIDV0_PATTERN = /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/;
+export const CID_PATTERN = /^(?:b[a-z2-7]{20,120}|Qm[1-9A-HJ-NP-Za-km-z]{44})$/;
 export const isCidShape = (cid) => typeof cid === 'string' && CID_PATTERN.test(cid);
+
+function base58Decode(value) {
+  if (typeof value !== 'string' || !CIDV0_PATTERN.test(value)) return null;
+  let number = 0n;
+  for (const ch of value) {
+    const digit = BASE58.indexOf(ch);
+    if (digit < 0) return null;
+    number = number * 58n + BigInt(digit);
+  }
+  let hex = number.toString(16);
+  if (hex.length % 2) hex = `0${hex}`;
+  const body = hex ? Buffer.from(hex, 'hex') : Buffer.alloc(0);
+  let zeroes = 0;
+  while (value[zeroes] === '1') zeroes++;
+  return Buffer.concat([Buffer.alloc(zeroes), body]);
+}
 
 /** -> {version, codec, hashCode, digest} or null. */
 export function parseCid(cid) {
   if (!isCidShape(cid)) return null;
+  if (CIDV0_PATTERN.test(cid)) {
+    const bytes = base58Decode(cid);
+    if (!bytes || bytes.length !== 34 || bytes[0] !== SHA2_256 || bytes[1] !== 32) return null;
+    return { version: 0, codec: CODEC_DAG_PB, hashCode: SHA2_256, digest: bytes.subarray(2) };
+  }
   const bytes = base32Decode(cid.slice(1));
   if (!bytes || bytes.length < 4 + 32) return null;
+  // Reject base32 aliases with non-zero residual padding bits. CID text is
+  // used in deterministic DIDs and manifests, so each byte string needs one
+  // canonical spelling.
+  if (`b${base32(bytes)}` !== cid) return null;
   const [version, codec, hashCode, len] = bytes;
-  if (version !== 1 || len !== bytes.length - 4 || len !== 32) return null;
+  if (version !== 1 || hashCode !== SHA2_256 || len !== bytes.length - 4 || len !== 32) return null;
   return { version, codec, hashCode, digest: bytes.subarray(4) };
+}
+
+/** Normalize a supported CID to its canonical lower-case base32 CIDv1 form. */
+export function normalizeCid(cid) {
+  const parsed = parseCid(cid);
+  if (!parsed) return null;
+  if (parsed.version === 1) return cid;
+  const bytes = Buffer.concat([
+    Buffer.from([1, parsed.codec, parsed.hashCode, parsed.digest.length]),
+    parsed.digest,
+  ]);
+  return `b${base32(bytes)}`;
 }
 
 /** true iff `bytes` hash to the digest named by `cid` (any codec; sha2-256 only). */
