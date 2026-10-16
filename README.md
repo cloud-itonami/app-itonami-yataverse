@@ -48,16 +48,14 @@ The record contains no credentials or personal identity proofs. Its presence doe
 prove execution; a Murakumo reviewer must read back the referenced bytes and verify that the target
 asset, model, and completed epoch match the run. Publish the canonical manifest with
 `yataverse put` only after removing private data, then list its returned CID in the asset manifest's
-`trainingRunEvidenceCids`.
- The manifest
-references the model, dataset, checkpoint, adapter, or evaluation artifact by its existing Yataverse
+`trainingRunEvidenceCids`. The manifest references the model, dataset, checkpoint, adapter, or evaluation artifact by its existing Yataverse
 CID, so adding a DID never requires rewriting the artifact bytes. Legacy CIDv0 values are normalized
 to their equivalent CIDv1/dag-pb base32 representation in the canonical manifest.
 
 `yataverse asset-did <cid>` derives the deterministic asset DID that the Murakumo training feature
-resolves at `GET /training/assets/<cid>/did.json` when deployed. As of 2026-10-16, the production
-Murakumo Worker does not yet serve this feature route. To enumerate a supplied JSONL inventory, use
-`yataverse asset-did-index <jsonl|-> [--domain host]`; each input line may be a CID string or an
+resolves at `GET /training/assets/<cid>/did.json` when deployed. A read-only production readback on 2026-10-17 returned 404 for `/training/policy` on the active
+`local-murakumo` v393 Worker; the training feature routes are not established as served. To enumerate a supplied JSONL inventory, use
+`yataverse asset-did-index <jsonl|-> [--domain host] [--summary file]`; each input line may be a CID string or an
 object with `cid` and optional `bytes`. It streams one canonical JSON record per unique CID, including
 the DID, resolver URL, `recordStatus: unregistered`, `evidenceStatus: cid-only-unverified`, and
 `rewardStatus: not-eligible-unregistered`. A generated DID candidate cannot become reward-eligible
@@ -66,7 +64,7 @@ without a verified artifact root, rights, registered contributors, and reviewed 
 `--domain` to match the domain configured on the deployed Murakumo Worker.
 
 The input fields are `schema`, `assetType`, `artifactCid`, `license`, `rightsEvidenceCid`,
-`contributors`, and optional `sourceCids`, `trainingRunIds`, and `createdAt`. `contributors` is a list
+`contributors`, and optional `sourceCids`, `trainingRunIds`, `trainingRunEvidenceCids`, and `createdAt`. `contributors` is a list
 of `{ "did", "role", "shareBps" }` claims. For example (replace the placeholders with real CIDs and
 the registered contributor's wallet DID):
 
@@ -77,6 +75,7 @@ the registered contributor's wallet DID):
   "artifactCid": "REPLACE_WITH_ARTIFACT_CID",
   "license": "CC-BY-4.0",
   "rightsEvidenceCid": "REPLACE_WITH_RIGHTS_EVIDENCE_CID",
+  "trainingRunEvidenceCids": ["REPLACE_WITH_RUN_MANIFEST_CID"],
   "contributors": [
     {
       "did": "did:pkh:eip155:1:0x1111111111111111111111111111111111111111",
@@ -97,8 +96,8 @@ activity.
 The manifest carries an `unverified` claim status. A CID proves only which bytes were published; it
 does not prove a contributor's identity, rights, consent, or training use. Murakumo must separately
 match each claimant to a registered eligible human, verify the rights and provenance evidence, check
-that accepted shares total at most 10,000 basis points, and record actual use before allocating a
-funded YATA pool. Do not put personal data or identity proofs in this public manifest.
+that accepted contributor claims total exactly 10,000 basis points, and record a read-back training-run
+manifest that matches the asset and completed epoch before allocating a funded YATA pool. Do not put personal data or identity proofs in this public manifest.
 
 ### Historical model and data migration audit (2026-10-17)
 
