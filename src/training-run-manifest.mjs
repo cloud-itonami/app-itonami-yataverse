@@ -32,7 +32,7 @@ function cidList(value, field) {
 }
 
 function validIsoUtcTimestamp(value, field) {
-  const match = /^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})(?:\\.(\\d{1,3}))?Z$/.exec(value);
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/.exec(value);
   if (!match) throw new Error(`${field} must be an ISO 8601 UTC timestamp`);
   const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
   const year = Number(yearText);
