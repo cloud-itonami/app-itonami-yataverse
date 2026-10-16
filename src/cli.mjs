@@ -9,6 +9,7 @@ import { serve } from './mcp.mjs';
 import { keygen, adminStatus, makeAdmin, AdminError } from './admin.mjs';
 import { canonicalAssetManifest } from './asset-manifest.mjs';
 import { assetDidRecord } from './asset-did.mjs';
+import { canonicalTrainingRunManifest } from './training-run-manifest.mjs';
 
 const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobase)
 
@@ -18,6 +19,7 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse verify <cid>               is it present, and do the served bytes hash to it?
   yataverse put <file|->               publish a block, then read it back and verify
   yataverse asset-manifest <json|->    validate and canonicalize a training-asset manifest
+  yataverse training-run-manifest <json|-> validate and canonicalize run provenance (unverified)
   yataverse asset-did <cid> [--domain host]  derive the deterministic Murakumo did:web for a CID
   yataverse asset-did-index <jsonl|-> [--domain host]
                                        stream unique CIDs to JSONL DID records (CID-only, unverified)
@@ -133,6 +135,11 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
       }
       case 'asset-manifest': {
         const manifest = canonicalAssetManifest(readInput(f._[0]).toString('utf8'));
+        stdout.write(manifest);
+        return 0;
+      }
+      case 'training-run-manifest': {
+        const manifest = canonicalTrainingRunManifest(readInput(f._[0]).toString('utf8'));
         stdout.write(manifest);
         return 0;
       }
