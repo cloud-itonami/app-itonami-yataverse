@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import readline from 'node:readline';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { rawCid, parseCid, normalizeCid } from './cid.mjs';
 import { loadConfig, saveConfig, status, configDir, ConfigError } from './config.mjs';
@@ -9,6 +10,7 @@ import { serve } from './mcp.mjs';
 import { keygen, adminStatus, makeAdmin, AdminError } from './admin.mjs';
 import { canonicalAssetManifest } from './asset-manifest.mjs';
 import { assetDidRecord } from './asset-did.mjs';
+import { canonicalTrainingRunManifest } from './training-run-manifest.mjs';
 
 const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobase)
 
@@ -18,9 +20,10 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse verify <cid>               is it present, and do the served bytes hash to it?
   yataverse put <file|->               publish a block, then read it back and verify
   yataverse asset-manifest <json|->    validate and canonicalize a training-asset manifest
+  yataverse training-run-manifest <json|-> validate and canonicalize run provenance (unverified)
   yataverse asset-did <cid> [--domain host]  derive the deterministic Murakumo did:web for a CID
-  yataverse asset-did-index <jsonl|-> [--domain host]
-                                       stream unique CIDs to JSONL DID records (CID-only, unverified)
+  yataverse asset-did-index <jsonl|-> [--domain host] [--summary file]
+                                       stream unique CID DIDs and bind input/index hashes
   yataverse status                     how this machine is configured (names only, no secrets)
   yataverse config init [--url U] [--read-url U] [--prefix P] [--tenant-id t_..] [--storage S]
                         [--sa-token-stdin]   write ~/.config/yataverse (secret from stdin, 0600)
@@ -51,17 +54,26 @@ or a static value. This tool mints no credential; a service-account secret comes
 
 const readInput = (arg) => (arg === '-' || arg === undefined) ? fs.readFileSync(0) : fs.readFileSync(arg);
 
-async function writeAssetDidIndex(inputPath, domain, stdout) {
+async function writeAssetDidIndex(inputPath, domain, stdout, summaryPath) {
   const input = inputPath === '-' || inputPath === undefined
     ? process.stdin
     : fs.createReadStream(inputPath);
+  const inputHash = createHash('sha256');
+  const outputHash = createHash('sha256');
+  input.on('data', (chunk) => inputHash.update(chunk));
   const lines = readline.createInterface({ input, crlfDelay: Infinity });
-  const seen = new Set();
+  const seen = new Map();
   let lineNumber = 0;
+  let inputRows = 0;
+  let duplicateRows = 0;
+  let byteSizeConflicts = 0;
+  let uniqueDeclaredBytes = 0n;
+  let uniqueByteRecords = 0;
   let count = 0;
   for await (const line of lines) {
     lineNumber++;
     if (!line.trim()) continue;
+    inputRows++;
     let parsed;
     try {
       const trimmed = line.trim();
@@ -78,18 +90,62 @@ async function writeAssetDidIndex(inputPath, domain, stdout) {
     } catch (error) {
       throw new Error(`inventory line ${lineNumber}: ${error.message}`);
     }
-    if (seen.has(record.cid)) continue;
-    seen.add(record.cid);
+    const bytes = Number.isSafeInteger(parsed?.bytes) && parsed.bytes >= 0
+      ? parsed.bytes
+      : undefined;
+    if (seen.has(record.cid)) {
+      duplicateRows++;
+      const previous = seen.get(record.cid);
+      if (bytes !== undefined && previous.bytes !== undefined && bytes !== previous.bytes) {
+        byteSizeConflicts++;
+      }
+      continue;
+    }
+    seen.set(record.cid, { bytes });
+    if (bytes !== undefined) {
+      uniqueDeclaredBytes += BigInt(bytes);
+      uniqueByteRecords++;
+    }
     const output = {
       ...record,
-      ...(Number.isSafeInteger(parsed?.bytes) && parsed.bytes >= 0
-        ? { inventoryBytes: parsed.bytes }
-        : {}),
+      ...(bytes === undefined ? {} : { inventoryBytes: bytes }),
     };
-    if (!stdout.write(`${JSON.stringify(output)}\n`)) await once(stdout, 'drain');
+    const jsonLine = `${JSON.stringify(output)}\n`;
+    outputHash.update(jsonLine);
+    if (!stdout.write(jsonLine)) await once(stdout, 'drain');
     count++;
   }
-  return { uniqueCids: count };
+  const sourceName = !inputPath || inputPath === '-'
+    ? 'stdin'
+    : inputPath.split(/[\\/]/).at(-1);
+  const summary = {
+    schema: 'yataverse.asset-did-index-summary/v1',
+    domain: (domain ?? 'api.murakumo.cloud').toLowerCase(),
+    source: {
+      name: sourceName,
+      sha256: inputHash.digest('hex'),
+      nonEmptyRows: inputRows,
+    },
+    index: {
+      format: 'jsonl',
+      uniqueCids: count,
+      sha256: outputHash.digest('hex'),
+    },
+    duplicateRows,
+    byteSizeConflicts,
+    declaredBytes: {
+      uniqueCidRecords: uniqueByteRecords,
+      total: uniqueDeclaredBytes.toString(),
+      status: 'inventory-declared-not-byte-verified',
+    },
+    evidenceStatus: 'cid-only-unverified',
+    recordStatus: 'unregistered',
+    rewardStatus: 'not-eligible-unregistered',
+  };
+  if (summaryPath) {
+    fs.writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, { flag: 'wx' });
+  }
+  return summary;
 }
 
 function flags(argv) {
@@ -126,13 +182,18 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
       }
       case 'asset-did-index': {
         const result = await writeAssetDidIndex(
-          f._[0], f.domain ?? process.env.TRAINING_ASSET_DID_DOMAIN, stdout,
+          f._[0], f.domain ?? process.env.TRAINING_ASSET_DID_DOMAIN, stdout, f.summary,
         );
-        stderr.write(`wrote ${result.uniqueCids} unique CID DID records; all remain unregistered and unverified\n`);
+        stderr.write(`wrote ${result.index.uniqueCids} unique CID DID records; source sha256 ${result.source.sha256}; index sha256 ${result.index.sha256}; all candidates remain unregistered and unverified\n`);
         return 0;
       }
       case 'asset-manifest': {
         const manifest = canonicalAssetManifest(readInput(f._[0]).toString('utf8'));
+        stdout.write(manifest);
+        return 0;
+      }
+      case 'training-run-manifest': {
+        const manifest = canonicalTrainingRunManifest(readInput(f._[0]).toString('utf8'));
         stdout.write(manifest);
         return 0;
       }

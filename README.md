@@ -37,15 +37,45 @@ yataverse mcp                          # MCP server on stdio
 
 `yataverse asset-manifest <json|->` validates the versioned Murakumo asset-manifest shape, sorts
 fields and contributor claims into a stable representation, and writes canonical JSON to stdout. Pipe
-that output to `yataverse put -` to publish the manifest and get its verified CID. The manifest
-references the model, dataset, checkpoint, adapter, or evaluation artifact by its existing Yataverse
+that output to `yataverse put -` to publish the manifest and get its verified CID. A manifest may include
+`trainingRunEvidenceCids` to reference immutable run-provenance records; this field is a list of claims
+and does not verify that the run occurred.
+
+`yataverse training-run-manifest <json|->` canonicalizes a run-provenance claim and fixes
+`claimStatus: unverified`. It requires an epoch/run ID, UTC start/completion times, input, model and
+output CIDs, a training-code CID, a sanitized configuration CID, receipt CIDs, and an operator DID.
+The record contains no credentials or personal identity proofs. Its presence does not independently
+prove execution; a Murakumo reviewer must read back the referenced bytes and verify that the target
+asset, model, and completed epoch match the run. Publish the canonical manifest with
+`yataverse put` only after removing private data, then list its returned CID in the asset manifest's
+`trainingRunEvidenceCids`. A run-manifest input has this shape; replace every placeholder with
+a verified Yataverse CID or an actual run identifier before canonicalizing:
+
+```json
+{
+  "schema": "https://api.murakumo.cloud/training/run-manifest/v1",
+  "runId": "actual-run-id",
+  "epochId": "actual-completed-epoch-id",
+  "startedAt": "2026-10-17T00:00:00Z",
+  "completedAt": "2026-10-17T01:00:00Z",
+  "inputCids": ["REPLACE_WITH_ASSET_CID"],
+  "modelCids": ["REPLACE_WITH_MODEL_CID"],
+  "outputCids": ["REPLACE_WITH_OUTPUT_CID"],
+  "trainingCodeCid": "REPLACE_WITH_TRAINING_CODE_CID",
+  "configCid": "REPLACE_WITH_SANITIZED_CONFIG_CID",
+  "receiptCids": ["REPLACE_WITH_RUN_RECEIPT_CID"],
+  "operatorDid": "did:web:example.org:operators:trainer"
+}
+```
+
+The manifest references the model, dataset, checkpoint, adapter, or evaluation artifact by its existing Yataverse
 CID, so adding a DID never requires rewriting the artifact bytes. Legacy CIDv0 values are normalized
 to their equivalent CIDv1/dag-pb base32 representation in the canonical manifest.
 
 `yataverse asset-did <cid>` derives the deterministic asset DID that the Murakumo training feature
-resolves at `GET /training/assets/<cid>/did.json` when deployed. As of 2026-10-16, the production
-Murakumo Worker does not yet serve this feature route. To enumerate a supplied JSONL inventory, use
-`yataverse asset-did-index <jsonl|-> [--domain host]`; each input line may be a CID string or an
+resolves at `GET /training/assets/<cid>/did.json` when deployed. A read-only production readback on 2026-10-17 returned 404 for `/training/policy` on the active
+`local-murakumo` v393 Worker; the training feature routes are not established as served. To enumerate a supplied JSONL inventory, use
+`yataverse asset-did-index <jsonl|-> [--domain host] [--summary file]`; each input line may be a CID string or an
 object with `cid` and optional `bytes`. It streams one canonical JSON record per unique CID, including
 the DID, resolver URL, `recordStatus: unregistered`, `evidenceStatus: cid-only-unverified`, and
 `rewardStatus: not-eligible-unregistered`. A generated DID candidate cannot become reward-eligible
@@ -54,7 +84,7 @@ without a verified artifact root, rights, registered contributors, and reviewed 
 `--domain` to match the domain configured on the deployed Murakumo Worker.
 
 The input fields are `schema`, `assetType`, `artifactCid`, `license`, `rightsEvidenceCid`,
-`contributors`, and optional `sourceCids`, `trainingRunIds`, and `createdAt`. `contributors` is a list
+`contributors`, and optional `sourceCids`, `trainingRunIds`, `trainingRunEvidenceCids`, and `createdAt`. `contributors` is a list
 of `{ "did", "role", "shareBps" }` claims. For example (replace the placeholders with real CIDs and
 the registered contributor's wallet DID):
 
@@ -65,6 +95,7 @@ the registered contributor's wallet DID):
   "artifactCid": "REPLACE_WITH_ARTIFACT_CID",
   "license": "CC-BY-4.0",
   "rightsEvidenceCid": "REPLACE_WITH_RIGHTS_EVIDENCE_CID",
+  "trainingRunEvidenceCids": ["REPLACE_WITH_RUN_MANIFEST_CID"],
   "contributors": [
     {
       "did": "did:pkh:eip155:1:0x1111111111111111111111111111111111111111",
@@ -85,8 +116,46 @@ activity.
 The manifest carries an `unverified` claim status. A CID proves only which bytes were published; it
 does not prove a contributor's identity, rights, consent, or training use. Murakumo must separately
 match each claimant to a registered eligible human, verify the rights and provenance evidence, check
-that accepted shares total at most 10,000 basis points, and record actual use before allocating a
-funded YATA pool. Do not put personal data or identity proofs in this public manifest.
+that accepted contributor claims total exactly 10,000 basis points, and record a read-back training-run
+manifest that matches the asset and completed epoch before allocating a funded YATA pool. Do not put personal data or identity proofs in this public manifest.
+
+### Historical model and data migration audit (2026-10-17)
+
+The checked-in indexes currently derive nine model-catalog DIDs, two weight-hash CID/DID
+candidates, and six inventory-manifest-root DIDs. They are identifiers only. Eight of the nine
+catalog entries have no artifact CID; neither weight-derived CID has a byte readback; and none of
+the six inventory roots has a remote bytes readback. The tracked candidate records remain
+unregistered and not reward eligible.
+
+A prior audit verified 825,258 unique CID rows across epoch 0–3 source inventories, totaling
+91,395,006,284 declared bytes. Their 825,258-record DID candidate index is currently outside this
+repository (43,829,349 compressed bytes) and has not been uploaded to Yataverse. The source inventory
+for epoch 4 (24 rows) and epoch 6 (107 rows) is absent from the inspected workspace; epoch 5 is
+excluded because it is a P6 drill action, not a lake listing. The six tracked roots cover inventory
+epochs 0–4 and 6, but do not enumerate or verify the contained blocks. Do not describe the 825,258
+rows or root DIDs as a complete asset catalog.
+
+No verified rights-evidence CID, complete contributor-DID/share claims, or actual training-run
+manifest has been found for the historical candidates. Therefore none is eligible for retroactive
+YATA allocation. To migrate an existing asset, the claimant must supply its exact root CID, a
+published asset manifest, rights evidence, contributor DIDs with an agreed complete share total of
+10,000 basis points, and a run manifest linking that asset to the model and completed epoch. Each
+claimant then submits their own `legacyAsset: true` claim from a registered wallet-bound human
+account. Murakumo must read back the artifact, asset manifest, rights evidence, and run manifest;
+verify claimant identity/share, deduplication, and actual completed-epoch use; and accept only the
+complete reviewed share set. Existing catalogue names, hash notes, lake roots, or generated DIDs do
+not supply any missing evidence.
+
+After that review, the existing Murakumo source can automatically allocate only within an explicitly
+funded YATA epoch to eligible registered humans, and prepare the epoch claim root. On-chain
+publication/claims still require verified chain/token/distributor/Safe identities, owner authorization,
+prefunding, and keeper configuration. A prepared root is not a payment. No historical claim or
+reward is created by DID generation or manifest publication.
+
+For a supplied inventory, use `yataverse asset-did-index inventory.jsonl --summary index-summary.json`
+to stream one unregistered DID candidate per unique CID and write a summary binding the source SHA-256,
+record count, duplicate count, and output-index SHA-256. The summary describes the supplied input; it
+does not prove bytes, ownership, or asset-root completeness.
 
 ### Backfilling existing models and datasets
 

@@ -70,7 +70,7 @@ export function canonicalAssetManifest(input) {
   const value = typeof input === 'string' ? JSON.parse(input) : input;
   if (!plainObject(value)) throw new Error('manifest must be a JSON object');
   const allowed = new Set(['schema', 'assetType', 'artifactCid', 'license', 'rightsEvidenceCid',
-    'sourceCids', 'trainingRunIds', 'contributors', 'createdAt', 'claimStatus']);
+    'sourceCids', 'trainingRunIds', 'trainingRunEvidenceCids', 'contributors', 'createdAt', 'claimStatus']);
   for (const key of Object.keys(value)) if (!allowed.has(key)) throw new Error(`unknown manifest field: ${key}`);
   if (value.schema !== ASSET_MANIFEST_SCHEMA) throw new Error(`schema must be ${ASSET_MANIFEST_SCHEMA}`);
   if (value.claimStatus !== undefined && value.claimStatus !== 'unverified') {
@@ -92,6 +92,11 @@ export function canonicalAssetManifest(input) {
   if (!Array.isArray(trainingRunIds) || trainingRunIds.length > CID_LIST_LIMIT ||
       !trainingRunIds.every((id) => typeof id === 'string' && /^[A-Za-z0-9._:-]{1,160}$/.test(id))) {
     throw new Error(`trainingRunIds must be an array of at most ${CID_LIST_LIMIT} bounded identifiers`);
+  }
+  const trainingRunEvidenceCids = value.trainingRunEvidenceCids ?? [];
+  if (!Array.isArray(trainingRunEvidenceCids) || trainingRunEvidenceCids.length > CID_LIST_LIMIT ||
+      !trainingRunEvidenceCids.every(isCidShape)) {
+    throw new Error(`trainingRunEvidenceCids must be an array of at most ${CID_LIST_LIMIT} CIDv0 or CIDv1 values`);
   }
   if (!Array.isArray(value.contributors) || value.contributors.length < 1 || value.contributors.length > CLAIM_LIMIT) {
     throw new Error(`contributors must contain 1..${CLAIM_LIMIT} claims`);
@@ -131,6 +136,7 @@ export function canonicalAssetManifest(input) {
     rightsEvidenceCid,
     sourceCids: [...new Set(sourceCids.map((value) => cid(value, 'sourceCids entry')))].sort(),
     trainingRunIds: [...new Set(trainingRunIds)].sort(),
+    trainingRunEvidenceCids: [...new Set(trainingRunEvidenceCids.map((value) => cid(value, 'trainingRunEvidenceCids entry')))].sort(),
     contributors,
     claimStatus: 'unverified',
     ...(createdAt === undefined ? {} : { createdAt }),
