@@ -64,7 +64,10 @@ async function writeAssetDidIndex(inputPath, domain, stdout) {
     if (!line.trim()) continue;
     let parsed;
     try {
-      parsed = line.trimStart().startsWith('{') ? JSON.parse(line) : line.trim();
+      const trimmed = line.trim();
+      parsed = trimmed.startsWith('{') || trimmed.startsWith('"')
+        ? JSON.parse(trimmed)
+        : trimmed;
     } catch {
       throw new Error(`inventory line ${lineNumber} is not valid JSON`);
     }
