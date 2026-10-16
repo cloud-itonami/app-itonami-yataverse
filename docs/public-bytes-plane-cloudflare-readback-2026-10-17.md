@@ -34,10 +34,31 @@ themselves prove the behavior of every edge or origin path.
 
 ## Byte and hash status
 
-This configuration pass did not retrieve a CID response body, so it observed
-no HTTP status or payload and performed no SHA-256 comparison. The earlier
-2026-10-16 audit records DNS/TLS/client readback failures; those transport
-failures are not an HTTP 404 and do not establish that the CID data is absent.
+The Cloudflare configuration pass did not retrieve a CID response body, so it
+observed no HTTP status or payload and performed no SHA-256 comparison. The
+earlier 2026-10-16 audit records DNS/TLS/client readback failures; those
+transport failures are not an HTTP 404 and do not establish that the CID data
+is absent.
+
+A separate direct client probe on 2026-10-17 JST found that
+`dig +short ipfs.yataverse.com` returned no addresses and
+`curl https://ipfs.yataverse.com/` failed with `curl (6): Could not resolve
+host`. The three inventory-root CID subdomains returned A answers
+`104.21.58.150` and `172.67.204.228` from this resolver, but HTTPS requests
+to their raw CID URLs failed during TLS negotiation with
+`curl (35): SSL alert handshake failure`. No HTTP status, response bytes, or
+SHA-256 was obtained.
+
+| Epoch | Inventory root CID | Direct raw-read result |
+|---|---|---|
+| 3 | `bafkreigee73ngsuzj2fqlnzygqhz3mmvgk6xopsf4icyvdqvngrmdwycvq` | TLS handshake failed |
+| 4 | `bafkreia7apwkvsjh5be5v3sonkkq3jq4hxiiooymk2arxu2x6tfvphuuwa` | TLS handshake failed |
+| 6 | `bafkreiatoqsucmlvs3ktvtrmkglx6vlqauiodzj26mqwnt2flcpggmnce4` | TLS handshake failed |
+
+These results describe this client's DNS and TLS path, not every edge or the
+availability of the underlying bytes. They do not establish that any CID is
+missing. The inventory report's local CID/hash checks remain local evidence;
+remote readback is still unverified.
 
 Manifest-root and model-catalog candidates remain unverified references. This
 configuration record does not establish asset rights, contributors, or actual
