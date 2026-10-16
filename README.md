@@ -48,7 +48,27 @@ The record contains no credentials or personal identity proofs. Its presence doe
 prove execution; a Murakumo reviewer must read back the referenced bytes and verify that the target
 asset, model, and completed epoch match the run. Publish the canonical manifest with
 `yataverse put` only after removing private data, then list its returned CID in the asset manifest's
-`trainingRunEvidenceCids`. The manifest references the model, dataset, checkpoint, adapter, or evaluation artifact by its existing Yataverse
+`trainingRunEvidenceCids`. A run-manifest input has this shape; replace every placeholder with
+a verified Yataverse CID or an actual run identifier before canonicalizing:
+
+```json
+{
+  "schema": "https://api.murakumo.cloud/training/run-manifest/v1",
+  "runId": "actual-run-id",
+  "epochId": "actual-completed-epoch-id",
+  "startedAt": "2026-10-17T00:00:00Z",
+  "completedAt": "2026-10-17T01:00:00Z",
+  "inputCids": ["REPLACE_WITH_ASSET_CID"],
+  "modelCids": ["REPLACE_WITH_MODEL_CID"],
+  "outputCids": ["REPLACE_WITH_OUTPUT_CID"],
+  "trainingCodeCid": "REPLACE_WITH_TRAINING_CODE_CID",
+  "configCid": "REPLACE_WITH_SANITIZED_CONFIG_CID",
+  "receiptCids": ["REPLACE_WITH_RUN_RECEIPT_CID"],
+  "operatorDid": "did:web:example.org:operators:trainer"
+}
+```
+
+The manifest references the model, dataset, checkpoint, adapter, or evaluation artifact by its existing Yataverse
 CID, so adding a DID never requires rewriting the artifact bytes. Legacy CIDv0 values are normalized
 to their equivalent CIDv1/dag-pb base32 representation in the canonical manifest.
 
