@@ -42,11 +42,15 @@ references the model, dataset, checkpoint, adapter, or evaluation artifact by it
 CID, so adding a DID never requires rewriting the artifact bytes. Legacy CIDv0 values are normalized
 to their equivalent CIDv1/dag-pb base32 representation in the canonical manifest.
 
-`yataverse asset-did <cid>` derives the same deterministic asset DID Murakumo resolves at
-`GET /training/assets/<cid>/did.json`. To enumerate a supplied JSONL inventory, use
+`yataverse asset-did <cid>` derives the deterministic asset DID that the Murakumo training feature
+resolves at `GET /training/assets/<cid>/did.json` when deployed. As of 2026-10-16, the production
+Murakumo Worker does not yet serve this feature route. To enumerate a supplied JSONL inventory, use
 `yataverse asset-did-index <jsonl|-> [--domain host]`; each input line may be a CID string or an
 object with `cid` and optional `bytes`. It streams one canonical JSON record per unique CID, including
-the DID, resolver URL, and `recordStatus: unregistered`. Set `TRAINING_ASSET_DID_DOMAIN` or pass
+the DID, resolver URL, `recordStatus: unregistered`, `evidenceStatus: cid-only-unverified`, and
+`rewardStatus: not-eligible-unregistered`. A generated DID candidate cannot become reward-eligible
+without a verified artifact root, rights, registered contributors, and reviewed training use. Set
+`TRAINING_ASSET_DID_DOMAIN` or pass
 `--domain` to match the domain configured on the deployed Murakumo Worker.
 
 The input fields are `schema`, `assetType`, `artifactCid`, `license`, `rightsEvidenceCid`,
@@ -86,18 +90,33 @@ funded YATA pool. Do not put personal data or identity proofs in this public man
 
 ### Backfilling existing models and datasets
 
-An existing Yataverse CID can resolve to the deterministic asset DID immediately at
-`GET /training/assets/<cid>/did.json`; the artifact bytes do not need to move or change. The CLI can
-derive a DID for one CID or write a deduplicated index from a supplied lake inventory. These records
-identify CID bytes only; a lake block can be an internal DAG node or shard rather than a complete
-dataset/model root, and every generated entry remains unregistered. Murakumo also derives catalog DIDs
-for its current model entries at `GET /training/models`. Those DIDs name
-catalog records, not model-weight bytes. An operator can attach `artifactCid` and `assetManifestCid`
+An existing Yataverse CID can receive a deterministic DID without moving or changing the bytes. The
+Murakumo feature source resolves it at `GET /training/assets/<cid>/did.json`, but that route is not
+available in the current production Worker. The CLI can derive a DID for one CID or write a
+deduplicated index from a supplied lake inventory. These records identify CID bytes only; a lake
+block can be an internal DAG node or shard rather than a complete dataset/model root, and every
+generated entry remains unregistered. The Murakumo feature source also derives catalog DIDs for its
+current model entries at `GET /training/models`; that route is also not deployed yet. Those DIDs name
+catalog records, not model-weight bytes. A model DID document carries any source revision, license,
+and weight fingerprints already present in the model catalog; those are registry claims, not a
+Yataverse byte readback or proof of ownership. An operator can attach `artifactCid` and `assetManifestCid`
 to a catalog entry; Murakumo then exposes a separate artifact DID, marked unverified until the
 normal Yataverse readback and rights/contributor review pass. Model names or checksum text in
 registry notes are not enough to identify a DAG root or qualify contributor rewards. The index
 command processes an inventory file supplied by the operator; it does not query or enumerate an
 account's remote content inventory.
+
+When deployed, the asset DID document includes a `murakumo` status extension for registration, CID/manifest
+readbacks, claim review, registered-human eligibility, and reward allocation. `claimStatus: reviewed`
+means every submitted claim was accepted; partial or mixed claim decisions remain `mixed-review`.
+The aggregate human-eligibility field does not disclose claimant IDs, wallets, World ID data, or
+Human Passport scores. `rewardStatus: awaiting-complete-contributor-claims` and
+`not-eligible-human` explain why accepted claims do not yet pass allocation's complete-share and
+registered-human gates; `awaiting-payout-configuration` means the Murakumo chain, token, distributor,
+Safe addresses, or payout activation are not configured yet. `claim-root-prepared` means an
+off-chain allocation and claim root were prepared; it does not mean a token transfer was confirmed.
+These status values link to the public asset record and remain review attestations, not proof of
+legal title.
 
 For a legacy CIDv0, `yataverse get` and `yataverse verify` request and verify its raw dag-pb block.
 Use `yataverse canonical-cid <cid>` or the `artifactCid` emitted by `asset-manifest` to get the
@@ -116,6 +135,33 @@ evidence that the asset was actually used in the retroactive epoch. Shares must 
 allocation. If historical training costs are unknown, record them as `unmeasured`; do not invent a
 zero or estimate. Historical YATA rewards still require human registration, a funded epoch pool, and
 the normal wallet claim flow.
+
+The audited backfill snapshot for 2026-10-16 counted 825,390 rows across historical epoch manifests;
+that aggregate includes an epoch-5 P6 drill action and is not a verified unique lake-CID count. The
+available epoch 0–3 source inventories now produce an 825,258-record candidate index; each source
+hash, row count, and byte total was validated, and the gzip output passed integrity checking. A
+narrower 822,510-CID fence-B snapshot is also retained. Both indexes are outside the repository and
+have not been uploaded. Each block-CID entry remains `unregistered` and `cid-only-unverified`, with
+`not-eligible-unregistered` reward status. Epochs 4–6 add 132 rows (79,818 bytes), but their row CID
+lists are absent; seven manifest inventory-root DID candidates are recorded separately as
+unverified references and are not reward eligible. The inventory does not identify complete asset
+roots, contributors, rights, or actual training use.
+Three older epoch inventory blocks have locally verified CID/SHA-256 bytes, but remote Yataverse
+readback is still unverified and they are inventory metadata, not proven training assets. The nine
+model-catalog DID candidates include one SHA-256-derived artifact CID candidate for `ling-3.0-tiny`;
+the model file and Yataverse readback are not verified, and the other eight model entries lack artifact
+CIDs. A second SHA-256-derived candidate identifies the Qwen Image diffusion weight component, not
+the complete multi-file model. Neither candidate is reward eligible. See the
+[backfill audit snapshot](docs/legacy-did-backfill-2026-10-16.json) and generated indexes under
+`workspaces/codex/yataverse-training-did-index`. No legacy reward claims or transfers were created.
+
+The 2026-10-16 public bytes-plane check also found that the configured
+`https://ipfs.yataverse.com` read host had no base-host DNS record, Worker custom
+domain, or Worker route in the checked Cloudflare account. The wildcard CID
+subdomain DNS record existed, but direct CID-subdomain HTTPS readback failed.
+The CLI could not fetch the three inventory roots. A repository Wrangler file
+that declares these hosts is configuration evidence only; it does not establish
+that the Worker or domain is deployed. The audit snapshot records these limits.
 
 The MCP tools `yataverse_asset_manifest` and `yataverse_asset_did` perform local validation and
 deterministic derivation. They do not upload a manifest or prove an asset claim.

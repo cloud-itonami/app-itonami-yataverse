@@ -22,5 +22,7 @@ export function assetDidRecord(inputCid, domain = DEFAULT_DOMAIN) {
     assetRecordUrl: `https://${host}/training/assets/${cid}`,
     recordStatus: 'unregistered',
     evidenceStatus: 'cid-only-unverified',
+    rewardStatus: 'not-eligible-unregistered',
+    rewardEligibility: 'requires-verified-asset-root-rights-registered-contributors-and-training-use-review',
   };
 }
