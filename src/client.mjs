@@ -3,7 +3,7 @@
 //           but only inside the read host's own parent domain, at most 3 hops)
 //   write:  PUT <url><prefix><cid>     (Authorization required; NEVER follows a redirect)
 // Every read and every write is checked by re-deriving the CID from the bytes.
-import { rawCid, verifyBlock, isCidShape } from './cid.mjs';
+import { rawCid, verifyBlock, isCidShape, parseCid, CODEC_RAW } from './cid.mjs';
 
 export class YataverseError extends Error {
   constructor(code, detail) { super(detail ? `${code}: ${detail}` : code); this.code = code; }
@@ -40,10 +40,14 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
     if (!isCidShape(cid)) throw new YataverseError('bad-cid');
     let url = new URL(`/ipfs/${cid}`, readOrigin);
     for (let hop = 0; hop <= 3; hop++) {
+      url.searchParams.set('format', 'raw');
       if (!okScheme(url)) throw new YataverseError('redirect-not-https');
       if (parentDomain(url.hostname) !== parentDomain(readOrigin.hostname))
         throw new YataverseError('redirect-off-domain', url.hostname);
-      const res = await fetchImpl(url, { redirect: 'manual', signal: timeout() });
+      const res = await fetchImpl(url, {
+        redirect: 'manual', signal: timeout(),
+        headers: { accept: 'application/vnd.ipld.raw' },
+      });
       if (REDIRECTS.has(res.status)) {
         const loc = res.headers.get('location');
         if (!loc) throw new YataverseError('redirect-without-location');
@@ -59,7 +63,10 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
   }
 
   async function putBlock(cid, bytes) {
-    if (!isCidShape(cid)) throw new YataverseError('bad-cid');
+    const parsed = parseCid(cid);
+    if (!parsed) throw new YataverseError('bad-cid');
+    if (parsed.version !== 1 || parsed.codec !== CODEC_RAW)
+      throw new YataverseError('put-requires-cidv1-raw');
     if (!verifyBlock(cid, bytes)) throw new YataverseError('bytes-do-not-hash-to-cid');
     if (!authorize) throw new YataverseError('no-authorization-configured');
     const auth = await authorize();

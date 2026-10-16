@@ -1,17 +1,26 @@
 import fs from 'node:fs';
-import { rawCid, parseCid } from './cid.mjs';
+import readline from 'node:readline';
+import { once } from 'node:events';
+import { rawCid, parseCid, normalizeCid } from './cid.mjs';
 import { loadConfig, saveConfig, status, configDir, ConfigError } from './config.mjs';
 import { makeAuthorizer } from './auth.mjs';
 import { makeClient } from './client.mjs';
 import { serve } from './mcp.mjs';
 import { keygen, adminStatus, makeAdmin, AdminError } from './admin.mjs';
+import { canonicalAssetManifest } from './asset-manifest.mjs';
+import { assetDidRecord } from './asset-did.mjs';
 
 const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobase)
 
   yataverse cid <file|->               print the CIDv1 (raw, sha2-256) of a file or stdin
+  yataverse canonical-cid <cid>        normalize a CIDv0 or CIDv1 to CIDv1 base32
   yataverse get <cid> [-o file]        read a block, verified against its CID (stdout if no -o)
   yataverse verify <cid>               is it present, and do the served bytes hash to it?
   yataverse put <file|->               publish a block, then read it back and verify
+  yataverse asset-manifest <json|->    validate and canonicalize a training-asset manifest
+  yataverse asset-did <cid> [--domain host]  derive the deterministic Murakumo did:web for a CID
+  yataverse asset-did-index <jsonl|-> [--domain host]
+                                       stream unique CIDs to JSONL DID records (CID-only, unverified)
   yataverse status                     how this machine is configured (names only, no secrets)
   yataverse config init [--url U] [--read-url U] [--prefix P] [--tenant-id t_..] [--storage S]
                         [--sa-token-stdin]   write ~/.config/yataverse (secret from stdin, 0600)
@@ -42,6 +51,44 @@ or a static value. This tool mints no credential; a service-account secret comes
 
 const readInput = (arg) => (arg === '-' || arg === undefined) ? fs.readFileSync(0) : fs.readFileSync(arg);
 
+async function writeAssetDidIndex(inputPath, domain, stdout) {
+  const input = inputPath === '-' || inputPath === undefined
+    ? process.stdin
+    : fs.createReadStream(inputPath);
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  const seen = new Set();
+  let lineNumber = 0;
+  let count = 0;
+  for await (const line of lines) {
+    lineNumber++;
+    if (!line.trim()) continue;
+    let parsed;
+    try {
+      parsed = line.trimStart().startsWith('{') ? JSON.parse(line) : line.trim();
+    } catch {
+      throw new Error(`inventory line ${lineNumber} is not valid JSON`);
+    }
+    const cidValue = typeof parsed === 'string' ? parsed : parsed?.cid;
+    let record;
+    try {
+      record = assetDidRecord(cidValue, domain);
+    } catch (error) {
+      throw new Error(`inventory line ${lineNumber}: ${error.message}`);
+    }
+    if (seen.has(record.cid)) continue;
+    seen.add(record.cid);
+    const output = {
+      ...record,
+      ...(Number.isSafeInteger(parsed?.bytes) && parsed.bytes >= 0
+        ? { inventoryBytes: parsed.bytes }
+        : {}),
+    };
+    if (!stdout.write(`${JSON.stringify(output)}\n`)) await once(stdout, 'drain');
+    count++;
+  }
+  return { uniqueCids: count };
+}
+
 function flags(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -64,6 +111,28 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
     switch (cmd) {
       case undefined: case 'help': case '--help': case '-h': out(USAGE); return 0;
       case 'cid': { const b = readInput(f._[0]); out({ cid: rawCid(b), bytes: b.length }); return 0; }
+      case 'canonical-cid': {
+        const cid = normalizeCid(f._[0]);
+        if (!cid) throw new Error('expected a supported CIDv0 or CIDv1 sha2-256 CID');
+        out({ cid, version: 1 });
+        return 0;
+      }
+      case 'asset-did': {
+        out(assetDidRecord(f._[0], f.domain ?? process.env.TRAINING_ASSET_DID_DOMAIN));
+        return 0;
+      }
+      case 'asset-did-index': {
+        const result = await writeAssetDidIndex(
+          f._[0], f.domain ?? process.env.TRAINING_ASSET_DID_DOMAIN, stdout,
+        );
+        stderr.write(`wrote ${result.uniqueCids} unique CID DID records; all remain unregistered and unverified\n`);
+        return 0;
+      }
+      case 'asset-manifest': {
+        const manifest = canonicalAssetManifest(readInput(f._[0]).toString('utf8'));
+        stdout.write(manifest);
+        return 0;
+      }
       case 'status': out(status(loadConfig())); return 0;
       case 'config': {
         if (f._[0] !== 'init') { stderr.write('usage: yataverse config init [...]\n'); return 2; }

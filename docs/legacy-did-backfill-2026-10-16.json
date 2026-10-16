@@ -1,0 +1,160 @@
+{
+  "schema": "yataverse.legacy-did-backfill-audit/v1",
+  "generatedAt": "2026-10-16",
+  "didDomain": "api.murakumo.cloud",
+  "lakeBlockInventory": {
+    "historicalAuditRows": 825390,
+    "historicalAuditScope": "epoch manifests 0 through 6; includes one epoch-5 P6 drill action and is not a verified unique lake-CID count",
+    "verifiedSourceRows": 825258,
+    "verifiedUniqueCidRecords": 825258,
+    "verifiedSourceBytes": 91395006284,
+    "verifiedSources": [
+      {
+        "epoch": 0,
+        "file": "inventory-20260926.jsonl",
+        "rows": 821533,
+        "sha256": "f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188"
+      },
+      {
+        "epoch": 1,
+        "file": "inventory-delta-fence-20260929.jsonl",
+        "rows": 977,
+        "sha256": "899e7e26087e98a9c6859db4cd697753f26745e5ac46dc3f3a071a05c585e7d1"
+      },
+      {
+        "epoch": 2,
+        "file": "epoch-2-inventory.jsonl",
+        "rows": 2700,
+        "sha256": "d5c97b72281d2688a0623943a86881a1d36c5e2a4ab264ddec59e77ca1b4de7f"
+      },
+      {
+        "epoch": 3,
+        "file": "inventory.jsonl",
+        "rows": 48,
+        "sha256": "c427f6d34a994e8b05b738340f9db19532bd773e45e2058a8e1569a2c1db02ac"
+      }
+    ],
+    "candidateIndex": {
+      "file": "workspaces/codex/yataverse-training-did-index/lake-cid-did-candidates-epoch0-through3.jsonl.gz",
+      "uniqueCidRecords": 825258,
+      "compressedBytes": 43829349,
+      "sha256": "8521869965fad9e49de2e1afd19cf822b33ea5adab0283db2be85700dfcc3f56",
+      "storedOutsideRepository": true,
+      "uploadedToYataverse": false,
+      "verificationStatus": "source hashes, row counts, and byte totals validated; gzip integrity checked"
+    },
+    "materializedCandidateIndex": {
+      "file": "workspaces/codex/yataverse-training-did-index/lake-cid-did-candidates-epoch0-through1.jsonl.gz",
+      "source": "inventory-candidate-fence-b-20260929.jsonl",
+      "sourceRows": 822510,
+      "sourceSha256": "9abc4740e681c73e74a70079577dd37bd45e62b887de1efbccf7d3890ad71336",
+      "uniqueCidRecords": 822510,
+      "compressedBytes": 44210121,
+      "sha256": "8e6dcacbbeba314463e5d5c6173386efb17e70a29c15c3155c54daeafc3ed6d2",
+      "uploadedToYataverse": false,
+      "recordStatus": "unregistered",
+      "evidenceStatus": "cid-only-unverified",
+      "rewardStatus": "not-eligible-unregistered"
+    },
+    "notIncluded": [
+      {
+        "epoch": 4,
+        "rows": 24,
+        "reason": "inventory delta source file not present in the inspected local workspace"
+      },
+      {
+        "epoch": 5,
+        "rows": 1,
+        "reason": "P6 drill action; not a lake-listing capture"
+      },
+      {
+        "epoch": 6,
+        "rows": 107,
+        "reason": "inventory delta source file not present in the inspected local workspace"
+      }
+    ],
+    "previousFullCandidateIndex": {
+      "file": "lake-block-did-candidates-reviewed.jsonl.gz",
+      "sha256": "708d625cc5fc3a558373ca4aa45ac0a6f700450ec1bc650e7d4bd7057677f449",
+      "verificationStatus": "unavailable; file not present in the inspected workspace"
+    },
+    "manifestRootCandidateIndex": {
+      "file": "workspaces/codex/yataverse-training-did-index/lake-inventory-root-did-candidates-epoch0-through6.jsonl",
+      "records": 7,
+      "sha256": "525b4aaf6d12755b698aa563f7a7553e46ba7c3a8e9c1f2adf55b4370388a08d",
+      "source": "inventory.cid references from epoch manifests 0 through 6",
+      "verificationStatus": "manifest references only; roots not resolved or read back",
+      "uploadedToYataverse": false,
+      "rewardStatus": "not-eligible-unverified-inventory-roots"
+    },
+    "recordStatus": "unregistered",
+    "evidenceStatus": "cid-only-unverified",
+    "candidateRewardStatus": "not-eligible-unregistered",
+    "rewardStatus": "not-eligible-no-asset-root-contributor-rights-or-training-use-evidence"
+  },
+  "verifiedEpochInventoryRoots": [
+    {
+      "epoch": 3,
+      "cid": "bafkreigee73ngsuzj2fqlnzygqhz3mmvgk6xopsf4icyvdqvngrmdwycvq",
+      "did": "did:web:api.murakumo.cloud:training:assets:bafkreigee73ngsuzj2fqlnzygqhz3mmvgk6xopsf4icyvdqvngrmdwycvq",
+      "rows": 48,
+      "inventoryBlockBytes": 29040,
+      "manifestFileBytes": 3936,
+      "localCidAndSha256Verified": true,
+      "remoteReadback": "unverified",
+      "assetClassification": "inventory-metadata-block",
+      "rewardStatus": "not-eligible"
+    },
+    {
+      "epoch": 4,
+      "cid": "bafkreia7apwkvsjh5be5v3sonkkq3jq4hxiiooymk2arxu2x6tfvphuuwa",
+      "did": "did:web:api.murakumo.cloud:training:assets:bafkreia7apwkvsjh5be5v3sonkkq3jq4hxiiooymk2arxu2x6tfvphuuwa",
+      "rows": 24,
+      "inventoryBlockBytes": 14520,
+      "manifestFileBytes": 1968,
+      "localCidAndSha256Verified": true,
+      "remoteReadback": "unverified",
+      "assetClassification": "inventory-metadata-block",
+      "rewardStatus": "not-eligible"
+    },
+    {
+      "epoch": 6,
+      "cid": "bafkreiatoqsucmlvs3ktvtrmkglx6vlqauiodzj26mqwnt2flcpggmnce4",
+      "did": "did:web:api.murakumo.cloud:training:assets:bafkreiatoqsucmlvs3ktvtrmkglx6vlqauiodzj26mqwnt2flcpggmnce4",
+      "rows": 107,
+      "inventoryBlockBytes": 64735,
+      "manifestFileBytes": 8774,
+      "localCidAndSha256Verified": true,
+      "remoteReadback": "unverified",
+      "assetClassification": "inventory-metadata-block",
+      "rewardStatus": "not-eligible"
+    }
+  ],
+  "modelCatalog": {
+    "candidateDidRecords": 9,
+    "artifactCidCandidates": 1,
+    "artifactCidsVerified": 0,
+    "artifactCidsMissing": 8,
+    "weightHashCidCandidates": 2,
+    "candidateIndex": "workspaces/codex/yataverse-training-did-index/model-catalog-did-candidates.jsonl",
+    "rewardStatus": "not-eligible-unverified-artifact-rights-contributor-and-training-use-evidence",
+    "didMeaning": "model catalog record identity; asset DID only when an artifact CID is declared"
+  },
+  "publicBytesPlane": {
+    "configuredReadUrl": "https://ipfs.yataverse.com",
+    "zoneStatus": "active",
+    "baseHostDnsRecord": "absent",
+    "wildcardCidSubdomainDnsRecord": "present-proxied-aaaa-100::",
+    "workerCustomDomainForReadHost": "absent",
+    "workerRouteForReadHost": "absent",
+    "workerScriptNamedNetKotobaseIpfs": "not-found-in-checked-account-script-list",
+    "cliReadback": "fetch-failed-for-all-three-epoch-inventory-roots",
+    "browserPathReadback": "base-host-err-name-not-resolved; cid-subdomain-err-ssl-version-or-cipher-mismatch",
+    "status": "public-readback-unavailable-at-audit-time",
+    "sourceWranglerConfigProvesDeployment": false
+  },
+  "payouts": {
+    "legacyClaimsCreated": 0,
+    "yataTransfersCreated": 0
+  }
+}
