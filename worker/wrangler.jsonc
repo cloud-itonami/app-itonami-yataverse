@@ -26,7 +26,11 @@
     "MAX_BLOCK_BYTES": "16777216",
     // Read tier used only when B2 has no copy: the existing self-hosted Reader
     // (JUN-228). Its bytes are verified against the CID like every other read.
-    "READ_FALLBACK_URL": "https://ipfs.yataverse.com"
+    "READ_FALLBACK_URL": "https://ipfs.yataverse.com",
+    // Awai Drive packs (/awai-drive/v1/packs/<sha256>): the Drive WebView origin allowed by
+    // CORS (comma-separated) and the largest pack accepted (12 MiB, Drive's CAR bound).
+    "DRIVE_ALLOWED_ORIGINS": "http://tauri.localhost",
+    "DRIVE_MAX_PACK_BYTES": "12582912"
   },
   "observability": { "enabled": true, "logs": { "head_sampling_rate": 1 } }
 }
