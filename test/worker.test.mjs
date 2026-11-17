@@ -1,0 +1,144 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import { handle, tokenAllowed } from '../worker/src/index.mjs';
+import { signV4, regionFromEndpoint } from '../worker/src/sigv4.mjs';
+import { rawCid } from '../src/cid.mjs';
+
+const TOKEN = 'yv_write_0123456789abcdef';
+const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const ENV = {
+  B2_ENDPOINT: 'https://s3.us-west-004.backblazeb2.com', B2_BUCKET: 'bucket', B2_KEY_ID: 'kid', B2_APP_KEY: 'secret',
+  B2_PREFIX: 'ipld/', WRITE_TOKEN_SHA256: sha(TOKEN), MAX_BLOCK_BYTES: '1024',
+};
+const NOW = () => new Date('2026-11-18T00:00:00Z');
+
+/** In-memory B2 plus an optional fallback reader. `mode` injects faults. */
+function fakeStore({ mode = 'ok', fallback = new Map() } = {}) {
+  const objects = new Map(); const log = [];
+  const fetchImpl = async (url, init = {}) => {
+    const u = new URL(url); const method = init.method ?? 'GET';
+    log.push({ host: u.host, method, path: u.pathname, auth: init.headers?.authorization ?? null, redirect: init.redirect });
+    if (u.host === 's3.us-west-004.backblazeb2.com') {
+      assert.match(init.headers.authorization, /^AWS4-HMAC-SHA256 Credential=kid\/20261118\/us-west-004\/s3\/aws4_request/);
+      const key = u.pathname.replace('/bucket/', '');
+      if (method === 'PUT') {
+        if (mode === 'put-fails') return new Response(null, { status: 500 });
+        const body = Buffer.from(init.body);
+        assert.equal(init.headers['x-amz-content-sha256'], sha(body));
+        objects.set(key, mode === 'corrupt-store' ? Buffer.from('tampered') : body);
+        return new Response(null, { status: 200 });
+      }
+      const b = objects.get(key);
+      return b ? new Response(b, { status: 200 }) : new Response(null, { status: 404 });
+    }
+    if (u.host === 'ipfs.yataverse.com') {
+      const cid = u.pathname.split('/').pop(); const b = fallback.get(cid);
+      return b ? new Response(b, { status: 200 }) : new Response(null, { status: 404 });
+    }
+    throw new Error(`unexpected host ${u.host}`);
+  };
+  return { objects, log, fetchImpl };
+}
+
+const put = (cid, body, { auth = `Bearer ${TOKEN}`, ct = 'application/vnd.ipld.raw' } = {}) =>
+  new Request(`https://yataverse.com/ipfs/${cid}`, { method: 'PUT', body, headers: { authorization: auth, 'content-type': ct } });
+const get = (cid, method = 'GET') => new Request(`https://yataverse.com/ipfs/${cid}`, { method });
+
+test('PUT stores, reads back and verifies; GET then serves the same bytes', async () => {
+  const s = fakeStore(); const bytes = Buffer.from('hello yataverse'); const cid = rawCid(bytes);
+  const res = await handle(put(cid, bytes), ENV, { fetchImpl: s.fetchImpl, now: NOW });
+  assert.equal(res.status, 201);
+  assert.deepEqual(await res.json(), { cid, bytes: bytes.length, verified: true });
+  assert.ok(s.objects.has(`ipld/${cid}`));
+  assert.ok(s.log.every((r) => r.redirect === 'manual'));
+  const g = await handle(get(cid), ENV, { fetchImpl: s.fetchImpl, now: NOW });
+  assert.equal(g.status, 200);
+  assert.equal(g.headers.get('content-type'), 'application/vnd.ipld.raw');
+  assert.deepEqual(Buffer.from(await g.arrayBuffer()), bytes);
+  const h = await handle(get(cid, 'HEAD'), ENV, { fetchImpl: s.fetchImpl, now: NOW });
+  assert.equal(h.status, 200); assert.equal(h.headers.get('content-length'), String(bytes.length));
+});
+
+test('PUT refuses a missing or wrong token, wrong type, mismatched bytes and non-raw CIDs before storing', async () => {
+  const s = fakeStore(); const bytes = Buffer.from('x'.repeat(20)); const cid = rawCid(bytes);
+  const deps = { fetchImpl: s.fetchImpl, now: NOW };
+  assert.equal((await handle(put(cid, bytes, { auth: 'Bearer wrong-token-0000000' }), ENV, deps)).status, 401);
+  assert.equal((await handle(put(cid, bytes, { auth: '' }), ENV, deps)).status, 401);
+  assert.equal((await handle(put(cid, bytes, { ct: 'text/plain' }), ENV, deps)).status, 415);
+  assert.equal((await handle(put(cid, Buffer.from('other bytes here')), ENV, deps)).status, 400);
+  const dagPb = 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi';
+  assert.equal((await handle(put(dagPb, bytes), ENV, deps)).status, 400);
+  assert.equal((await handle(put(cid, Buffer.alloc(2048, 1)), ENV, deps)).status, 413); // size is checked before hashing
+  assert.equal(s.objects.size, 0);
+  assert.equal(s.log.length, 0);
+});
+
+test('PUT over the size cap is 413 and writes are 503 without a configured token', async () => {
+  const s = fakeStore(); const big = Buffer.alloc(2048, 7); const cid = rawCid(big);
+  assert.equal((await handle(put(cid, big), ENV, { fetchImpl: s.fetchImpl, now: NOW })).status, 413);
+  const small = Buffer.from('small block bytes'); const c2 = rawCid(small);
+  assert.equal((await handle(put(c2, small), { ...ENV, WRITE_TOKEN_SHA256: '' }, { fetchImpl: s.fetchImpl, now: NOW })).status, 503);
+  assert.equal(s.objects.size, 0);
+});
+
+test('a failed store write or a corrupt readback is never reported as success', async () => {
+  const bytes = Buffer.from('important block'); const cid = rawCid(bytes);
+  let s = fakeStore({ mode: 'put-fails' });
+  assert.equal((await handle(put(cid, bytes), ENV, { fetchImpl: s.fetchImpl, now: NOW })).status, 502);
+  s = fakeStore({ mode: 'corrupt-store' });
+  const r = await handle(put(cid, bytes), ENV, { fetchImpl: s.fetchImpl, now: NOW });
+  assert.equal(r.status, 502); assert.equal((await r.json()).error, 'readback-does-not-hash-to-cid');
+  const g = await handle(get(cid), ENV, { fetchImpl: s.fetchImpl, now: NOW });
+  assert.equal(g.status, 502);
+});
+
+test('GET falls back to the configured Reader only on a B2 miss, and verifies those bytes too', async () => {
+  const good = Buffer.from('lake block on xavier'); const cid = rawCid(good);
+  const other = Buffer.from('another lake block'); const cid2 = rawCid(other);
+  const fallback = new Map([[cid, good], [cid2, Buffer.from('tampered')]]);
+  const s = fakeStore({ fallback });
+  const env = { ...ENV, READ_FALLBACK_URL: 'https://ipfs.yataverse.com' };
+  const ok = await handle(get(cid), env, { fetchImpl: s.fetchImpl, now: NOW });
+  assert.equal(ok.status, 200); assert.deepEqual(Buffer.from(await ok.arrayBuffer()), good);
+  assert.equal((await handle(get(cid2), env, { fetchImpl: s.fetchImpl, now: NOW })).status, 502);
+  const absent = rawCid(Buffer.from('nowhere'));
+  assert.equal((await handle(get(absent), env, { fetchImpl: s.fetchImpl, now: NOW })).status, 404);
+  assert.equal((await handle(get(absent), ENV, { fetchImpl: s.fetchImpl, now: NOW })).status, 404);
+  assert.ok(!s.log.some((r) => r.host === 'ipfs.yataverse.com' && r.auth));
+});
+
+test('routing: health, bad CIDs, unknown paths and methods; store config is required', async () => {
+  const s = fakeStore(); const deps = { fetchImpl: s.fetchImpl, now: NOW };
+  const h = await handle(new Request('https://yataverse.com/health'), {}, deps);
+  assert.equal(h.status, 200); assert.deepEqual(await h.json(), { ok: true, service: 'yataverse-bytes' });
+  assert.equal((await handle(new Request('https://yataverse.com/ipfs/not-a-cid'), ENV, deps)).status, 404);
+  assert.equal((await handle(new Request('https://yataverse.com/ipfs/bafkreinotacid'), ENV, deps)).status, 400);
+  assert.equal((await handle(new Request('https://yataverse.com/'), ENV, deps)).status, 404);
+  const cid = rawCid(Buffer.from('m'));
+  assert.equal((await handle(new Request(`https://yataverse.com/ipfs/${cid}`, { method: 'DELETE' }), ENV, deps)).status, 405);
+  assert.equal((await handle(get(cid), { ...ENV, B2_APP_KEY: '' }, deps)).status, 503);
+  assert.equal(s.log.length, 0);
+});
+
+test('tokenAllowed accepts any configured digest and ignores malformed entries', () => {
+  assert.equal(tokenAllowed(`Bearer ${TOKEN}`, `zz, ${sha('another-token-123456')}, ${sha(TOKEN)}`), true);
+  assert.equal(tokenAllowed(`Bearer ${TOKEN}`, 'not-hex'), false);
+  assert.equal(tokenAllowed(`Basic ${TOKEN}`, sha(TOKEN)), false);
+  assert.equal(tokenAllowed('Bearer short', sha('short')), false);
+});
+
+test('signV4 matches the AWS S3 GET Object example signature', () => {
+  // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+  const h = signV4({
+    method: 'GET', url: 'https://examplebucket.s3.amazonaws.com/test.txt', headers: { range: 'bytes=0-9' },
+    payloadHash: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    keyId: 'AKIAIOSFODNN7EXAMPLE', secret: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', region: 'us-east-1',
+    now: new Date('2013-05-24T00:00:00Z'),
+  });
+  assert.equal(h.authorization, 'AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, '
+    + 'SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, '
+    + 'Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41');
+  assert.equal(regionFromEndpoint('https://s3.eu-central-003.backblazeb2.com'), 'eu-central-003');
+  assert.equal(regionFromEndpoint('https://example.com'), null);
+});

@@ -303,10 +303,33 @@ Credentials come from the operator's config and **never pass through a tool argu
 any argument named like a credential is refused. `yataverse_put` requires `confirm: true` (it writes to a
 shared plane and cannot be undone). Bytes returned by `yataverse_get` are untrusted data.
 
+## yataverse.com Worker (Backblaze B2)
+
+`worker/` is the server side of the bytes plane on `yataverse.com` (AWAI-3102). Owner decision
+2026-11-17: the plane uses yataverse.com hosts (kotobase is a library name, not a host), Cloudflare
+may be used, and blocks are stored in Backblaze B2 through its S3-compatible API. It uses no R2,
+KV, D1 or Durable Objects.
+
+| Request | Behaviour |
+|---|---|
+| `PUT /ipfs/<cid>` | `Authorization: Bearer <write token>`, `Content-Type: application/vnd.ipld.raw`. CIDv1/raw/sha2-256 only, at most `MAX_BLOCK_BYTES`. The body must hash to the CID; it is stored at `B2_PREFIX + cid`, read back from B2 and verified again before `201`. |
+| `GET` / `HEAD /ipfs/<cid>` | Served from B2 after verification. On a B2 miss, `READ_FALLBACK_URL` (the self-hosted Reader at `ipfs.yataverse.com`) is tried and its bytes are verified the same way. |
+| `GET /health` | Liveness only. |
+
+The Worker never follows a redirect. Write tokens are checked against `WRITE_TOKEN_SHA256`
+(comma-separated SHA-256 hex digests), so the Worker holds no token in clear. Verifying the
+Authn Biscuit instead is a follow-up: the Authn service does not publish its verification key.
+
+Merging does **not** deploy it. Deploying adds the `yataverse.com` custom domain and needs the
+owner's approval and these secrets: `B2_ENDPOINT`, `B2_BUCKET`, `B2_KEY_ID`, `B2_APP_KEY`,
+`WRITE_TOKEN_SHA256` (`wrangler secret put <NAME>` from `worker/`). After deploying, check
+`/health`, then put one block with a test token and read it back with `yataverse get`.
+
 ## Test
 
 ```sh
-npm test        # 40 tests: CID vectors, redirect policy, Authn exchange/caching, sign-in CACAO verified by a fake Authn, admin flow, config permissions, MCP
+npm test        # CLI: CID vectors, redirect policy, Authn exchange/caching, sign-in CACAO verified by a fake Authn, admin flow, config permissions, MCP
+                # Worker: write/read/verify against a fake B2, fallback verification, SigV4 vector from the AWS docs
 ```
 
 Apache-2.0.
