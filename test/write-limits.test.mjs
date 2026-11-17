@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { handle } from '../worker/src/index.mjs';
 import { rawCid } from '../src/cid.mjs';
 import { encodeCarV1 } from '../src/car.mjs';
-import { ENV, TOKEN, NOW, fakeStore, fakeLimiter } from './worker-fixtures.mjs';
+import { ENV, TOKEN, NOW, fakeStore, fakeLimiter, dataKeys } from './worker-fixtures.mjs';
 
 const deps = (s) => ({ fetchImpl: s.fetchImpl, now: NOW });
 const ip = (n) => `203.0.113.${n}`;
@@ -22,7 +22,7 @@ test('writes beyond the per-client request budget are 429 and store nothing; oth
   const r = await handle(putBlock(Buffer.from('block 3'), ip(1)), env, deps(s));
   assert.equal(r.status, 429); assert.equal(r.headers.get('retry-after'), '60');
   assert.equal((await r.json()).error, 'write-rate-limited');
-  assert.equal(s.objects.size, 2);
+  assert.equal(dataKeys(s).length, 2);
   assert.equal((await handle(putBlock(Buffer.from('block 3'), ip(2)), env, deps(s))).status, 201);
 });
 
@@ -34,7 +34,7 @@ test('the byte budget counts started MiB per client and is checked before storin
   assert.equal(mib.used.get(ip(3)), 3);
   const r = await handle(putBlock(Buffer.from('tiny'), ip(3)), env, deps(s));
   assert.equal(r.status, 429); assert.equal((await r.json()).error, 'write-bytes-limited');
-  assert.equal(s.objects.size, 1);
+  assert.equal(dataKeys(s).length, 1);
 });
 
 test('CAR imports and Drive pack uploads are limited the same way; Drive keeps its CORS header on 429', async () => {
@@ -57,7 +57,7 @@ test('writes fail closed without the limiter bindings; reads are not limited', a
   const r = await handle(putBlock(Buffer.from('x'), ip(6)), env, deps(s));
   assert.equal(r.status, 503); assert.equal((await r.json()).error, 'write-limits-not-configured');
   assert.equal((await handle(putPack(ip(6)), env, deps(s))).status, 503);
-  assert.equal(s.objects.size, 0);
+  assert.equal(dataKeys(s).length, 0);
   const none = { ...ENV, WRITE_REQUEST_LIMITER: fakeLimiter(0) };
   assert.equal((await handle(new Request(`https://yataverse.com/ipfs/${rawCid(Buffer.from('x'))}`), none, deps(s))).status, 404);
 });

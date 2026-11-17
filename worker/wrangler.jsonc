@@ -11,6 +11,11 @@
   //   wrangler secret put B2_KEY_ID            an application key scoped to that bucket
   //   wrangler secret put B2_APP_KEY
   //   wrangler secret put WRITE_TOKEN_SHA256   comma-separated SHA-256 hex of write tokens
+  //   wrangler secret put RECEIPT_SIGNING_KEY  Ed25519 private JWK {kty, crv, d, x} (AWAI-3305).
+  //                                            Its keyId must be in RECEIPT_PUBLIC_KEYS below, or
+  //                                            writes fail closed with 503.
+  // Deploy with `wrangler deploy --var SOURCE_COMMIT:<merged main commit>`; the commit is part of
+  // the policy each receipt names.
   "name": "yataverse-bytes",
   "main": "src/index.mjs",
   "compatibility_date": "2026-11-01",
@@ -30,7 +35,25 @@
     // Awai Drive packs (/awai-drive/v1/packs/<sha256>): the Drive WebView origin allowed by
     // CORS (comma-separated) and the largest pack accepted (12 MiB, Drive's CAR bound).
     "DRIVE_ALLOWED_ORIGINS": "http://tauri.localhost",
-    "DRIVE_MAX_PACK_BYTES": "12582912"
+    "DRIVE_MAX_PACK_BYTES": "12582912",
+    // Published receipt signing keys (/.well-known/yataverse-receipt-keys.json, did:web:yataverse.com).
+    // keyId = sha256(0xed01 || public key). Times are Unix milliseconds. Rotation: add a key with
+    // keyEpoch + 1, set notAfter on the old one and keep it listed; revocation sets revokedAt.
+    "RECEIPT_PUBLIC_KEYS": {
+      "v": 1,
+      "signer": "did:web:yataverse.com",
+      "keys": [
+        {
+          "keyId": "0xad062e68a246d01a369edc6d3713cbbc737b8469208796e52b8c6e943e92eafc",
+          "keyEpoch": 1,
+          "alg": "Ed25519",
+          "publicKeyJwk": { "kty": "OKP", "crv": "Ed25519", "x": "tG9ponOv0_BqWPLw0xpBd9JPKZpImv2yWbT3G7SXdy4" },
+          "notBefore": 1794957496429,
+          "notAfter": null,
+          "revokedAt": null
+        }
+      ]
+    }
   },
   // Per-client write budgets (AWAI-3160, worker/src/write-limits.mjs). The window may only be
   // 10 or 60 seconds; counters are per Cloudflare location. namespace_id must be unique in the account.

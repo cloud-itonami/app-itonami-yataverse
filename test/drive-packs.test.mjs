@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { handle } from '../worker/src/index.mjs';
 import { parseCar } from '../src/car.mjs';
-import { ENV, NOW, fakeStore } from './worker-fixtures.mjs';
+import { ENV, NOW, fakeStore, dataKeys } from './worker-fixtures.mjs';
 
 const fixture = (name) => fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url));
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -64,7 +64,7 @@ test('uploads are refused unless the body is the named, bounded, well-formed pac
   const wrongType = new Request(url(sha(bytes)), { method: 'PUT', body: bytes, headers: { 'content-type': 'application/octet-stream' } });
   assert.equal((await handle(wrongType, ENV, deps(s))).status, 415);
   assert.equal((await handle(new Request(url(sha(bytes)) + '?x=1', { method: 'PUT', body: bytes, headers: { 'content-type': 'application/vnd.ipld.car' } }), ENV, deps(s))).status, 400);
-  assert.equal(s.objects.size, 0);
+  assert.equal(dataKeys(s).length, 0);
 });
 
 test('CORS: the Drive origin gets a preflight answer, other origins do not', async () => {

@@ -164,3 +164,10 @@ YataverseStorageReceipt(
   - keccak256（`a` を 200 個、2 block）: `0x96ea54061def936c4be90b518992fdc6f12f535068a256229aca54267b4d084d`
 
   いずれも本実装の値と一致した。これは参照実装と同じ値になるという証拠で、本実装が正しいことの証明ではない。test はこの値を固定値として持ち、oracle を CI や実行経路には入れない。
+- **段階 2・3（[AWAI-3305](https://linear.app/kotobalabs/issue/AWAI-3305)）:** `worker/src/receipts.mjs`。3 種類の書込みで受領証を返し、B2 の `ipld/receipts/by-request/<requestId>` に保存する。
+  - 順序: 検査 → 署名鍵と既存の受領証の確認（衝突なら 409、bytes は保存しない）→ 保存と readback → 署名と受領証の保存。再送でも保存と readback はやり直し、受領証は保存済みのものを返す。
+  - 衝突の判定: `kind`・`subject`・`size`・`contentDigest`・`requester` のどれかが違えば 409。
+  - 署名鍵が無い、公開されていない、今有効でない場合は書込みを 503 にする（署名のない成功を返さない）。
+  - policy の記録は dag-cbor の block として保存するので、`policyRevision` は block の CID の digest と同じになり、過去の版も `/ipfs/<cid>` で読める。WAF の rule は Worker の外の設定なので、policy には宣言として記録する（`EXTERNAL_WRITE_LIMITS`）。
+  - 同じ `requestId` の新しい request が同時に 2 本来た場合、両方が新しい受領証を出し得る（内容は同じで `acceptedAt` だけが違う）。Worker は状態を持たないため防げない。内容が同じなので §7 の「矛盾する受領証」には当たらない。
+  - 鍵（epoch 1、keyId `0xad062e68…eafc`）は 2026-11-18 に生成し、private JWK は手元に保存せず `wrangler secret put` に直接渡した。

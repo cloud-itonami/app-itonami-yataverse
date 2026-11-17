@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { TOKEN, sha, ENV, NOW, fakeStore } from './worker-fixtures.mjs';
+import { TOKEN, sha, ENV, NOW, fakeStore, dataKeys } from './worker-fixtures.mjs';
 import { handle, tokenAllowed } from '../worker/src/index.mjs';
 import { signV4, regionFromEndpoint } from '../worker/src/sigv4.mjs';
 import { rawCid, cidFor, CODEC_DAG_CBOR } from '../src/cid.mjs';
@@ -13,7 +13,9 @@ test('PUT stores, reads back and verifies; GET then serves the same bytes', asyn
   const s = fakeStore(); const bytes = Buffer.from('hello yataverse'); const cid = rawCid(bytes);
   const res = await handle(put(cid, bytes), ENV, { fetchImpl: s.fetchImpl, now: NOW });
   assert.equal(res.status, 201);
-  assert.deepEqual(await res.json(), { cid, bytes: bytes.length, verified: true });
+  const body = await res.json();
+  assert.deepEqual({ cid: body.cid, bytes: body.bytes, verified: body.verified }, { cid, bytes: bytes.length, verified: true });
+  assert.equal(body.receipt.v, 1); assert.match(body.receiptCid, /^bafyrei/);
   assert.ok(s.objects.has(`ipld/${cid}`));
   assert.ok(s.log.every((r) => r.redirect === 'manual'));
   const g = await handle(get(cid), ENV, { fetchImpl: s.fetchImpl, now: NOW });
@@ -34,7 +36,7 @@ test('PUT refuses a missing or wrong token, wrong type, mismatched bytes and non
   const dagPb = 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi';
   assert.equal((await handle(put(dagPb, bytes), ENV, deps)).status, 400);
   assert.equal((await handle(put(cid, Buffer.alloc(2048, 1)), ENV, deps)).status, 413); // size is checked before hashing
-  assert.equal(s.objects.size, 0);
+  assert.equal(dataKeys(s).length, 0);
   assert.equal(s.log.length, 0);
 });
 
@@ -43,7 +45,7 @@ test('PUT over the size cap is 413 and writes are 503 without a configured token
   assert.equal((await handle(put(cid, big), ENV, { fetchImpl: s.fetchImpl, now: NOW })).status, 413);
   const small = Buffer.from('small block bytes'); const c2 = rawCid(small);
   assert.equal((await handle(put(c2, small), { ...ENV, WRITE_TOKEN_SHA256: '' }, { fetchImpl: s.fetchImpl, now: NOW })).status, 503);
-  assert.equal(s.objects.size, 0);
+  assert.equal(dataKeys(s).length, 0);
 });
 
 test('PUT accepts canonical DAG-CBOR and refuses non-canonical DAG-CBOR under a dag-cbor CID', async () => {
@@ -57,7 +59,7 @@ test('PUT accepts canonical DAG-CBOR and refuses non-canonical DAG-CBOR under a 
   const unsorted = Buffer.from('a2616201616102', 'hex');       // {"b":1,"a":2}: keys out of order
   const r = await handle(put(cidFor(unsorted, CODEC_DAG_CBOR), unsorted), ENV, deps);
   assert.equal(r.status, 400); assert.equal((await r.json()).error, 'not-canonical-dag-cbor:map-keys-not-sorted');
-  assert.equal(s.objects.size, 1);
+  assert.equal(dataKeys(s).length, 1);
 });
 
 test('a failed store write or a corrupt readback is never reported as success', async () => {
