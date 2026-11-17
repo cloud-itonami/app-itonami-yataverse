@@ -141,3 +141,17 @@ export function verifyBlock(cid, bytes) {
   if (!p || p.hashCode !== SHA2_256) return false;
   return crypto.timingSafeEqual(p.digest, sha256(bytes));
 }
+
+/** Binary form of a CIDv1 string (the bytes after the multibase prefix). null for anything else. */
+export function cidToBytes(cid) {
+  const p = parseCid(cid);
+  if (!p || p.version !== 1) return null;
+  return base32Decode(cid.slice(1));
+}
+
+/** Canonical base32 CIDv1 string of binary CID bytes, or null (CIDv0 and malformed CIDs). */
+export function cidFromBytes(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length < 4 || bytes[0] !== 0x01) return null;
+  const cid = 'b' + base32(bytes);
+  return parseCid(cid) ? cid : null;
+}

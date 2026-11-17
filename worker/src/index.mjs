@@ -6,6 +6,12 @@
 //   PUT /ipfs/<cid>       Authorization: Bearer <write token>. CIDv1/sha2-256 with codec raw or
 //                          dag-cbor (canonical DAG-CBOR only). The body must hash to the CID; it is stored, read back from B2
 //                          and verified again before 201 is returned.
+//   GET /ipfs/<cid>?format=car (or Accept: application/vnd.ipld.car)
+//                          CARv1, order=dfs, dups=n; dag-scope=all (default) or block.
+//                          Every block is verified; an incomplete DAG is an error, never a
+//                          truncated CAR.
+//   POST /ipfs/           Authorization: Bearer <write token>, a CARv1 or CARv2 body. All
+//                          blocks, roots and the closure are checked before anything is stored.
 //   GET /health           liveness, no configuration values.
 //
 // Configuration (see wrangler.jsonc): B2_ENDPOINT, B2_BUCKET, B2_KEY_ID, B2_APP_KEY and
@@ -14,9 +20,15 @@
 import crypto from 'node:crypto';
 import { parseCid, verifyBlock, SHA2_256 } from '../../src/cid.mjs';
 import { checkWritableBlock } from '../../src/block.mjs';
+import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
+import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
+// Each imported block costs two store subrequests (PUT, readback GET) and each exported block
+// one GET; keep a request well inside the platform's per-request subrequest limit.
+export const DEFAULT_MAX_CAR_BLOCKS = 256;
+export const DEFAULT_MAX_CAR_BYTES = 32 * 1024 * 1024;
 const RAW = 'application/vnd.ipld.raw';
 const B2_TIMEOUT_MS = 30_000;
 const FALLBACK_TIMEOUT_MS = 15_000;
@@ -25,6 +37,9 @@ const json = (status, body, extra = {}) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json; charset=utf-8', ...extra } });
 const fail = (status, error, extra) => json(status, { error }, extra);
 const hex = (bytes) => Buffer.from(bytes).toString('hex');
+
+function intVar(v, dflt) { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : dflt; }
+const carLimits = (env) => ({ maxBlocks: intVar(env.MAX_CAR_BLOCKS, DEFAULT_MAX_CAR_BLOCKS), maxBytes: intVar(env.MAX_CAR_BYTES, DEFAULT_MAX_CAR_BYTES) });
 
 function maxBytes(env) {
   const n = Number(env.MAX_BLOCK_BYTES);
@@ -77,6 +92,7 @@ function b2(env, deps) {
   };
   return {
     get: (cid) => call('GET', cid),
+    head: (cid) => call('HEAD', cid),
     // Content-Length is left to fetch (it is derived from the body) and is not signed.
     put: (cid, bytes, digestHex) => call('PUT', cid, { body: bytes, payloadHash: digestHex,
       headers: { 'content-type': 'application/octet-stream' } }),
@@ -117,25 +133,117 @@ async function readBlock(cid, env, deps, store) {
   return { bytes };
 }
 
-async function writeBlock(request, cid, parsed, env, deps, store) {
-  if ((request.headers.get('content-type') ?? '').split(';')[0].trim() !== RAW) return fail(415, 'content-type-must-be-ipld-raw');
+const contentType = (request) => (request.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
+
+function writeAuthFailure(request, env) {
   if (!env.WRITE_TOKEN_SHA256) return fail(503, 'writes-not-configured');
   if (!tokenAllowed(request.headers.get('authorization'), env.WRITE_TOKEN_SHA256))
     return fail(401, 'unauthorized', { 'www-authenticate': 'Bearer' });
+  return null;
+}
+
+/** PUT one already-checked block, read it back and verify. -> null or [status, error]. */
+async function storeBlock(cid, bytes, env, store) {
+  const digestHex = hex(parseCid(cid).digest);
+  const put = await store.put(cid, bytes, digestHex);
+  if (put.status !== 200) return [502, `store-write-failed-${put.status}`];
+  const back = await store.get(cid);
+  if (back.status !== 200) return [502, `readback-failed-${back.status}`];
+  const again = await readCapped(back, maxBytes(env));
+  if (!again || !verifyBlock(cid, again)) return [502, 'readback-does-not-hash-to-cid'];
+  return null;
+}
+
+async function writeBlock(request, cid, parsed, env, deps, store) {
+  if (contentType(request) !== RAW) return fail(415, 'content-type-must-be-ipld-raw');
+  const denied = writeAuthFailure(request, env);
+  if (denied) return denied;
   if (parsed.version !== 1) return fail(400, 'put-requires-cidv1-sha2-256');
-  const cap = maxBytes(env);
-  const bytes = await readCapped(request, cap);
+  const bytes = await readCapped(request, maxBytes(env));
   if (!bytes) return fail(413, 'too-large');
   const bad = checkWritableBlock(cid, bytes);
   if (bad) return fail(400, bad);
-  const digestHex = hex(parsed.digest);
-  const put = await store.put(cid, bytes, digestHex);
-  if (put.status !== 200) return fail(502, `store-write-failed-${put.status}`);
-  const back = await store.get(cid);
-  if (back.status !== 200) return fail(502, `readback-failed-${back.status}`);
-  const again = await readCapped(back, cap);
-  if (!again || !verifyBlock(cid, again)) return fail(502, 'readback-does-not-hash-to-cid');
+  const err = await storeBlock(cid, bytes, env, store);
+  if (err) return fail(...err);
   return json(201, { cid, bytes: bytes.length, verified: true });
+}
+
+/**
+ * POST /ipfs/ with a CAR body. Everything is checked before anything is stored: header,
+ * each block's CID/codec/canonical form, roots present, closure complete (in the CAR or
+ * already stored) and no unreachable blocks. Then each block is stored and read back.
+ */
+async function importCar(request, env, store) {
+  if (contentType(request) !== CAR_CONTENT_TYPE) return fail(415, 'content-type-must-be-ipld-car');
+  const denied = writeAuthFailure(request, env);
+  if (denied) return denied;
+  const limits = carLimits(env);
+  const body = await readCapped(request, limits.maxBytes);
+  if (!body) return fail(413, 'car-too-large');
+  let car;
+  try { car = parseCar(body, { maxBlocks: limits.maxBlocks }); }
+  catch (e) { if (e instanceof CarError) return fail(e.code === 'car-too-many-blocks' ? 413 : 400, e.code); throw e; }
+  const blocks = new Map();
+  for (const { cid, bytes } of car.blocks) {
+    if (bytes.length > maxBytes(env)) return fail(413, `block-too-large:${cid}`);
+    const bad = checkWritableBlock(cid, bytes);
+    if (bad) return fail(400, `${bad}:${cid}`);
+    blocks.set(cid, bytes);
+  }
+  for (const r of car.roots) if (!blocks.has(r)) return fail(400, `car-root-missing:${r}`);
+  let closure;
+  try {
+    closure = await checkClosure(car.roots, blocks, async (cid) => {
+      const r = await store.head(cid);
+      if (r.status === 200) return true;
+      if (r.status === 404) return false;
+      throw new DagError(`store-head-failed-${r.status}`, cid);
+    });
+  } catch (e) { if (e instanceof DagError) return fail(e.code.startsWith('store-') ? 502 : 400, `${e.code}:${String(e.message).split(': ')[1] ?? ''}`); throw e; }
+  let total = 0;
+  for (const [cid, bytes] of blocks) {
+    const err = await storeBlock(cid, bytes, env, store);
+    if (err) return fail(err[0], `${err[1]}:${cid}`);
+    total += bytes.length;
+  }
+  return json(201, { roots: car.roots, carVersion: car.version, blocks: blocks.size, bytes: total,
+                     external: closure.external, verified: true });
+}
+
+/** GET /ipfs/<root>?format=car: a CARv1 (order=dfs, dups=n) of the root's DAG or just the root. */
+async function exportCar(cid, url, env, deps, store, head) {
+  const scope = url.searchParams.get('dag-scope') ?? 'all';
+  if (scope !== 'all' && scope !== 'block') return fail(400, 'dag-scope-not-supported');
+  if (url.searchParams.has('entity-bytes')) return fail(400, 'entity-bytes-not-supported');
+  let blocks;
+  try {
+    blocks = await collectDag(cid, scope, async (c) => {
+      const r = await readBlock(c, env, deps, store);
+      if (r.error) throw new DagError(`read-failed:${r.error[1]}`, c);
+      return r.absent ? null : r.bytes;
+    }, carLimits(env));
+  } catch (e) {
+    if (!(e instanceof DagError)) throw e;
+    const detail = String(e.message).split(': ')[1] ?? '';
+    if (e.code === 'root-not-found') return fail(404, 'block-not-found');
+    if (e.code.startsWith('read-failed:')) return fail(502, `${e.code.slice(12)}:${detail}`);
+    if (e.code === 'closure-incomplete') return fail(502, `closure-incomplete:${detail}`);
+    return fail(422, `${e.code}:${detail}`);
+  }
+  const car = encodeCarV1([cid], blocks);
+  return new Response(head ? null : car, { status: 200, headers: {
+    'content-type': `${CAR_CONTENT_TYPE}; version=1; order=dfs; dups=n`, 'content-length': String(car.length),
+    'cache-control': 'public, max-age=31536000, immutable', etag: `"${cid}.car.${scope}"`, vary: 'accept',
+    'x-content-type-options': 'nosniff', 'content-disposition': `attachment; filename="${cid}.car"`,
+  } });
+}
+
+function wantsCar(request, url) {
+  const format = url.searchParams.get('format');
+  if (format === 'car') return true;
+  if (format === 'raw') return false;
+  if (format) return null;
+  return (request.headers.get('accept') ?? '').toLowerCase().includes(CAR_CONTENT_TYPE);
 }
 
 export async function handle(request, env, deps = {}) {
@@ -147,6 +255,12 @@ export async function handle(request, env, deps = {}) {
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
     return json(200, { ok: true, service: 'yataverse-bytes' });
   }
+  if (url.pathname === '/ipfs/' || url.pathname === '/ipfs') {
+    if (request.method !== 'POST') return fail(405, 'method-not-allowed', { allow: 'POST' });
+    const store = b2(env, deps);
+    if (!store) return fail(503, 'store-not-configured');
+    try { return await importCar(request, env, store); } catch (e) { return storeFailure(e); }
+  }
   const m = /^\/ipfs\/([A-Za-z0-9]+)$/.exec(url.pathname);
   if (!m) return fail(404, 'not-found');
   const cid = m[1];
@@ -157,18 +271,23 @@ export async function handle(request, env, deps = {}) {
   try {
     if (request.method === 'PUT') return await writeBlock(request, cid, parsed, env, deps, store);
     if (request.method === 'GET' || request.method === 'HEAD') {
+      const car = wantsCar(request, url);
+      if (car === null) return fail(400, 'format-not-supported');
+      if (car) return await exportCar(cid, url, env, deps, store, request.method === 'HEAD');
       const r = await readBlock(cid, env, deps, store);
       if (r.error) return fail(...r.error);
       if (r.absent) return fail(404, 'block-not-found');
       return serveBlock(cid, r.bytes, request.method === 'HEAD');
     }
-  } catch (e) {
-    if (e?.name === 'TimeoutError' || e?.name === 'AbortError') return fail(504, 'store-timeout');
-    // Name and message only: neither carries a token, key or request body.
-    console.error('store-unreachable', e?.name, String(e?.message ?? '').slice(0, 300));
-    return fail(502, 'store-unreachable');
-  }
+  } catch (e) { return storeFailure(e); }
   return fail(405, 'method-not-allowed', { allow: 'GET, HEAD, PUT' });
+}
+
+function storeFailure(e) {
+  if (e?.name === 'TimeoutError' || e?.name === 'AbortError') return fail(504, 'store-timeout');
+  // Name and message only: neither carries a token, key or request body.
+  console.error('store-unreachable', e?.name, String(e?.message ?? '').slice(0, 300));
+  return fail(502, 'store-unreachable');
 }
 
 export default { fetch: (request, env) => handle(request, env) };
