@@ -76,8 +76,9 @@ function b2(env, deps) {
   };
   return {
     get: (cid) => call('GET', cid),
+    // Content-Length is left to fetch (it is derived from the body) and is not signed.
     put: (cid, bytes, digestHex) => call('PUT', cid, { body: bytes, payloadHash: digestHex,
-      headers: { 'content-type': 'application/octet-stream', 'content-length': String(bytes.length) } }),
+      headers: { 'content-type': 'application/octet-stream' } }),
   };
 }
 
