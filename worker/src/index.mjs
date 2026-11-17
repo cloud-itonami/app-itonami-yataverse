@@ -137,7 +137,9 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
 }
 
 export async function handle(request, env, deps = {}) {
-  deps = { fetchImpl: fetch, now: () => new Date(), ...deps };
+  // Call the global fetch unbound: Workers throws "Illegal invocation" when fetch runs
+  // with another object as `this` (as `deps.fetchImpl(...)` would).
+  deps = { fetchImpl: (input, init) => fetch(input, init), now: () => new Date(), ...deps };
   const url = new URL(request.url);
   if (url.pathname === '/health') {
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
