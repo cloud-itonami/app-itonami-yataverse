@@ -121,6 +121,19 @@ test('routing: health, bad CIDs, unknown paths and methods; store config is requ
   assert.equal(s.log.length, 0);
 });
 
+test('the default fetch is called without a foreign `this` (Workers rejects that)', async () => {
+  const s = fakeStore(); const original = globalThis.fetch; let calls = 0;
+  globalThis.fetch = function (input, init) {
+    if (this !== undefined && this !== globalThis) throw new TypeError('Illegal invocation');
+    calls += 1; return s.fetchImpl(input, init);
+  };
+  try {
+    const bytes = Buffer.from('unbound fetch'); const cid = rawCid(bytes);
+    assert.equal((await handle(put(cid, bytes), ENV, { now: NOW })).status, 201);
+    assert.ok(calls >= 2);
+  } finally { globalThis.fetch = original; }
+});
+
 test('tokenAllowed accepts any configured digest and ignores malformed entries', () => {
   assert.equal(tokenAllowed(`Bearer ${TOKEN}`, `zz, ${sha('another-token-123456')}, ${sha(TOKEN)}`), true);
   assert.equal(tokenAllowed(`Bearer ${TOKEN}`, 'not-hex'), false);
