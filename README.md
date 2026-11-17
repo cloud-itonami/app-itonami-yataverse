@@ -25,11 +25,11 @@ yataverse mcp                          # MCP server on stdio
 
 ## Reads and writes
 
-- **Read**: `GET <readUrl>/ipfs/<cid>` (default `https://ipfs.yataverse.com`). The gateway answers
-  with a `301` to a per-CID subdomain; that is followed (at most 3 hops) but **only inside the read
-  host's own parent domain**, over https. Requests include `Accept: application/vnd.ipld.raw` and
+- **Read**: `GET <readUrl>/ipfs/<cid>` (default `https://yataverse.com`, the Worker below). If a
+  gateway answers with a `301` to a per-CID subdomain, that is followed (at most 3 hops) but **only
+  inside the read host's own parent domain**, over https. Requests include `Accept: application/vnd.ipld.raw` and
   `?format=raw`, so legacy dag-pb blocks are checked as blocks rather than as decoded files.
-- **Write**: `PUT <url><prefix><cid>` (default `https://kotobase.net/ipfs/`, `application/vnd.ipld.raw`).
+- **Write**: `PUT <url><prefix><cid>` (default `https://yataverse.com/ipfs/`, `application/vnd.ipld.raw`).
   A write **never follows a redirect**: the `Authorization` header must not travel to another host.
   Writes are limited to CIDv1/raw blocks. Every write is read back and its CID recomputed.
 

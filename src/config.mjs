@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-export const DEFAULT_URL = 'https://kotobase.net';
-export const DEFAULT_READ_URL = 'https://ipfs.yataverse.com';
+export const DEFAULT_URL = 'https://yataverse.com';
+export const DEFAULT_READ_URL = 'https://yataverse.com';
 export const DEFAULT_PREFIX = '/ipfs/';
 export const DEFAULT_AUTHN = 'https://auth.kotoba.cloud';
 
