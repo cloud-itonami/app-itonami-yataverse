@@ -43,7 +43,7 @@ test('each DAG-CBOR rule rejects its violation', () => {
     'fb7ff8000000000000': 'float-not-finite', 'fb7ff0000000000000': 'float-not-finite',
     'f7': 'simple-value-not-allowed', 'f0': 'simple-value-not-allowed', 'ff': 'unexpected-break',
     '5b00000001000000000000': 'length-exceeds-block',
-    '83 0102': 'truncated',
+    '83 0102': 'length-exceeds-block', 'a1 6161': 'truncated',
   };
   for (const [hex, code] of Object.entries(cases)) assert.equal(validateDagCbor(h(hex)), code, hex || '(empty)');
   const bad = Buffer.concat([h('d82a5826 00 01551220'), Buffer.alloc(33)]);   // multihash longer than declared

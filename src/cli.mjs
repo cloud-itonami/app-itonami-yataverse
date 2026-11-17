@@ -19,6 +19,8 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse get <cid> [-o file]        read a block, verified against its CID (stdout if no -o)
   yataverse verify <cid>               is it present, and do the served bytes hash to it?
   yataverse put <file|-> [--codec raw|dag-cbor]  publish a block (dag-cbor must be canonical), then read it back and verify
+  yataverse car-put <file.car|->       import a CARv1/CARv2 (roots + complete closure), then export and compare
+  yataverse car-get <cid> [--scope all|block] [-o file.car]  export a root as a verified CARv1
   yataverse asset-manifest <json|->    validate and canonicalize a training-asset manifest
   yataverse training-run-manifest <json|-> validate and canonicalize run provenance (unverified)
   yataverse asset-did <cid> [--domain host]  derive the deterministic Murakumo did:web for a CID
@@ -206,7 +208,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         out({ wrote: dir, saTokenStored: saToken !== undefined });
         return 0;
       }
-      case 'get': case 'verify': case 'put': case 'token': {
+      case 'get': case 'verify': case 'put': case 'token': case 'car-put': case 'car-get': {
         const cfg = loadConfig();
         const authorize = makeAuthorizer(cfg);
         if (cmd === 'token') { stdout.write(await authorize() + '\n'); return 0; }
@@ -218,6 +220,14 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
           return 0;
         }
         if (cmd === 'verify') { const r = await client.verifyRemote(f._[0]); out(r); return r.verified ? 0 : 1; }
+        if (cmd === 'car-put') { out(await client.putCar(readInput(f._[0]))); return 0; }
+        if (cmd === 'car-get') {
+          const r = await client.getCar(f._[0], { scope: f.scope ?? 'all' });
+          if (!r) { stderr.write('not found\n'); return 1; }
+          if (f.o) { fs.writeFileSync(f.o, r.bytes); out({ cid: f._[0], blocks: r.blocks.size, bytes: r.bytes.length, verified: true }); }
+          else stdout.write(r.bytes);
+          return 0;
+        }
         const r = await client.putBytes(readInput(f._[0]), { codec: f.codec ?? 'raw' }); out(r); return 0;
       }
       case 'mcp': serve(); return await new Promise(() => {});

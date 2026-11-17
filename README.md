@@ -14,6 +14,8 @@ yataverse canonical-cid Qm...           # normalize a legacy CIDv0 to CIDv1 base
 yataverse get bafkrei... -o out.bin    # read, verified against the CID
 yataverse verify bafkrei...            # present? and do the served bytes hash to it?
 yataverse put file.bin                 # publish, then read back and verify
+yataverse car-put dag.car              # import a CAR (roots + complete closure), then export and compare
+yataverse car-get bafy... -o dag.car   # export a root as a verified CARv1 (--scope all|block)
 yataverse asset-manifest asset.json | yataverse put -  # canonicalize, publish, and verify the manifest
 yataverse asset-did <cid>                             # derive its Murakumo did:web identifier
 yataverse asset-did-index lake.jsonl > asset-dids.jsonl  # stream a supplied inventory into a DID index
@@ -317,6 +319,8 @@ KV, D1 or Durable Objects.
 |---|---|
 | `PUT /ipfs/<cid>` | `Authorization: Bearer <write token>`, `Content-Type: application/vnd.ipld.raw`. CIDv1/sha2-256 with codec raw or dag-cbor (canonical DAG-CBOR only), at most `MAX_BLOCK_BYTES`. The body must hash to the CID; it is stored at `B2_PREFIX + cid`, read back from B2 and verified again before `201`. |
 | `GET` / `HEAD /ipfs/<cid>` | Served from B2 after verification. On a B2 miss, `READ_FALLBACK_URL` (the self-hosted Reader at `ipfs.yataverse.com`) is tried and its bytes are verified the same way. |
+| `GET /ipfs/<cid>?format=car` (or `Accept: application/vnd.ipld.car`) | CARv1 with `order=dfs; dups=n`. `dag-scope=all` (default) follows DAG-CBOR links down to raw leaves; `dag-scope=block` returns the root alone. Every block is verified first; a missing block or an untraversable codec is an error, never a truncated CAR. |
+| `POST /ipfs/` | `Authorization: Bearer <write token>`, `Content-Type: application/vnd.ipld.car`, a CARv1 or CARv2 (`.awai`) body. Before anything is stored: canonical DAG-CBOR header, every block passes the write rules, every root is in the CAR, the closure is complete (in the CAR or already stored) and no block is unreachable. Then each block is stored and read back. Limits: `MAX_CAR_BLOCKS` (256), `MAX_CAR_BYTES` (32 MiB). |
 | `GET /health` | Liveness only. |
 
 The Worker never follows a redirect. Write tokens are checked against `WRITE_TOKEN_SHA256`
