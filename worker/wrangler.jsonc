@@ -1,0 +1,32 @@
+{
+  // yataverse-bytes — the yataverse.com bytes-plane Worker (AWAI-3102).
+  // Owner decision 2026-11-17: the bytes plane uses yataverse.com hosts (kotobase is a
+  // library name, not a host); Cloudflare may be used; blocks are stored in Backblaze B2.
+  // No R2, KV, D1 or Durable Objects (ADR 0031 D1).
+  //
+  // NOT DEPLOYED by merging this file. Deploying adds the `yataverse.com` custom domain
+  // (a production DNS record) and needs the owner's approval plus these secrets:
+  //   wrangler secret put B2_ENDPOINT          e.g. https://s3.us-west-004.backblazeb2.com
+  //   wrangler secret put B2_BUCKET
+  //   wrangler secret put B2_KEY_ID            an application key scoped to that bucket
+  //   wrangler secret put B2_APP_KEY
+  //   wrangler secret put WRITE_TOKEN_SHA256   comma-separated SHA-256 hex of write tokens
+  "name": "yataverse-bytes",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "yataverse.com", "custom_domain": true }
+  ],
+  "vars": {
+    // Object key = B2_PREFIX + CID. "ipld/" matches the earlier graph layout in B2.
+    "B2_PREFIX": "ipld/",
+    // Largest block accepted or served, in bytes (16 MiB).
+    "MAX_BLOCK_BYTES": "16777216",
+    // Read tier used only when B2 has no copy: the existing self-hosted Reader
+    // (JUN-228). Its bytes are verified against the CID like every other read.
+    "READ_FALLBACK_URL": "https://ipfs.yataverse.com"
+  },
+  "observability": { "enabled": true, "logs": { "head_sampling_rate": 1 } }
+}
