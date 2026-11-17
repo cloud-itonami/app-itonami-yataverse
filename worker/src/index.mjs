@@ -12,6 +12,8 @@
 //                          truncated CAR.
 //   POST /ipfs/           Authorization: Bearer <write token>, a CARv1 or CARv2 body. All
 //                          blocks, roots and the closure are checked before anything is stored.
+//   PUT|GET|HEAD|OPTIONS /awai-drive/v1/packs/<sha256>
+//                          Awai Drive encrypted snapshot packs (see drive-packs.mjs).
 //   GET /health           liveness, no configuration values.
 //
 // Configuration (see wrangler.jsonc): B2_ENDPOINT, B2_BUCKET, B2_KEY_ID, B2_APP_KEY and
@@ -22,6 +24,7 @@ import { parseCid, verifyBlock, SHA2_256 } from '../../src/cid.mjs';
 import { checkWritableBlock } from '../../src/block.mjs';
 import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
+import { handleDrivePack, DRIVE_PACK_PATH } from './drive-packs.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
@@ -84,9 +87,11 @@ function b2(env, deps) {
   const region = env.B2_REGION || regionFromEndpoint(env.B2_ENDPOINT);
   if (!region) return null;
   const prefix = env.B2_PREFIX ?? 'ipld/';
-  const objectUrl = (cid) => new URL(`/${env.B2_BUCKET}/${prefix}${cid}`, endpoint).toString();
-  const call = (method, cid, { body, payloadHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', headers = {} } = {}) => {
-    const url = objectUrl(cid);
+  // Object keys: blocks at <B2_PREFIX><cid>, Drive packs at <B2_PREFIX>drive-packs/<sha256>.
+  // A block CID never contains '/', so the two namespaces cannot collide.
+  const objectUrl = (key) => new URL(`/${env.B2_BUCKET}/${prefix}${key}`, endpoint).toString();
+  const call = (method, key, { body, payloadHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', headers = {} } = {}) => {
+    const url = objectUrl(key);
     const signed = signV4({ method, url, headers, payloadHash, keyId: env.B2_KEY_ID, secret: env.B2_APP_KEY, region, now: deps.now() });
     return deps.fetchImpl(url, { method, headers: signed, body, redirect: 'manual', signal: AbortSignal.timeout(B2_TIMEOUT_MS) });
   };
@@ -95,6 +100,9 @@ function b2(env, deps) {
     head: (cid) => call('HEAD', cid),
     // Content-Length is left to fetch (it is derived from the body) and is not signed.
     put: (cid, bytes, digestHex) => call('PUT', cid, { body: bytes, payloadHash: digestHex,
+      headers: { 'content-type': 'application/octet-stream' } }),
+    getPack: (id) => call('GET', `drive-packs/${id}`),
+    putPack: (id, bytes) => call('PUT', `drive-packs/${id}`, { body: bytes, payloadHash: id,
       headers: { 'content-type': 'application/octet-stream' } }),
   };
 }
@@ -254,6 +262,11 @@ export async function handle(request, env, deps = {}) {
   if (url.pathname === '/health') {
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
     return json(200, { ok: true, service: 'yataverse-bytes' });
+  }
+  const pack = DRIVE_PACK_PATH.exec(url.pathname);
+  if (pack || url.pathname.startsWith('/awai-drive/')) {
+    try { return await handleDrivePack(request, pack?.[1] ?? null, env, b2(env, deps), { readCapped }); }
+    catch (e) { return storeFailure(e); }
   }
   if (url.pathname === '/ipfs/' || url.pathname === '/ipfs') {
     if (request.method !== 'POST') return fail(405, 'method-not-allowed', { allow: 'POST' });
