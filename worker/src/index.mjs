@@ -160,6 +160,8 @@ export async function handle(request, env, deps = {}) {
     }
   } catch (e) {
     if (e?.name === 'TimeoutError' || e?.name === 'AbortError') return fail(504, 'store-timeout');
+    // Name and message only: neither carries a token, key or request body.
+    console.error('store-unreachable', e?.name, String(e?.message ?? '').slice(0, 300));
     return fail(502, 'store-unreachable');
   }
   return fail(405, 'method-not-allowed', { allow: 'GET, HEAD, PUT' });
