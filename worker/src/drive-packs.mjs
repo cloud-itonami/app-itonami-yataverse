@@ -1,7 +1,9 @@
 // Awai Drive pack protocol, as the Drive app speaks it (network-awai/awai-os
 // apps/drive/src/sync.js and docs/encrypted-sync.md):
 //   PUT /awai-drive/v1/packs/<sha256>   Content-Type: application/vnd.ipld.car, no query, no
-//                                       credentials -> 200 JSON receipt {sha256, bytes}
+//                                       credentials -> 200 JSON receipt {sha256, bytes}, plus the
+//                                       signed storage receipt (`receipt`, `receiptCid`; Drive
+//                                       does not check it yet, owner decision 2026-11-18)
 //   GET /awai-drive/v1/packs/<sha256>   the same bytes
 // The id is the SHA-256 of the exact pack bytes; packs are encrypted CAR snapshots.
 //
@@ -16,6 +18,7 @@
 import crypto from 'node:crypto';
 import { parseCar, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { verifyBlock } from '../../src/cid.mjs';
+import { KIND, ZERO32 } from '../../src/receipt.mjs';
 
 export const DRIVE_PACK_PATH = /^\/awai-drive\/v1\/packs\/([a-f0-9]{64})$/;
 export const DEFAULT_DRIVE_MAX_PACK_BYTES = 12 * 1024 * 1024;
@@ -36,7 +39,7 @@ function corsHeaders(request, env) {
   return h;
 }
 
-export async function handleDrivePack(request, id, env, store, { readCapped, admitWriteRequest, admitWriteBytes }) {
+export async function handleDrivePack(request, id, env, store, { readCapped, admitWriteRequest, admitWriteBytes, receipts, requestIdOf }) {
   const cors = corsHeaders(request, env);
   const reply = (status, body, headers = {}) => new Response(body === null ? null : JSON.stringify(body),
     { status, headers: { ...cors, 'cache-control': 'no-store', ...(body === null ? {} : { 'content-type': 'application/json' }), ...headers } });
@@ -61,13 +64,22 @@ export async function handleDrivePack(request, id, env, store, { readCapped, adm
     let car;
     try { car = parseCar(bytes); } catch (e) { if (e instanceof CarError) return reply(400, { error: e.code }); throw e; }
     for (const b of car.blocks) if (!verifyBlock(b.cid, b.bytes)) return reply(400, { error: 'pack-block-does-not-hash-to-cid' });
+    const digest = new Uint8Array(Buffer.from(id, 'hex'));
+    const rid = requestIdOf(request, digest);
+    if (rid.error) return reply(rid.error[0], { error: rid.error[1] });
+    // No credentials, so requester is 0 (owner decision 2026-11-18; no IP hash).
+    const claim = { kind: KIND.drivePack, subject: digest, size: bytes.length, contentDigest: digest, requestId: rid.requestId, requester: ZERO32 };
+    const begun = await receipts.begin(claim);
+    if (begun.error) return reply(begun.error[0], { error: begun.error[1] });
     const put = await store.putPack(id, bytes);
     if (put.status !== 200) return reply(502, { error: `store-write-failed-${put.status}` });
     const back = await store.getPack(id);
     if (back.status !== 200) return reply(502, { error: `readback-failed-${back.status}` });
     const again = await readCapped(back, cap);
     if (!again || again.length !== bytes.length || sha256Hex(again) !== id) return reply(502, { error: 'readback-mismatch' });
-    return reply(200, { sha256: id, bytes: bytes.length });
+    const receipt = await receipts.finish(begun, claim);
+    if (receipt.error) return reply(receipt.error[0], { error: receipt.error[1] });
+    return reply(200, { sha256: id, bytes: bytes.length, receipt: receipt.json, receiptCid: receipt.cid });
   }
 
   if (request.method === 'GET' || request.method === 'HEAD') {

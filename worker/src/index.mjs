@@ -15,12 +15,22 @@
 //   PUT|GET|HEAD|OPTIONS /awai-drive/v1/packs/<sha256>
 //                          Awai Drive encrypted snapshot packs (see drive-packs.mjs).
 //   GET /health           liveness, no configuration values.
+//   GET /.well-known/yataverse-receipt-keys.json, /.well-known/did.json,
+//       /.well-known/yataverse-policy/<revision>.json (and current.json)
+//                          the receipt signing keys (did:web:yataverse.com) and the write policy.
+//
+// Every successful write returns a signed storage receipt (receipts.mjs): `receipt` (JSON
+// envelope) and `receiptCid` (its DAG-CBOR record). An optional Yataverse-Request-Id header
+// (64 hex) names the request; a repeat gets the same receipt, a different write under the
+// same id is 409.
 //
 // Configuration (see wrangler.jsonc): B2_ENDPOINT, B2_BUCKET, B2_KEY_ID, B2_APP_KEY and
 // WRITE_TOKEN_SHA256 are secrets. The Worker never follows a redirect and never logs a
 // token, key or request body.
 import crypto from 'node:crypto';
-import { parseCid, verifyBlock, SHA2_256 } from '../../src/cid.mjs';
+import { parseCid, verifyBlock, cidToBytes, SHA2_256 } from '../../src/cid.mjs';
+import { KIND, rootsCommitment, blockSetDigest } from '../../src/receipt.mjs';
+import { beginReceipt, finishReceipt, requestIdOf, tokenDigest, wellKnown, sha256 } from './receipts.mjs';
 import { checkWritableBlock } from '../../src/block.mjs';
 import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
@@ -44,6 +54,20 @@ const hex = (bytes) => Buffer.from(bytes).toString('hex');
 
 function intVar(v, dflt) { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : dflt; }
 const carLimits = (env) => ({ maxBlocks: intVar(env.MAX_CAR_BLOCKS, DEFAULT_MAX_CAR_BLOCKS), maxBytes: intVar(env.MAX_CAR_BYTES, DEFAULT_MAX_CAR_BYTES) });
+
+/** The write limits this Worker enforces, recorded in the receipt policy. */
+export function writeLimits(env) {
+  const drive = Number(env.DRIVE_MAX_PACK_BYTES);
+  return { maxBlockBytes: maxBytes(env), maxCarBytes: carLimits(env).maxBytes, maxCarBlocks: carLimits(env).maxBlocks,
+           drivePackMaxBytes: Number.isInteger(drive) && drive > 0 ? drive : 12 * 1024 * 1024,
+           perClient: { requestsPerMinute: 60, mibPerMinute: 64 } };
+}
+
+/** Receipt helpers bound to one request's env, deps and store. */
+const receiptOps = (env, deps, store) => ({
+  begin: (claim) => beginReceipt(claim, env, deps, store),
+  finish: (begun, claim) => finishReceipt(begun, claim, env, deps, store, writeLimits(env)),
+});
 
 function maxBytes(env) {
   const n = Number(env.MAX_BLOCK_BYTES);
@@ -103,6 +127,10 @@ function b2(env, deps) {
     put: (cid, bytes, digestHex) => call('PUT', cid, { body: bytes, payloadHash: digestHex,
       headers: { 'content-type': 'application/octet-stream' } }),
     getPack: (id) => call('GET', `drive-packs/${id}`),
+    // Receipt records: <B2_PREFIX>receipts/by-request/<requestId hex>.
+    getReceipt: (rid) => call('GET', `receipts/by-request/${rid}`),
+    putReceipt: (rid, bytes) => call('PUT', `receipts/by-request/${rid}`, { body: bytes, payloadHash: hex(sha256(bytes)),
+      headers: { 'content-type': 'application/vnd.ipld.dag-cbor' } }),
     putPack: (id, bytes) => call('PUT', `drive-packs/${id}`, { body: bytes, payloadHash: id,
       headers: { 'content-type': 'application/octet-stream' } }),
   };
@@ -176,9 +204,19 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
   if (overBytes) return fail(...overBytes);
   const bad = checkWritableBlock(cid, bytes);
   if (bad) return fail(400, bad);
+  const contentDigest = new Uint8Array(parsed.digest);
+  const rid = requestIdOf(request, contentDigest);
+  if (rid.error) return fail(...rid.error);
+  const claim = { kind: KIND.block, subject: cidToBytes(cid), size: bytes.length, contentDigest,
+                  requestId: rid.requestId, requester: tokenDigest(request.headers.get('authorization')) };
+  const ops = receiptOps(env, deps, store);
+  const begun = await ops.begin(claim);
+  if (begun.error) return fail(...begun.error);
   const err = await storeBlock(cid, bytes, env, store);
   if (err) return fail(...err);
-  return json(201, { cid, bytes: bytes.length, verified: true });
+  const receipt = await ops.finish(begun, claim);
+  if (receipt.error) return fail(...receipt.error);
+  return json(201, { cid, bytes: bytes.length, verified: true, receipt: receipt.json, receiptCid: receipt.cid });
 }
 
 /**
@@ -186,7 +224,7 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
  * each block's CID/codec/canonical form, roots present, closure complete (in the CAR or
  * already stored) and no unreachable blocks. Then each block is stored and read back.
  */
-async function importCar(request, env, store) {
+async function importCar(request, env, deps, store) {
   if (contentType(request) !== CAR_CONTENT_TYPE) return fail(415, 'content-type-must-be-ipld-car');
   const denied = writeAuthFailure(request, env);
   if (denied) return denied;
@@ -218,13 +256,23 @@ async function importCar(request, env, store) {
     });
   } catch (e) { if (e instanceof DagError) return fail(e.code.startsWith('store-') ? 502 : 400, `${e.code}:${String(e.message).split(': ')[1] ?? ''}`); throw e; }
   let total = 0;
+  for (const bytes of blocks.values()) total += bytes.length;
+  const contentDigest = blockSetDigest([...blocks.keys(), ...closure.external]);
+  const rid = requestIdOf(request, contentDigest);
+  if (rid.error) return fail(...rid.error);
+  const claim = { kind: KIND.car, subject: rootsCommitment(car.roots), size: total, contentDigest,
+                  requestId: rid.requestId, requester: tokenDigest(request.headers.get('authorization')) };
+  const ops = receiptOps(env, deps, store);
+  const begun = await ops.begin(claim);
+  if (begun.error) return fail(...begun.error);
   for (const [cid, bytes] of blocks) {
     const err = await storeBlock(cid, bytes, env, store);
     if (err) return fail(err[0], `${err[1]}:${cid}`);
-    total += bytes.length;
   }
+  const receipt = await ops.finish(begun, claim);
+  if (receipt.error) return fail(...receipt.error);
   return json(201, { roots: car.roots, carVersion: car.version, blocks: blocks.size, bytes: total,
-                     external: closure.external, verified: true });
+                     external: closure.external, verified: true, receipt: receipt.json, receiptCid: receipt.cid });
 }
 
 /** GET /ipfs/<root>?format=car: a CARv1 (order=dfs, dups=n) of the root's DAG or just the root. */
@@ -272,16 +320,23 @@ export async function handle(request, env, deps = {}) {
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
     return json(200, { ok: true, service: 'yataverse-bytes' });
   }
+  if (url.pathname.startsWith('/.well-known/')) {
+    if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
+    return wellKnown(url.pathname, env, writeLimits(env), json) ?? fail(404, 'not-found');
+  }
   const pack = DRIVE_PACK_PATH.exec(url.pathname);
   if (pack || url.pathname.startsWith('/awai-drive/')) {
-    try { return await handleDrivePack(request, pack?.[1] ?? null, env, b2(env, deps), { readCapped, admitWriteRequest, admitWriteBytes }); }
+    try {
+      const store = b2(env, deps);
+      return await handleDrivePack(request, pack?.[1] ?? null, env, store, { readCapped, admitWriteRequest, admitWriteBytes, receipts: store && receiptOps(env, deps, store), requestIdOf });
+    }
     catch (e) { return storeFailure(e); }
   }
   if (url.pathname === '/ipfs/' || url.pathname === '/ipfs') {
     if (request.method !== 'POST') return fail(405, 'method-not-allowed', { allow: 'POST' });
     const store = b2(env, deps);
     if (!store) return fail(503, 'store-not-configured');
-    try { return await importCar(request, env, store); } catch (e) { return storeFailure(e); }
+    try { return await importCar(request, env, deps, store); } catch (e) { return storeFailure(e); }
   }
   const m = /^\/ipfs\/([A-Za-z0-9]+)$/.exec(url.pathname);
   if (!m) return fail(404, 'not-found');

@@ -4,7 +4,7 @@ import { encodeCarV1, parseCar } from '../src/car.mjs';
 import { cidFor, cidToBytes, CODEC_DAG_CBOR, CODEC_RAW } from '../src/cid.mjs';
 import { handle } from '../worker/src/index.mjs';
 import { makeClient } from '../src/client.mjs';
-import { ENV, TOKEN, NOW, fakeStore } from './worker-fixtures.mjs';
+import { ENV, TOKEN, NOW, fakeStore, dataKeys } from './worker-fixtures.mjs';
 
 // --- a tiny canonical DAG-CBOR encoder for test fixtures (text keys, links, arrays) ---
 const te = new TextEncoder();
@@ -65,7 +65,7 @@ test('import stores a complete DAG after checking everything; export returns it 
   assert.equal(r.status, 201);
   const j = await r.json();
   assert.deepEqual([j.roots, j.blocks, j.external, j.verified], [[f.root.cid], 4, [], true]);
-  assert.equal(s.objects.size, 4);
+  assert.equal(dataKeys(s).length, 4);
   const e = await handle(getCar(f.root.cid), ENV, deps(s));
   assert.equal(e.status, 200);
   assert.match(e.headers.get('content-type'), /^application\/vnd\.ipld\.car; version=1; order=dfs; dups=n$/);
@@ -89,14 +89,14 @@ test('import refuses bad CARs before storing anything', async () => {
     const s = fakeStore();
     const r = await handle(post(car), ENV, deps(s));
     assert.equal(r.status, status); assert.match((await r.json()).error, re);
-    assert.equal(s.objects.size, 0);
+    assert.equal(dataKeys(s).length, 0);
   }
   const s = fakeStore(); const car = encodeCarV1([f.root.cid], f.all);
   assert.equal((await handle(post(car), { ...ENV, MAX_CAR_BLOCKS: '3' }, deps(s))).status, 413);
   assert.equal((await handle(post(car), { ...ENV, MAX_CAR_BYTES: '64' }, deps(s))).status, 413);
   assert.equal((await handle(post(car, { auth: 'Bearer wrong-token-000000' }), ENV, deps(s))).status, 401);
   assert.equal((await handle(post(car, { ct: 'application/octet-stream' }), ENV, deps(s))).status, 415);
-  assert.equal(s.objects.size, 0);
+  assert.equal(dataKeys(s).length, 0);
 });
 
 test('import accepts links to blocks that are already stored, and reports them as external', async () => {
