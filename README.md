@@ -31,7 +31,10 @@ yataverse mcp                          # MCP server on stdio
   `?format=raw`, so legacy dag-pb blocks are checked as blocks rather than as decoded files.
 - **Write**: `PUT <url><prefix><cid>` (default `https://yataverse.com/ipfs/`, `application/vnd.ipld.raw`).
   A write **never follows a redirect**: the `Authorization` header must not travel to another host.
-  Writes are limited to CIDv1/raw blocks. Every write is read back and its CID recomputed.
+  Writes accept CIDv1/sha2-256 blocks with codec raw (`put`, the default) or dag-cbor
+  (`put --codec dag-cbor`), the core subset of the Awai File Format. A dag-cbor block must be
+  canonical DAG-CBOR (definite lengths, shortest integers, sorted unique text map keys, tag 42
+  links only, 64-bit finite floats). Every write is read back and its CID recomputed.
 
 ## Training asset manifests
 
@@ -312,7 +315,7 @@ KV, D1 or Durable Objects.
 
 | Request | Behaviour |
 |---|---|
-| `PUT /ipfs/<cid>` | `Authorization: Bearer <write token>`, `Content-Type: application/vnd.ipld.raw`. CIDv1/raw/sha2-256 only, at most `MAX_BLOCK_BYTES`. The body must hash to the CID; it is stored at `B2_PREFIX + cid`, read back from B2 and verified again before `201`. |
+| `PUT /ipfs/<cid>` | `Authorization: Bearer <write token>`, `Content-Type: application/vnd.ipld.raw`. CIDv1/sha2-256 with codec raw or dag-cbor (canonical DAG-CBOR only), at most `MAX_BLOCK_BYTES`. The body must hash to the CID; it is stored at `B2_PREFIX + cid`, read back from B2 and verified again before `201`. |
 | `GET` / `HEAD /ipfs/<cid>` | Served from B2 after verification. On a B2 miss, `READ_FALLBACK_URL` (the self-hosted Reader at `ipfs.yataverse.com`) is tried and its bytes are verified the same way. |
 | `GET /health` | Liveness only. |
 
