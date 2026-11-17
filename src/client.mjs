@@ -3,7 +3,8 @@
 //           but only inside the read host's own parent domain, at most 3 hops)
 //   write:  PUT <url><prefix><cid>     (Authorization required; NEVER follows a redirect)
 // Every read and every write is checked by re-deriving the CID from the bytes.
-import { rawCid, verifyBlock, isCidShape, parseCid, CODEC_RAW } from './cid.mjs';
+import { cidFor, verifyBlock, isCidShape } from './cid.mjs';
+import { checkWritableBlock, WRITABLE_CODECS } from './block.mjs';
 
 export class YataverseError extends Error {
   constructor(code, detail) { super(detail ? `${code}: ${detail}` : code); this.code = code; }
@@ -63,11 +64,9 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
   }
 
   async function putBlock(cid, bytes) {
-    const parsed = parseCid(cid);
-    if (!parsed) throw new YataverseError('bad-cid');
-    if (parsed.version !== 1 || parsed.codec !== CODEC_RAW)
-      throw new YataverseError('put-requires-cidv1-raw');
-    if (!verifyBlock(cid, bytes)) throw new YataverseError('bytes-do-not-hash-to-cid');
+    if (!isCidShape(cid)) throw new YataverseError('bad-cid');
+    const bad = checkWritableBlock(cid, bytes);
+    if (bad) throw new YataverseError(bad);
     if (!authorize) throw new YataverseError('no-authorization-configured');
     const auth = await authorize();
     const base = new URL(cfg.url);
@@ -83,8 +82,9 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
   }
 
   /** Write bytes, then read them back and verify. -> {cid, verified} */
-  async function putBytes(bytes) {
-    const cid = rawCid(bytes);
+  async function putBytes(bytes, { codec = 'raw' } = {}) {
+    if (!(codec in WRITABLE_CODECS)) throw new YataverseError('put-codec-not-accepted', codec);
+    const cid = cidFor(bytes, WRITABLE_CODECS[codec]);
     await putBlock(cid, bytes);
     const back = await get(cid);
     if (!back) throw new YataverseError('readback-absent');

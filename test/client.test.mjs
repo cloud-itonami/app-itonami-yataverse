@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { startServer, baseCfg } from './helpers.mjs';
-import { rawCid } from '../src/cid.mjs';
+import { rawCid, cidFor, CODEC_DAG_CBOR } from '../src/cid.mjs';
 import { makeClient, parentDomain, YataverseError } from '../src/client.mjs';
 import { makeAuthorizer } from '../src/auth.mjs';
 
@@ -23,6 +23,19 @@ test('put then read back verifies (static authorisation)', () => withServer('ok'
   const put = s.log.find((x) => x.method === 'PUT');
   assert.equal(put.ct, 'application/vnd.ipld.raw');
   assert.equal(put.auth, 'Bearer good');
+}));
+
+test('put --codec dag-cbor writes a dag-cbor CID; non-canonical bytes and unknown codecs never reach the network', () => withServer('ok', async (s) => {
+  const cfg = { ...baseCfg(s.origin), staticAuth: 'Bearer good' };
+  const client = makeClient(cfg, { authorize: makeAuthorizer(cfg, T), ...T });
+  const doc = Buffer.from('a2616101616202', 'hex');
+  const r = await client.putBytes(doc, { codec: 'dag-cbor' });
+  assert.deepEqual(r, { cid: cidFor(doc, CODEC_DAG_CBOR), verified: true, bytes: doc.length });
+  assert.ok(r.cid.startsWith('bafyrei'));
+  const before = s.log.length;
+  await assert.rejects(client.putBytes(Buffer.from('a2616201616102', 'hex'), { codec: 'dag-cbor' }), (e) => e.code === 'not-canonical-dag-cbor:map-keys-not-sorted');
+  await assert.rejects(client.putBytes(doc, { codec: 'dag-pb' }), (e) => e.code === 'put-codec-not-accepted');
+  assert.equal(s.log.length, before);
 }));
 
 test('a same-host redirect on read is followed and verified', () => withServer('redirect', async (s) => {

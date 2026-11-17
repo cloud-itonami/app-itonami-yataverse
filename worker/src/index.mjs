@@ -3,8 +3,8 @@
 //
 //   GET|HEAD /ipfs/<cid>  read from B2; on a B2 miss, from READ_FALLBACK_URL if set.
 //                          Bytes are served only after they hash to the CID.
-//   PUT /ipfs/<cid>       Authorization: Bearer <write token>. CIDv1/raw/sha2-256 only.
-//                          The body must hash to the CID; it is stored, read back from B2
+//   PUT /ipfs/<cid>       Authorization: Bearer <write token>. CIDv1/sha2-256 with codec raw or
+//                          dag-cbor (canonical DAG-CBOR only). The body must hash to the CID; it is stored, read back from B2
 //                          and verified again before 201 is returned.
 //   GET /health           liveness, no configuration values.
 //
@@ -12,7 +12,8 @@
 // WRITE_TOKEN_SHA256 are secrets. The Worker never follows a redirect and never logs a
 // token, key or request body.
 import crypto from 'node:crypto';
-import { parseCid, verifyBlock, CODEC_RAW, SHA2_256 } from '../../src/cid.mjs';
+import { parseCid, verifyBlock, SHA2_256 } from '../../src/cid.mjs';
+import { checkWritableBlock } from '../../src/block.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
@@ -121,11 +122,12 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
   if (!env.WRITE_TOKEN_SHA256) return fail(503, 'writes-not-configured');
   if (!tokenAllowed(request.headers.get('authorization'), env.WRITE_TOKEN_SHA256))
     return fail(401, 'unauthorized', { 'www-authenticate': 'Bearer' });
-  if (parsed.version !== 1 || parsed.codec !== CODEC_RAW || parsed.hashCode !== SHA2_256) return fail(400, 'put-requires-cidv1-raw-sha2-256');
+  if (parsed.version !== 1) return fail(400, 'put-requires-cidv1-sha2-256');
   const cap = maxBytes(env);
   const bytes = await readCapped(request, cap);
   if (!bytes) return fail(413, 'too-large');
-  if (!verifyBlock(cid, bytes)) return fail(400, 'bytes-do-not-hash-to-cid');
+  const bad = checkWritableBlock(cid, bytes);
+  if (bad) return fail(400, bad);
   const digestHex = hex(parsed.digest);
   const put = await store.put(cid, bytes, digestHex);
   if (put.status !== 200) return fail(502, `store-write-failed-${put.status}`);

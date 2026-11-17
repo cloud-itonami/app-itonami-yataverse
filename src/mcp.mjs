@@ -39,7 +39,7 @@ export const TOOLS = [
   { name: 'yataverse_verify', description: 'Check that a raw block CID is present on the gateway and that the bytes served hash to it.',
     inputSchema: { type: 'object', properties: { cid: str('CIDv0 Qm... or CIDv1 base32') }, required: ['cid'], additionalProperties: false } },
   { name: 'yataverse_put', description: `Publish content (up to ${PUT_CAP} bytes) as a block, then read it back and verify. This writes to a SHARED, content-addressed plane and cannot be undone; requires confirm=true and a configured authorisation.`,
-    inputSchema: { type: 'object', properties: { ...CONTENT, confirm: { type: 'boolean', description: 'must be true' } }, required: ['confirm'], additionalProperties: false } },
+    inputSchema: { type: 'object', properties: { ...CONTENT, codec: str('raw (default) or dag-cbor; dag-cbor content must be canonical DAG-CBOR, given as base64'), confirm: { type: 'boolean', description: 'must be true' } }, required: ['confirm'], additionalProperties: false } },
   // --- Authn administration. Mutating tools need confirm=true. The one-time service-account secret is
   // stored 0600 on this machine and NEVER returned: results carry metadata only.
   { name: 'yataverse_bootstrap', description: 'One idempotent pass: admin key -> sign in -> tenant -> service account -> secret stored 0600 on this machine (never returned). The first sign-in CREATES AN ACCOUNT; requires confirm=true, which only the operator\'s approval should set.',
@@ -130,7 +130,7 @@ export async function callTool(name, a, deps = {}) {
     }
     if (name === 'yataverse_verify') return j(await client.verifyRemote(a.cid));
     if (name === 'yataverse_put') {
-      return j(await client.putBytes(bytesFrom(a, PUT_CAP)));
+      return j(await client.putBytes(bytesFrom(a, PUT_CAP), { codec: a.codec ?? 'raw' }));
     }
   } catch (e) {
     return { text: JSON.stringify({ refused: e.code || 'error', detail: e.code ? undefined : String(e.message).slice(0, 200) }), isError: true };

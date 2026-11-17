@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { handle, tokenAllowed } from '../worker/src/index.mjs';
 import { signV4, regionFromEndpoint } from '../worker/src/sigv4.mjs';
-import { rawCid } from '../src/cid.mjs';
+import { rawCid, cidFor, CODEC_DAG_CBOR } from '../src/cid.mjs';
 
 const TOKEN = 'yv_write_0123456789abcdef';
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
@@ -80,6 +80,20 @@ test('PUT over the size cap is 413 and writes are 503 without a configured token
   const small = Buffer.from('small block bytes'); const c2 = rawCid(small);
   assert.equal((await handle(put(c2, small), { ...ENV, WRITE_TOKEN_SHA256: '' }, { fetchImpl: s.fetchImpl, now: NOW })).status, 503);
   assert.equal(s.objects.size, 0);
+});
+
+test('PUT accepts canonical DAG-CBOR and refuses non-canonical DAG-CBOR under a dag-cbor CID', async () => {
+  const s = fakeStore(); const deps = { fetchImpl: s.fetchImpl, now: NOW };
+  const doc = Buffer.from('a2616101616202', 'hex');            // {"a":1,"b":2}
+  const cid = cidFor(doc, CODEC_DAG_CBOR);
+  const ok = await handle(put(cid, doc), ENV, deps);
+  assert.equal(ok.status, 201); assert.equal((await ok.json()).cid, cid);
+  const g = await handle(get(cid), ENV, deps);
+  assert.deepEqual(Buffer.from(await g.arrayBuffer()), doc);
+  const unsorted = Buffer.from('a2616201616102', 'hex');       // {"b":1,"a":2}: keys out of order
+  const r = await handle(put(cidFor(unsorted, CODEC_DAG_CBOR), unsorted), ENV, deps);
+  assert.equal(r.status, 400); assert.equal((await r.json()).error, 'not-canonical-dag-cbor:map-keys-not-sorted');
+  assert.equal(s.objects.size, 1);
 });
 
 test('a failed store write or a corrupt readback is never reported as success', async () => {

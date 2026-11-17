@@ -18,7 +18,7 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse canonical-cid <cid>        normalize a CIDv0 or CIDv1 to CIDv1 base32
   yataverse get <cid> [-o file]        read a block, verified against its CID (stdout if no -o)
   yataverse verify <cid>               is it present, and do the served bytes hash to it?
-  yataverse put <file|->               publish a block, then read it back and verify
+  yataverse put <file|-> [--codec raw|dag-cbor]  publish a block (dag-cbor must be canonical), then read it back and verify
   yataverse asset-manifest <json|->    validate and canonicalize a training-asset manifest
   yataverse training-run-manifest <json|-> validate and canonicalize run provenance (unverified)
   yataverse asset-did <cid> [--domain host]  derive the deterministic Murakumo did:web for a CID
@@ -218,7 +218,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
           return 0;
         }
         if (cmd === 'verify') { const r = await client.verifyRemote(f._[0]); out(r); return r.verified ? 0 : 1; }
-        const r = await client.putBytes(readInput(f._[0])); out(r); return 0;
+        const r = await client.putBytes(readInput(f._[0]), { codec: f.codec ?? 'raw' }); out(r); return 0;
       }
       case 'mcp': serve(); return await new Promise(() => {});
       case 'bootstrap': {

@@ -61,9 +61,13 @@ export function base32Decode(str) {
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest();
 
 /** CIDv1 / raw / sha2-256, base32 lower — e.g. bafkrei... */
-export function rawCid(bytes) {
-  return 'b' + base32(Buffer.concat([Buffer.from([0x01, CODEC_RAW, SHA2_256, 0x20]), sha256(bytes)]));
+/** CIDv1/sha2-256 of bytes under a single-byte multicodec (raw 0x55, dag-cbor 0x71). */
+export function cidFor(bytes, codec) {
+  if (codec !== CODEC_RAW && codec !== CODEC_DAG_CBOR) throw new RangeError('codec not supported for writing');
+  return 'b' + base32(Buffer.concat([Buffer.from([0x01, codec, SHA2_256, 0x20]), sha256(bytes)]));
 }
+
+export function rawCid(bytes) { return cidFor(bytes, CODEC_RAW); }
 
 /** CIDv0 (implicit dag-pb/sha2-256) or lower-case base32 CIDv1/sha2-256. */
 export const CIDV0_PATTERN = /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/;
