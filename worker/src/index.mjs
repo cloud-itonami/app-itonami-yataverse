@@ -326,8 +326,10 @@ export async function handle(request, env, deps = {}) {
   }
   const pack = DRIVE_PACK_PATH.exec(url.pathname);
   if (pack || url.pathname.startsWith('/awai-drive/')) {
-    const store = b2(env, deps);
-    try { return await handleDrivePack(request, pack?.[1] ?? null, env, store, { readCapped, admitWriteRequest, admitWriteBytes, receipts: store && receiptOps(env, deps, store), requestIdOf }); }
+    try {
+      const store = b2(env, deps);
+      return await handleDrivePack(request, pack?.[1] ?? null, env, store, { readCapped, admitWriteRequest, admitWriteBytes, receipts: store && receiptOps(env, deps, store), requestIdOf });
+    }
     catch (e) { return storeFailure(e); }
   }
   if (url.pathname === '/ipfs/' || url.pathname === '/ipfs') {
