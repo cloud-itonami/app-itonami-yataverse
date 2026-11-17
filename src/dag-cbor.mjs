@@ -159,3 +159,60 @@ export function linksIn(value, out = []) {
   else if (value && typeof value === 'object' && value.cid instanceof Uint8Array) out.push(value.cid);
   return out;
 }
+
+/**
+ * Canonical DAG-CBOR bytes of a value: null, booleans, safe integers or BigInts (64-bit range),
+ * strings, Uint8Array (bytes), arrays, Maps or plain objects with string keys (sorted
+ * length-first, then bytewise), and CID links as { cid: <binary CID Uint8Array> } (the shape
+ * decodeDagCbor returns). Floats and undefined are refused, so integers never become floats.
+ * The output is checked with decodeDagCbor before it is returned.
+ */
+export function encodeDagCbor(value) {
+  const parts = [];
+  const enc = new TextEncoder();
+  function head(major, n) {
+    const v = BigInt(n);
+    if (v < 24n) parts.push(Uint8Array.of((major << 5) | Number(v)));
+    else if (v < 0x100n) parts.push(Uint8Array.of((major << 5) | 24, Number(v)));
+    else if (v < 0x10000n) parts.push(Uint8Array.of((major << 5) | 25, Number(v >> 8n), Number(v & 0xffn)));
+    else if (v < 0x100000000n) { const b = new Uint8Array(5); b[0] = (major << 5) | 26; new DataView(b.buffer).setUint32(1, Number(v)); parts.push(b); }
+    else if (v < 0x10000000000000000n) { const b = new Uint8Array(9); b[0] = (major << 5) | 27; new DataView(b.buffer).setBigUint64(1, v); parts.push(b); }
+    else bad('integer-out-of-range');
+  }
+  function item(v, depth) {
+    if (depth > MAX_DEPTH) bad('too-deep');
+    if (v === null) { parts.push(Uint8Array.of(0xf6)); return; }
+    if (v === true || v === false) { parts.push(Uint8Array.of(v ? 0xf5 : 0xf4)); return; }
+    if (typeof v === 'number' || typeof v === 'bigint') {
+      if (typeof v === 'number' && !Number.isSafeInteger(v)) bad('number-not-a-safe-integer');
+      const n = BigInt(v);
+      if (n >= 0n) head(0, n); else head(1, -1n - n);
+      return;
+    }
+    if (typeof v === 'string') { const b = enc.encode(v); head(3, b.length); parts.push(b); return; }
+    if (v instanceof Uint8Array) { head(2, v.length); parts.push(v); return; }
+    if (Array.isArray(v)) { head(4, v.length); for (const x of v) item(x, depth + 1); return; }
+    if (v && typeof v === 'object' && Object.keys(v).length === 1 && v.cid instanceof Uint8Array) {
+      parts.push(Uint8Array.of(0xd8, 0x2a));
+      const payload = new Uint8Array(v.cid.length + 1); payload.set(v.cid, 1);
+      head(2, payload.length); parts.push(payload);
+      return;
+    }
+    if (v instanceof Map || (v && typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype)) {
+      const entries = [...(v instanceof Map ? v.entries() : Object.entries(v))];
+      if (entries.some(([k]) => typeof k !== 'string')) bad('map-key-not-text');
+      const keyed = entries.map(([k, x]) => [enc.encode(k), k, x]).sort((a, b) => compareKeys(a[0], b[0]));
+      for (let i = 1; i < keyed.length; i++) if (compareKeys(keyed[i - 1][0], keyed[i][0]) === 0) bad('map-key-duplicate');
+      head(5, keyed.length);
+      for (const [kb, , x] of keyed) { head(3, kb.length); parts.push(kb); item(x, depth + 1); }
+      return;
+    }
+    bad('value-not-encodable');
+  }
+  item(value, 0);
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total); let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  decodeDagCbor(out);
+  return out;
+}

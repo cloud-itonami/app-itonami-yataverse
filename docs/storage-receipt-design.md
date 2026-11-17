@@ -1,6 +1,6 @@
 # 署名付き保存受領証（Yataverse storage receipt v1）の設計
 
-- Status: **設計案**（2026-11-18）。実装・deploy・鍵の発行は含まない。owner が決める点は §10 に挙げる。
+- Status: **owner 決定済み**（2026-11-18。§10 の推奨案を採用）。実装は [AWAI-3268](https://linear.app/kotobalabs/issue/AWAI-3268)。
 - Tracking: [AWAI-3261](https://linear.app/kotobalabs/issue/AWAI-3261)（親 [AWAI-3117](https://linear.app/kotobalabs/issue/AWAI-3117) の受入条件 3）。
 - 位置づけ: [ADR 0041](https://github.com/network-awai/network-awai-apex/blob/main/docs/adr/0041-yataverse-proof-of-storage-network.md)（Proposed）の段階 **P0「署名つきの保存受領証と readback」** の具体化。P1（PDP 型 PoSt）以降へ同じ構造のまま拡張できるようにする。
 - 前提にする既存の契約:
@@ -141,7 +141,7 @@ YataverseStorageReceipt(
 
 各段階の受入条件: 正例に加えて、改ざん、別の鍵、失効後の時刻、`requestId` の衝突、`policy-satisfied` の自己申告の負例が拒否されること。本番での readback と検証まで確認すること。
 
-## 10. owner が決めること
+## 10. owner の決定（2026-11-18: すべて推奨案）
 
 | # | 決めること | 推奨 | 他の選択肢 |
 |---|---|---|---|
@@ -151,3 +151,16 @@ YataverseStorageReceipt(
 | 4 | 受領証の保存 | B2 の `ipld/receipts/` に置く。再送に同じ受領証を返すため | 保存しない。その場合は再送のたびに `acceptedAt` が変わり、Protocol v0.1 の再送の規則を満たさない |
 | 5 | Drive への受領証 | `receipt` field を足すだけで、Drive の変更は後回しにする | 今すぐ Drive に受領証の検証を入れる |
 | 6 | `requester` の扱い | 認証つきは token の SHA-256、Drive は 0 | 接続元の IP の hash も入れる（濫用の追跡には役立つが、privacy に影響する） |
+
+## 11. 実装の記録
+
+- **段階 1（[AWAI-3304](https://linear.app/kotobalabs/issue/AWAI-3304)）:** `src/keccak.mjs`、`src/eip712.mjs`、`src/dag-cbor.mjs` の `encodeDagCbor`、`src/receipt.mjs`。依存は足していない。
+- **JSON の整数:** `kind`・`size`・`state`・`storeClass`・`acceptedAt`・`retentionUntil`・`keyEpoch` は JSON の number にする（hex にしない）。P0 の値はすべて 2^53 未満で、超える値は拒否する。bytes の field だけを 0x 付きの hex にする。
+- **署名鍵の secret:** `RECEIPT_SIGNING_KEY` は PKCS#8 ではなく Ed25519 の private JWK（`kty`・`crv`・`d`・`x`）にした。WebCrypto が private key から公開鍵を導けないため、`x` を併せて持ち、読み込み時に署名と検証を 1 回して `x` が `d` に対応することを確かめる。
+- **oracle の照合（2026-11-18、一回限り、手元のみ）:** viem 2.21.0（npm、`.agent-output/oracle/` に入れ、repo には入れない）の `hashTypedData`・`hashDomain`・`keccak256` を、`test/fixtures/receipt-vector.json` に対して Node v26.0.0 で実行した。
+  - 受領証の digest: `0x0e99111ec7716683f80460a9e79243824830ba37dbe3d2ee3b9a9d4b31c0e3a9`
+  - 受領証の domain separator: `0x0a22e1d01718aac7aa4fa15a8ea92d916117fad7b833e886730786bedf6a6b97`
+  - EIP-712 の例（Ether Mail）の domain separator: `0xf2cee375fa42b42143804025fc449deafd50cc031ca257e0b194a650a912090f`
+  - keccak256（`a` を 200 個、2 block）: `0x96ea54061def936c4be90b518992fdc6f12f535068a256229aca54267b4d084d`
+
+  いずれも本実装の値と一致した。これは参照実装と同じ値になるという証拠で、本実装が正しいことの証明ではない。test はこの値を固定値として持ち、oracle を CI や実行経路には入れない。
