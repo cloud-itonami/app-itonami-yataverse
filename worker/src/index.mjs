@@ -25,6 +25,7 @@ import { checkWritableBlock } from '../../src/block.mjs';
 import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
 import { handleDrivePack, DRIVE_PACK_PATH } from './drive-packs.mjs';
+import { admitWriteRequest, admitWriteBytes } from './write-limits.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
@@ -167,8 +168,12 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
   const denied = writeAuthFailure(request, env);
   if (denied) return denied;
   if (parsed.version !== 1) return fail(400, 'put-requires-cidv1-sha2-256');
+  const limited = await admitWriteRequest(request, env);
+  if (limited) return fail(...limited);
   const bytes = await readCapped(request, maxBytes(env));
   if (!bytes) return fail(413, 'too-large');
+  const overBytes = await admitWriteBytes(request, env, bytes.length);
+  if (overBytes) return fail(...overBytes);
   const bad = checkWritableBlock(cid, bytes);
   if (bad) return fail(400, bad);
   const err = await storeBlock(cid, bytes, env, store);
@@ -185,9 +190,13 @@ async function importCar(request, env, store) {
   if (contentType(request) !== CAR_CONTENT_TYPE) return fail(415, 'content-type-must-be-ipld-car');
   const denied = writeAuthFailure(request, env);
   if (denied) return denied;
+  const limited = await admitWriteRequest(request, env);
+  if (limited) return fail(...limited);
   const limits = carLimits(env);
   const body = await readCapped(request, limits.maxBytes);
   if (!body) return fail(413, 'car-too-large');
+  const overBytes = await admitWriteBytes(request, env, body.length);
+  if (overBytes) return fail(...overBytes);
   let car;
   try { car = parseCar(body, { maxBlocks: limits.maxBlocks }); }
   catch (e) { if (e instanceof CarError) return fail(e.code === 'car-too-many-blocks' ? 413 : 400, e.code); throw e; }
@@ -265,7 +274,7 @@ export async function handle(request, env, deps = {}) {
   }
   const pack = DRIVE_PACK_PATH.exec(url.pathname);
   if (pack || url.pathname.startsWith('/awai-drive/')) {
-    try { return await handleDrivePack(request, pack?.[1] ?? null, env, b2(env, deps), { readCapped }); }
+    try { return await handleDrivePack(request, pack?.[1] ?? null, env, b2(env, deps), { readCapped, admitWriteRequest, admitWriteBytes }); }
     catch (e) { return storeFailure(e); }
   }
   if (url.pathname === '/ipfs/' || url.pathname === '/ipfs') {

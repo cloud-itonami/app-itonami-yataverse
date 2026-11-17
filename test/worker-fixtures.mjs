@@ -4,7 +4,15 @@ import crypto from 'node:crypto';
 
 export const TOKEN = 'yv_write_0123456789abcdef';
 export const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
+/** A fake Workers Rate Limiting binding: `limit` units per key, counted until reset. */
+export function fakeLimiter(limit = Infinity) {
+  const used = new Map();
+  return { used, async limit({ key }) { const n = (used.get(key) ?? 0) + 1; used.set(key, n); return { success: n <= limit }; } };
+}
+export const UNLIMITED = { async limit() { return { success: true }; } };
+
 export const ENV = {
+  WRITE_REQUEST_LIMITER: UNLIMITED, WRITE_MIB_LIMITER: UNLIMITED,
   B2_ENDPOINT: 'https://s3.us-west-004.backblazeb2.com', B2_BUCKET: 'bucket', B2_KEY_ID: 'kid', B2_APP_KEY: 'secret',
   B2_PREFIX: 'ipld/', WRITE_TOKEN_SHA256: sha(TOKEN), MAX_BLOCK_BYTES: '1024',
 };

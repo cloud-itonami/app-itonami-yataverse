@@ -36,7 +36,7 @@ function corsHeaders(request, env) {
   return h;
 }
 
-export async function handleDrivePack(request, id, env, store, { readCapped }) {
+export async function handleDrivePack(request, id, env, store, { readCapped, admitWriteRequest, admitWriteBytes }) {
   const cors = corsHeaders(request, env);
   const reply = (status, body, headers = {}) => new Response(body === null ? null : JSON.stringify(body),
     { status, headers: { ...cors, 'cache-control': 'no-store', ...(body === null ? {} : { 'content-type': 'application/json' }), ...headers } });
@@ -51,8 +51,12 @@ export async function handleDrivePack(request, id, env, store, { readCapped }) {
   if (request.method === 'PUT') {
     if ((request.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase() !== CAR_CONTENT_TYPE)
       return reply(415, { error: 'content-type-must-be-ipld-car' });
+    const limited = await admitWriteRequest(request, env);
+    if (limited) return reply(limited[0], { error: limited[1] }, limited[2]);
     const bytes = await readCapped(request, cap);
     if (!bytes) return reply(413, { error: 'pack-too-large' });
+    const overBytes = await admitWriteBytes(request, env, bytes.length);
+    if (overBytes) return reply(overBytes[0], { error: overBytes[1] }, overBytes[2]);
     if (sha256Hex(bytes) !== id) return reply(400, { error: 'pack-does-not-hash-to-id' });
     let car;
     try { car = parseCar(bytes); } catch (e) { if (e instanceof CarError) return reply(400, { error: e.code }); throw e; }
