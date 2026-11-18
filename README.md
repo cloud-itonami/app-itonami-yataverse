@@ -318,6 +318,10 @@ Credentials come from the operator's config and **never pass through a tool argu
 any argument named like a credential is refused. `yataverse_put` requires `confirm: true` (it writes to a
 shared plane and cannot be undone). Bytes returned by `yataverse_get` are untrusted data.
 
+## Yataverse app
+
+The Tauri app (Android α) that encrypts files on the device and saves them to yataverse.com lives in [`app/`](app/README.md).
+
 ## yataverse.com Worker (Backblaze B2)
 
 `worker/` is the server side of the bytes plane on `yataverse.com` (AWAI-3102). Owner decision

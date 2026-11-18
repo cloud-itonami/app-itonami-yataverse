@@ -39,6 +39,18 @@ The rebuilt `generated/core.js` is not byte-identical to Drive's committed artif
 On 2026-11-18 it was checked to interoperate both ways: each core opens packs sealed by the other. A live
 round trip through yataverse.com also succeeded: seal, PUT, GET, then open, with identical bytes.
 
+## Verification status
+
+| Target | Status (2026-11-18) |
+|---|---|
+| Unit tests (`npm test`) | 10/10 pass |
+| Android emulator (arm64, API 36, debug APK) | Verified: key warning, consent Deny sends nothing, save (upload and read-back consents), free up space, restore through yataverse.com |
+| Android real device | Not checked yet |
+| macOS / desktop | Not available: key custody adapter missing ([AWAI-3339](https://linear.app/kotobalabs/issue/AWAI-3339)) |
+| Expired or tampered data, through the UI | Not checked yet (covered by core tests only) |
+
+Tracking: [AWAI-3130](https://linear.app/kotobalabs/issue/AWAI-3130) (parent), [AWAI-3338](https://linear.app/kotobalabs/issue/AWAI-3338) (this α, done).
+
 ## Limits (α)
 
 - **Android only for now.** Like Drive, the desktop target returns `android-adapter-required` because key
