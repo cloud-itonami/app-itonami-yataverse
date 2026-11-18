@@ -1,0 +1,1 @@
+{:target :bundle :output-to "build/cljs-bundle/core.cjs" :output-dir "build/cljs" :infer-externs true :language-out :ecmascript-2020}
