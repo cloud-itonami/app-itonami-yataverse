@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/network-awai/app-drive",
+  "files": {
+    "generated/core.js": "8df9bb0bdfb2a089fde993cee145ab6fdb1e41fca6b51cde119f55538ddb27ca",
+    "generated/receipt.js": "845a2a2c53ad875ece362f2499b2fe2d679f0cb65072b8c0609efe8017ccd610",
+    "generated/wnfs-core.js": "93df9af2f314a4a60e8a6674e34e505a97c45c04b1b96a8d955296295b7888ad",
+    "receipt-trust.json": "dc38207bdb1c591d5cc1191c4d0c2e455532a852e81791fb4b15687351f4022f",
+    "src/wnfs-sync.js": "cc7eaf403e5cd1309cfdfc1c621eb4ce47c9d92866b5f9378dc1b7657bd29d3d",
+    "src/wnfs-worker.js": "00f0f54eb86c9c0e487e5b9e411dfb50ba31a63f93247d03778474d89c30f268"
+  },
+  "revision": "0a3f0fe199278c4536cc59f46adbb14f3278c750"
+}

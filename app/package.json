@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "clojure -M:build && node scripts/bundle.mjs && node scripts/build.mjs",
+    "build": "node scripts/build.mjs",
     "test": "node --test test/*.test.mjs",
     "tauri": "tauri",
     "build:android": "npm run build && tauri android build --apk --target aarch64"
