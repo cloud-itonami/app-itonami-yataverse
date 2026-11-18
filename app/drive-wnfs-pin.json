@@ -3,11 +3,11 @@
   "files": {
     "generated/core.js": "8df9bb0bdfb2a089fde993cee145ab6fdb1e41fca6b51cde119f55538ddb27ca",
     "generated/receipt.js": "845a2a2c53ad875ece362f2499b2fe2d679f0cb65072b8c0609efe8017ccd610",
-    "generated/wnfs-core.js": "d7f6cb21ce7be45d2bccc1f5254d9966247b8d7aa19edd13b375e85274329539",
+    "generated/wnfs-core.js": "13b630175893351ebf05e70d1f1c70f4d780a640ac55911c9931837d7416997f",
     "receipt-trust.json": "dc38207bdb1c591d5cc1191c4d0c2e455532a852e81791fb4b15687351f4022f",
-    "src/wnfs-sync.js": "d68c6f7dad16835e85f5c33cf6b50133271189e68e1bac28085a24deb042b004",
-    "src/wnfs-worker.js": "33aa3bc76583e9df5bf9e11b38ba0920e3493b4d538b9a0a2cdc0c59274bb94f",
+    "src/wnfs-sync.js": "59e40719f203ce2254b6d99a9bd629ceb20bf23c0d99055816383ef8473bf046",
+    "src/wnfs-worker.js": "2bf1b5ef7130bd56496fd2b8ecd024217927888d455e5c4863c303f5aabddea9",
     "src/share-controls.js": "0670412d8cea97b988548b48167f9c6d526efa78b8ac31007c37f562c8fa44f0"
   },
-  "revision": "b983d2b4909e23005ab912707a5f41d534f2bd6f"
+  "revision": "c3a4ae6ac44d24578e79b59bd6bc81e891afe11c"
 }
