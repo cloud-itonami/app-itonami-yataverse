@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/network-awai/app-drive",
+  "revision": "70db17dcac89c8feae8df91347a6ae79138df06d",
+  "files": {
+    "generated/core.js": "9bada99e569e844f4a6e2d34ed6f42a92d5e177a62a786e3ce2a5a79a95579cc",
+    "generated/receipt.js": "845a2a2c53ad875ece362f2499b2fe2d679f0cb65072b8c0609efe8017ccd610",
+    "receipt-trust.json": "dc38207bdb1c591d5cc1191c4d0c2e455532a852e81791fb4b15687351f4022f"
+  }
+}
