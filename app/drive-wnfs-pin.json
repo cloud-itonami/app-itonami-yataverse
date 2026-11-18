@@ -7,9 +7,9 @@
     "receipt-trust.json": "dc38207bdb1c591d5cc1191c4d0c2e455532a852e81791fb4b15687351f4022f",
     "src/wnfs-sync.js": "03f88b87c8c21b6fc0d5b67d127d9e7b2fd7770dbdf0b71f5054ddde043dd634",
     "src/wnfs-worker.js": "2bf1b5ef7130bd56496fd2b8ecd024217927888d455e5c4863c303f5aabddea9",
-    "src/share-controls.js": "a22ee1e3c946285b43d0a753d5610a8a2402490fbe9b06f840d9b4df5d7c60c7",
-    "src/account-share.js": "5665dde3a853fde19dcb47fc686e6fae93c11e64b7614a2d69256998e73e909e",
+    "src/share-controls.js": "959bbaa3919726600b996a2533c41830a0bd8763e2754469571fe40fbda60fe1",
+    "src/account-share.js": "14f41476c8449fc07848c546da31d75f6ecca4ca23dec7e2ae46eff034a27f2d",
     "src/wnfs-account.js": "376e9b8500b3a59f84050d84d851debfeee7705f6c52f94c149d833bc13c54c5"
   },
-  "revision": "49470c77d5745a23667d2efee84c8fff0a9bc22f"
+  "revision": "02c79f3d16b62c8557831c5397b662534c093e35"
 }

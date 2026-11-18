@@ -8,10 +8,11 @@ const digest = /^[a-f0-9]{64}$/;
 const binding = id => ({ purpose: 'bind-wnfs-key', value: id });
 
 export function createAccountSharing({ invoke, wnfs, sha256, app }) {
-  async function accountProof(action) {
+  async function accountProof(action, expectedAccount) {
     const { proof } = await invoke('accountProof', action);
     const verified = await verifyWnfsAccountProof(proof, action);
     if (verified.app !== app) throw Error('wrong-account-app');
+    if (expectedAccount && verified.account !== expectedAccount) throw Error('wrong-share-recipient');
     await invoke('vaultWnfsBindAccount', { account: verified.account });
     return { proof, account: verified.account };
   }
@@ -59,22 +60,31 @@ export function createAccountSharing({ invoke, wnfs, sha256, app }) {
 
     async sync(session) {
       const recipients = new Map();
+      const unverifiedRecipients = [];
+      const unpublishedRecipients = [];
       const published = await wnfs.sync(session, async (items, proofs) => {
         for (const key of Object.values(items)) {
           const proof = proofs?.[key.id];
-          if (!proof) continue;
-          const { account } = await verifyWnfsAccountProof(proof, binding(key.id));
-          recipients.set(key.id, account);
+          try {
+            const { account } = await verifyWnfsAccountProof(proof, binding(key.id));
+            recipients.set(key.id, account);
+          } catch {
+            unverifiedRecipients.push(key.id);
+          }
         }
         return Object.values(items).filter(key => recipients.has(key.id));
       });
       const grants = [];
       for (const grant of published.grants) {
         const recipient = recipients.get(grant.recipient);
-        const { proof } = await accountProof(await grantAction(grant, recipient));
-        grants.push({ schema: shareSchema, recipient, grant, proof });
+        try {
+          const { proof } = await accountProof(await grantAction(grant, recipient));
+          grants.push({ schema: shareSchema, recipient, grant, proof });
+        } catch {
+          unpublishedRecipients.push(grant.recipient);
+        }
       }
-      return { ...published, grants };
+      return { ...published, grants, unverifiedRecipients, unpublishedRecipients };
     },
 
     async restore(session, share, sender) {
@@ -84,8 +94,7 @@ export function createAccountSharing({ invoke, wnfs, sha256, app }) {
       if (issued.account !== sender) throw Error('wrong-share-sender');
       const local = await wnfs.publicRecipient(session);
       if (local.id !== grant.recipient) throw Error('invalid-snapshot-grant');
-      const { account } = await accountProof(binding(local.id));
-      if (account !== recipient) throw Error('wrong-share-recipient');
+      await accountProof(binding(local.id), recipient);
       return wnfs.restoreShared(session, grant);
     },
   };

@@ -11,6 +11,18 @@ export function mountWnfsSharing(controls, sync, task, enabled, refresh) {
   const output = document.createElement('textarea');
   output.readOnly = true;
   output.setAttribute('aria-label', label('Sharing output', '共有の出力'));
+  const recipientsLabel = document.createElement('label');
+  recipientsLabel.htmlFor = 'wnfs-issued-recipient';
+  recipientsLabel.textContent = label('Shared with', '共有先');
+  const recipients = document.createElement('select');
+  recipients.id = recipientsLabel.htmlFor;
+  recipients.hidden = recipientsLabel.hidden = true;
+  let grants = [];
+  const showGrant = () => {
+    const selected = grants[Number(recipients.value)];
+    output.value = selected ? JSON.stringify(selected, null, 2) : '';
+  };
+  recipients.onchange = showGrant;
   const advice = document.createElement('p');
   advice.textContent = label(
     'Confirm the account DID and key fingerprint with the other person. Sync to issue new grants. Removing a recipient affects future snapshots.',
@@ -36,7 +48,9 @@ export function mountWnfsSharing(controls, sync, task, enabled, refresh) {
   }
   const parse = () => JSON.parse(input.value);
   button(label('Show my public key', '受信者情報を表示'), async () => {
-    output.value = JSON.stringify(await sync.publicSnapshotRecipient(), null, 2);
+    const information = await sync.publicSnapshotRecipient();
+    recipients.hidden = recipientsLabel.hidden = true;
+    output.value = JSON.stringify(information, null, 2);
     return label('Recipient information is ready.', '受信者情報を表示しました。');
   });
   button(label('Add recipient', '受信者を追加'), async () => {
@@ -55,9 +69,29 @@ export function mountWnfsSharing(controls, sync, task, enabled, refresh) {
     await refresh();
     return label('Shared folder: ', '復元した共有フォルダ ') + result.folder;
   });
-  details.append(actions, output, status);
+  details.append(actions, recipientsLabel, recipients, output, status);
   controls.after(details);
   return snapshot => {
-    if (Array.isArray(snapshot?.grants)) output.value = JSON.stringify(snapshot.grants, null, 2);
+    if (!Array.isArray(snapshot?.grants)) return;
+    grants = snapshot.grants;
+    recipients.replaceChildren(...grants.map(({ recipient, grant }, index) => {
+      const option = document.createElement('option');
+      option.value = String(index);
+      option.textContent = `${recipient} · ${grant.recipient}`;
+      return option;
+    }));
+    recipients.hidden = recipientsLabel.hidden = grants.length === 0;
+    showGrant();
+    const needsProof = snapshot.unverifiedRecipients ?? [];
+    const pending = snapshot.unpublishedRecipients ?? [];
+    const warnings = [];
+    if (needsProof.length) {
+      warnings.push(label('Renew recipient information for ', '受信者情報の更新が必要です ') + needsProof.join(', '));
+    }
+    if (pending.length) {
+      warnings.push(label('Share approval did not complete for ', '共有の承認を完了できませんでした ') + pending.join(', '));
+    }
+    status.textContent = warnings.join(' / ');
+    if (warnings.length) details.open = true;
   };
 }
