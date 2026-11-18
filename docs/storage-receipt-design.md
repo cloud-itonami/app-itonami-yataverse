@@ -171,3 +171,7 @@ YataverseStorageReceipt(
   - policy の記録は dag-cbor の block として保存するので、`policyRevision` は block の CID の digest と同じになり、過去の版も `/ipfs/<cid>` で読める。WAF の rule は Worker の外の設定なので、policy には宣言として記録する（`EXTERNAL_WRITE_LIMITS`）。
   - 同じ `requestId` の新しい request が同時に 2 本来た場合、両方が新しい受領証を出し得る（内容は同じで `acceptedAt` だけが違う）。Worker は状態を持たないため防げない。内容が同じなので §7 の「矛盾する受領証」には当たらない。
   - 鍵（epoch 1、keyId `0xad062e68…eafc`）は 2026-11-18 に生成し、private JWK は手元に保存せず `wrangler secret put` に直接渡した。
+- **段階 4（[AWAI-3268](https://linear.app/kotobalabs/issue/AWAI-3268)）:** `src/client.mjs` の `putBytes`・`putCar` と、`yataverse verify-receipt`（`src/verify-receipt.mjs`）。
+  - client は書込みごとに乱数の `Yataverse-Request-Id` を送り、応答の受領証を §6 の手順で検証する。手元の値として、`subject`・`contentDigest`・`size`・`requestId` に加えて `requester`（送った bearer token の SHA-256）も照合する。別の request や別の requester の受領証を返す応答は拒否する。
+  - 鍵は書込み先の `/.well-known/yataverse-receipt-keys.json` から取る（redirect は追わない）。`--keys <file>` で固定もできる。HTTPS の書込み先から鍵を取る場合、信頼の根は `did:web` と同じく、その host の TLS になる。
+  - 受領証が無い応答: `https://yataverse.com` への書込みでは error にする。他の host では許すが、受領証があれば必ず検証する。

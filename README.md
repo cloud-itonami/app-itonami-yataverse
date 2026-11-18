@@ -16,6 +16,8 @@ yataverse verify bafkrei...            # present? and do the served bytes hash t
 yataverse put file.bin                 # publish, then read back and verify
 yataverse car-put dag.car              # import a CAR (roots + complete closure), then export and compare
 yataverse car-get bafy... -o dag.car   # export a root as a verified CARv1 (--scope all|block)
+yataverse put file.bin > r.json && yataverse verify-receipt r.json --file file.bin --kind block
+                                       # check a saved signed storage receipt (also --kind car|drive-pack)
 yataverse asset-manifest asset.json | yataverse put -  # canonicalize, publish, and verify the manifest
 yataverse asset-did <cid>                             # derive its Murakumo did:web identifier
 yataverse asset-did-index lake.jsonl > asset-dids.jsonl  # stream a supplied inventory into a DID index
@@ -24,6 +26,14 @@ yataverse config init --tenant-id t_... --storage blocks --sa-token-stdin < secr
 yataverse token                        # a fresh Authorization value, for another tool's auth-cmd
 yataverse mcp                          # MCP server on stdio
 ```
+
+`put` and `car-put` send a fresh `Yataverse-Request-Id` and verify the signed storage receipt in
+the response: the signature with the write host's published keys (or `--keys <file>`), the key's
+validity at `acceptedAt`, and the client's own subject, digest, size, request id and requester.
+A bad receipt is an error even though the bytes were stored. From `https://yataverse.com` a missing
+receipt is also an error; other hosts may omit it (`requireReceipt: true` in the client config forces
+it). `--request-id <64 hex>` retries a write and gets the same receipt back. A receipt says only
+that the gateway stored and read back the bytes, not that they are retained or replicated.
 
 ## Reads and writes
 

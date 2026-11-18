@@ -124,7 +124,9 @@ test('client putCar and getCar verify the round trip end to end', async () => {
   const cfg = { url: 'https://yataverse.com', readUrl: 'https://yataverse.com', prefix: '/ipfs/' };
   const client = makeClient(cfg, { fetchImpl, authorize: async () => `Bearer ${TOKEN}` });
   const put = await client.putCar(encodeCarV1([f.root.cid], f.all));
-  assert.deepEqual(put, { roots: [f.root.cid], blocks: 4, external: [], verified: true });
+  const { receipt, receiptCid, receiptVerified, ...rest } = put;
+  assert.deepEqual(rest, { roots: [f.root.cid], blocks: 4, external: [], verified: true });
+  assert.equal(receiptVerified, true); assert.equal(receipt.receipt.kind, 2); assert.match(receiptCid, /^bafyrei/);
   const got = await client.getCar(f.root.cid);
   assert.deepEqual([...got.blocks.keys()], f.all.map((b) => b.cid));
   // a server that returns a CAR missing a linked block is caught by the client
