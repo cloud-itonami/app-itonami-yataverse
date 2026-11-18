@@ -179,3 +179,48 @@ test('a service-auth JWT does not authorize a block PUT (write-token only)', asy
   assert.equal((await handle(put, SA_ENV, w.deps)).status, 401);
   assert.equal(dataKeys(w.s).length, 0); assert.deepEqual(w.calls, []);
 });
+
+// ---- PDS-attested tokens (AWAI-3370) -------------------------------------------------------
+const PDS_DID = 'did:web:pds.aozora.app';
+const PDS_KEY = k256();
+const MEMBER = 'did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme';
+const AT_ENV = { ...SA_ENV, SERVICE_AUTH_PDS_KEYS: `${PDS_DID}=${PDS_KEY.multikey}` };
+const attested = (claims = {}, key = PDS_KEY) => jwt(key, { iss: PDS_DID, sub: MEMBER, ...claims });
+
+test('a PDS-attested token for an active member stores the CAR; the receipt names the member', async () => {
+  const w = world({ status: { [MEMBER]: { did: MEMBER, active: true } } });
+  const r = await handle(post(attested()), AT_ENV, w.deps);
+  assert.equal(r.status, 201);
+  const body = await r.json();
+  assert.equal(body.receipt.receipt.requester, '0x' + crypto.createHash('sha256').update(MEMBER).digest('hex'));
+  assert.deepEqual(dataKeys(w.s), [`ipld/${cid}`]);
+  assert.deepEqual(w.calls, [`status:${MEMBER}`], 'no DID document lookup for the attested member');
+});
+
+test('negative controls for PDS-attested tokens: nothing is stored', async () => {
+  const other = k256();
+  const active = { status: { [MEMBER]: { did: MEMBER, active: true } } };
+  const cases = [
+    ['not pinned (no SERVICE_AUTH_PDS_KEYS)', attested(), SA_ENV, active, 401, 'service-auth-attester-not-trusted'],
+    ['pinned PDS not in SERVICE_AUTH_PDS', attested(), { ...AT_ENV, SERVICE_AUTH_PDS: 'https://pds.other.example' }, active, 401, 'service-auth-attester-not-trusted'],
+    ['signed by another key', attested({}, other), AT_ENV, active, 401, 'service-auth-bad-signature'],
+    ['the member signing as the PDS', jwt(KEY, { iss: PDS_DID, sub: MEMBER }), AT_ENV, active, 401, 'service-auth-bad-signature'],
+    ['no subject', attested({ sub: undefined }), AT_ENV, active, 401, 'service-auth-subject-not-supported'],
+    ['subject not a DID', attested({ sub: 'alice' }), AT_ENV, active, 401, 'service-auth-subject-not-supported'],
+    ['member not hosted', attested(), AT_ENV, { status: {} }, 403, 'issuer-not-hosted-by-pds'],
+    ['member deactivated', attested(), AT_ENV, { status: { [MEMBER]: { did: MEMBER, active: false } } }, 403, 'issuer-repo-not-active'],
+    ['member denied', attested(), { ...AT_ENV, SERVICE_AUTH_DENY_DIDS: MEMBER }, active, 403, 'service-auth-issuer-denied'],
+    ['wrong audience', attested({ aud: 'did:web:evil.example' }), AT_ENV, active, 401, 'service-auth-wrong-audience'],
+    ['wrong method', attested({ lxm: 'com.atproto.repo.createRecord' }), AT_ENV, active, 403, 'service-auth-wrong-method'],
+    ['too long-lived', attested({ iat: T0, exp: T0 + 301 }), AT_ENV, active, 401, 'service-auth-lifetime-not-allowed'],
+    ['a person claiming a sub other than themself', jwt(KEY, { sub: MEMBER }), SA_ENV, {}, 401, 'service-auth-attester-not-trusted'],
+  ];
+  for (const [name, token, env, opts, status, error] of cases) {
+    clearServiceAuthCache();
+    const w = world(opts);
+    const r = await handle(post(token), env, w.deps);
+    assert.equal(r.status, status, name);
+    assert.equal((await r.json()).error, error, name);
+    assert.equal(dataKeys(w.s).length, 0, name);
+  }
+});

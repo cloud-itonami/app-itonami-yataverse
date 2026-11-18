@@ -48,6 +48,10 @@
     "SERVICE_AUTH_AUD": "did:web:yataverse.com",
     "SERVICE_AUTH_PDS": "https://pds.aozora.app",
     "SERVICE_AUTH_DENY_DIDS": "",
+    // PDS-attested tokens (AWAI-3370): "<pds did:web>=<secp256k1 Multikey>", comma-separated. The
+    // PDS signs {iss: its DID, sub: member DID} with SERVICE_AUTH_SIGNING_KEY; pin its public half
+    // here when that key is provisioned. Empty: no PDS attestation is accepted.
+    "SERVICE_AUTH_PDS_KEYS": "",
     "PLC_DIRECTORY_URL": "https://plc.directory",
     // Published receipt signing keys (/.well-known/yataverse-receipt-keys.json, did:web:yataverse.com).
     // keyId = sha256(0xed01 || public key). Times are Unix milliseconds. Rotation: add a key with
