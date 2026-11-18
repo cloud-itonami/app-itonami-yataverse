@@ -354,6 +354,21 @@ public half goes in `RECEIPT_PUBLIC_KEYS` in `wrangler.jsonc`). Deploy with
 `wrangler deploy --var SOURCE_COMMIT:<commit>`. After deploying, check
 `/health`, then put one block with a test token and read it back with `yataverse get`.
 
+## Android and dapp SDK
+
+`src/drive-packs.mjs` exposes `createDrivePackClient` for the bounded encrypted
+Drive pack protocol. Import it with its `bounded-response.mjs` dependency and
+pin the owning source revision and file digests. Pass the exact app-configured
+HTTPS origin, declared app capability, canonical Kotoba broker, and existing
+SHA-256 implementation. `publish(bytes, verifyReceipt)` accepts sealed CAR
+bytes and returns the pack digest after receipt validation and an independent
+GET with digest readback. Supply a verifier wherever a storage signing key
+is pinned. `download(id)` returns digest-verified ciphertext for the owning
+AwaiFS envelope or snapshot reader to authenticate and open locally.
+
+See [the shared Awai app storage contract](https://github.com/network-awai/awai-os/blob/main/docs/otehon/app-storage.md)
+for WNFS, Kotobase and the host capability boundary.
+
 ## Test
 
 ```sh

@@ -1,4 +1,4 @@
-import test from'node:test';import assert from'node:assert/strict';import{readResponse}from'../src/bounded-response.js';
+import test from'node:test';import assert from'node:assert/strict';import{readResponse}from'../../src/bounded-response.mjs';
 test('storage reply bounds reject oversized receipts, stalled and failing streams',async()=>{
  assert.equal((await readResponse(new Response('receipt'),2048)).length,7);
  await assert.rejects(readResponse(new Response(new Uint8Array(2049)),2048),/response-limit/);
