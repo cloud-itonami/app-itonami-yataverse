@@ -58,19 +58,22 @@ pub trait VaultKeyProvider: Send + Sync {
 }
 
 /// Non-persistent provider for unit tests. Never touches the Keychain.
-#[allow(dead_code)]
+/// Test-only: gated out of every non-test build so production code cannot
+/// name, construct, or depend on it.
+#[cfg(test)]
 #[derive(Default)]
 pub struct MemoryKeyProvider {
     key: Mutex<Option<[u8; 32]>>,
 }
 
+#[cfg(test)]
 impl MemoryKeyProvider {
-    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
 }
 
+#[cfg(test)]
 impl VaultKeyProvider for MemoryKeyProvider {
     fn key_exists(&self) -> Result<bool, String> {
         Ok(self.key.lock().map_err(|_| "drive-operation-failed".to_string())?.is_some())
@@ -104,6 +107,15 @@ fn digest_id(value: &Value) -> Result<String, String> {
     match value.as_str() {
         Some(s) if is_hex64(s) => Ok(s.to_string()),
         _ => Err("invalid-root".into()),
+    }
+}
+
+/// Mirror Android `getString` + `digestId`: a missing or mistyped field
+/// throws (client bug); only a well-typed non-hex id is `invalid-root`.
+fn req_digest(value: &Value) -> Result<String, String> {
+    match value.as_str() {
+        Some(_) => digest_id(value),
+        None => Err("drive-operation-failed".into()),
     }
 }
 
@@ -204,11 +216,13 @@ impl<K: VaultKeyProvider> Vault<K> {
             None => return Err("recovery-required".into()),
         };
         let plain = decrypt_control(&dek, &blob)?;
+        // Mirror Android: `new JSONObject` throws on corrupt JSON (a client
+        // bug), it does not report recovery-required.
         let value: Value =
-            serde_json::from_slice(&plain).map_err(|_| "recovery-required".to_string())?;
+            serde_json::from_slice(&plain).map_err(|_| "drive-operation-failed".to_string())?;
         match value {
             Value::Object(map) => Ok(Some(map)),
-            _ => Err("recovery-required".into()),
+            _ => Err("drive-operation-failed".into()),
         }
     }
 
@@ -272,28 +286,38 @@ impl<K: VaultKeyProvider> Vault<K> {
         Ok(())
     }
 
-    fn equal_inventory(a: &[Value], b: &[Value]) -> bool {
+    /// Mirror Android `equalInventory`: malformed rows throw (a client bug,
+    /// surfacing as `drive-operation-failed`); only well-formed mismatches
+    /// mean `unsynced-data`/`restore-mismatch` at the call site.
+    fn equal_inventory(a: &[Value], b: &[Value]) -> Result<bool, String> {
         if a.len() != b.len() {
-            return false;
+            return Ok(false);
         }
         for (x, y) in a.iter().zip(b.iter()) {
-            let same = x.get("path") == y.get("path")
-                && x.get("directory") == y.get("directory");
-            if !same {
-                return false;
+            let bad = || "drive-operation-failed".to_string();
+            let xd = x.get("directory").and_then(Value::as_bool).ok_or_else(&bad)?;
+            let yd = y.get("directory").and_then(Value::as_bool).ok_or_else(&bad)?;
+            let xp = x.get("path").and_then(Value::as_str).ok_or_else(&bad)?;
+            let yp = y.get("path").and_then(Value::as_str).ok_or_else(&bad)?;
+            if xp != yp || xd != yd {
+                return Ok(false);
             }
-            if x.get("directory").and_then(Value::as_bool).unwrap_or(false) {
+            if xd {
                 continue;
             }
-            if x.get("size") != y.get("size") || x.get("sha256") != y.get("sha256") {
-                return false;
+            let xs = x.get("size").and_then(Value::as_i64).ok_or_else(&bad)?;
+            let ys = y.get("size").and_then(Value::as_i64).ok_or_else(&bad)?;
+            let xh = x.get("sha256").and_then(Value::as_str).ok_or_else(&bad)?;
+            let yh = y.get("sha256").and_then(Value::as_str).ok_or_else(&bad)?;
+            if xs != ys || xh != yh {
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     fn same(&self, expected: &[Value]) -> Result<(), String> {
-        if !Self::equal_inventory(&self.inventory(LEGACY_BYTES)?, expected) {
+        if !Self::equal_inventory(&self.inventory(LEGACY_BYTES)?, expected)? {
             return Err("unsynced-data".into());
         }
         Ok(())
@@ -400,6 +424,15 @@ impl<K: VaultKeyProvider> Vault<K> {
         }
     }
 
+    /// Mirror Android `getJSONArray("entries")`: a missing or mistyped array
+    /// throws (client bug). Head-level problems stay `recovery-required`.
+    fn head_entries(head: &Map<String, Value>) -> Result<Vec<Value>, String> {
+        match head.get("entries").and_then(Value::as_array) {
+            Some(a) => Ok(a.clone()),
+            None => Err("drive-operation-failed".into()),
+        }
+    }
+
     fn legacy_head(control: &Map<String, Value>) -> Result<(), String> {
         if control.contains_key("pack") && control.contains_key("entries") {
             Ok(())
@@ -414,10 +447,6 @@ impl<K: VaultKeyProvider> Vault<K> {
 
     fn req_i64(q: &Value, field: &str) -> Result<i64, String> {
         q.get(field).and_then(Value::as_i64).ok_or_else(|| "drive-operation-failed".to_string())
-    }
-
-    fn req_usize(q: &Value, field: &str) -> Result<usize, String> {
-        q.get(field).and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok()).ok_or_else(|| "drive-operation-failed".to_string())
     }
 
     fn req_entries(q: &Value) -> Result<Vec<Value>, String> {
@@ -474,27 +503,29 @@ impl<K: VaultKeyProvider> Vault<K> {
                 let mut clean = true;
                 match self.inventory(WNFS_BYTES) {
                     Ok(entries) => {
-                        let expected: Vec<Value> = head
-                            .get("entries")
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .ok_or_else(|| "recovery-required".to_string())?;
+                        let expected: Vec<Value> = Self::head_entries(head)?;
                         if let Err(e) = self.no_unpublished(&self.files()?) {
                             if e != "unsynced-data" && e != "sync-size-limit" {
                                 return Err(e);
                             }
                             clean = false;
-                        } else if !Self::equal_inventory(&entries, &expected) {
+                        } else if !Self::equal_inventory(&entries, &expected)? {
                             clean = false;
                         }
                     }
                     Err(e) if e == "sync-size-limit" || e == "unsynced-data" => clean = false,
                     Err(e) => return Err(e),
                 }
+                // Mirror Android `head.getString("origin")`: a missing origin
+                // throws (client bug) instead of reading as empty.
+                let origin = head
+                    .get("origin")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "drive-operation-failed".to_string())?;
                 return Ok(json!({
                     "initialized": true,
                     "synced": clean,
-                    "origin": head.get("origin").cloned().unwrap_or(json!("")),
+                    "origin": origin,
                     "wnfs": true,
                     "legacy": control.contains_key("pack"),
                     "evicted": false,
@@ -513,10 +544,20 @@ impl<K: VaultKeyProvider> Vault<K> {
         match probed {
             Ok(entries) => {
                 empty = entries.is_empty();
-                same = v.as_ref().is_some_and(|c| {
-                    c.contains_key("entries")
-                        && c.get("entries").and_then(Value::as_array).is_some_and(|e| Self::equal_inventory(&entries, e))
-                });
+                // Mirror Android: a present-but-mistyped `entries` throws
+                // (client bug); an absent one simply reads as not in sync.
+                same = match v.as_ref() {
+                    Some(c) => match c.get("entries").and_then(Value::as_array) {
+                        Some(stored) => Self::equal_inventory(&entries, stored)?,
+                        None => {
+                            if c.contains_key("entries") {
+                                return Err("drive-operation-failed".into());
+                            }
+                            false
+                        }
+                    },
+                    None => false,
+                };
             }
             Err(e) if e == "sync-size-limit" || e == "unsynced-data" => {
                 same = false;
@@ -537,8 +578,14 @@ impl<K: VaultKeyProvider> Vault<K> {
         let d = self.files()?;
         let f = d.resolve(Self::req_str(q, "path")?)?;
         let at = Self::req_i64(q, "offset")?;
-        let length = Self::req_usize(q, "length")?;
-        if !f.is_file() || at < 0 || length > CHUNK {
+        // Mirror Android `getInt("length")`: only an in-range integer reaches
+        // the range checks; anything else is a client bug.
+        let raw_length = Self::req_i64(q, "length")?;
+        if raw_length > i32::MAX as i64 || raw_length < i32::MIN as i64 {
+            return Err("drive-operation-failed".into());
+        }
+        let length = raw_length as usize;
+        if !f.is_file() || at < 0 || raw_length < 0 || length > CHUNK {
             return Err("invalid-path".into());
         }
         let size = f.metadata().map_err(|_| "invalid-path".to_string())?.len() as i64;
@@ -557,8 +604,8 @@ impl<K: VaultKeyProvider> Vault<K> {
         let entries = Self::req_entries(q)?;
         self.same(&entries)?;
         self.no_unpublished(&self.files()?)?;
-        let root = digest_id(q.get("root").unwrap_or(&Value::Null))?;
-        let pack = digest_id(q.get("pack").unwrap_or(&Value::Null))?;
+        let root = req_digest(q.get("root").unwrap_or(&Value::Null))?;
+        let pack = req_digest(q.get("pack").unwrap_or(&Value::Null))?;
         let origin = Self::req_str(q, "origin")?.to_string();
         v.insert("root".to_string(), json!(root));
         v.insert("pack".to_string(), json!(pack));
@@ -664,7 +711,12 @@ impl<K: VaultKeyProvider> Vault<K> {
         let rows = Self::req_entries(&Value::Object(v.clone()))?;
         for row in &rows {
             let f = d.resolve(Self::req_str(row, "path")?)?;
-            if row.get("directory").and_then(Value::as_bool).unwrap_or(false) {
+            // Mirror Android `getBoolean`: a mistyped flag throws.
+            let is_dir = row
+                .get("directory")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| "drive-operation-failed".to_string())?;
+            if is_dir {
                 fs::create_dir_all(&f).map_err(|_| "storage-unavailable".to_string())?;
             } else {
                 let size = Self::req_i64(row, "size")?;
@@ -681,7 +733,7 @@ impl<K: VaultKeyProvider> Vault<K> {
         let mut actual: Vec<Value> = Vec::new();
         let mut total: i64 = 0;
         self.walk(&check, "", &mut actual, &mut total, LEGACY_BYTES)?;
-        if !Self::equal_inventory(&actual, &rows) {
+        if !Self::equal_inventory(&actual, &rows)? {
             return Err("restore-mismatch".into());
         }
         for dir in self.all_dirs(&stage)? {
@@ -706,26 +758,29 @@ impl<K: VaultKeyProvider> Vault<K> {
             return Err("recovery-required".into());
         }
         let entries = Self::req_entries(q)?;
-        if !Self::equal_inventory(&self.inventory(WNFS_BYTES)?, &entries) {
+        if !Self::equal_inventory(&self.inventory(WNFS_BYTES)?, &entries)? {
             return Err("unsynced-data".into());
         }
         self.no_unpublished(&self.files()?)?;
-        let packs = q.get("packs").and_then(Value::as_array).ok_or_else(|| "invalid-root".to_string())?;
+        let packs = q
+            .get("packs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "drive-operation-failed".to_string())?;
         if packs.is_empty() || packs.len() > 8 {
             return Err("invalid-root".into());
         }
         let mut ids = std::collections::HashSet::new();
-        let capsule = digest_id(q.get("capsule").unwrap_or(&Value::Null))?;
+        let capsule = req_digest(q.get("capsule").unwrap_or(&Value::Null))?;
         ids.insert(capsule.clone());
         let mut pack_ids = Vec::with_capacity(packs.len());
         for p in packs {
-            let id = digest_id(p)?;
+            let id = req_digest(p)?;
             if !ids.insert(id.clone()) {
                 return Err("invalid-root".into());
             }
             pack_ids.push(json!(id));
         }
-        let root = digest_id(q.get("root").unwrap_or(&Value::Null))?;
+        let root = req_digest(q.get("root").unwrap_or(&Value::Null))?;
         let origin = Self::req_str(q, "origin")?.to_string();
         let head = json!({
             "schema": WNFS_SCHEMA,
@@ -808,22 +863,20 @@ impl<K: VaultKeyProvider> Vault<K> {
         let legacy = q.get("legacy").and_then(Value::as_bool).unwrap_or(false);
         let expected: Vec<Value> = if legacy {
             Self::legacy_head(&control)?;
-            control
-                .get("entries")
-                .and_then(Value::as_array)
-                .cloned()
-                .ok_or_else(|| "recovery-required".to_string())?
+            Self::head_entries(&control)?
         } else {
             let head = Self::wnfs_head(&control)?;
-            head.get("entries")
-                .and_then(Value::as_array)
-                .cloned()
-                .ok_or_else(|| "recovery-required".to_string())?
+            Self::head_entries(head)?
         };
         let files = DriveFiles::new(&stage)?;
         for entry in &expected {
             let file = files.resolve(Self::req_str(entry, "path")?)?;
-            if entry.get("directory").and_then(Value::as_bool).unwrap_or(false) {
+            // Mirror Android `getBoolean`: a mistyped flag throws.
+            let is_dir = entry
+                .get("directory")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| "drive-operation-failed".to_string())?;
+            if is_dir {
                 fs::create_dir_all(&file).map_err(|_| "storage-unavailable".to_string())?;
             } else if !file.is_file() {
                 return Err("restore-mismatch".into());
@@ -836,7 +889,7 @@ impl<K: VaultKeyProvider> Vault<K> {
         let mut actual: Vec<Value> = Vec::new();
         let mut total: i64 = 0;
         self.walk(&files, "", &mut actual, &mut total, if legacy { LEGACY_BYTES } else { WNFS_BYTES })?;
-        if !Self::equal_inventory(&actual, &expected) {
+        if !Self::equal_inventory(&actual, &expected)? {
             return Err("restore-mismatch".into());
         }
         for dir in self.all_dirs(&stage)? {
@@ -910,9 +963,9 @@ impl<K: VaultKeyProvider> DesktopDrive<K> {
                     row.insert("name".to_string(), json!(e.name));
                     row.insert("path".to_string(), json!(e.path));
                     row.insert("directory".to_string(), json!(e.directory));
-                    if !e.directory {
-                        row.insert("bytes".to_string(), json!(e.bytes));
-                    }
+                    // Mirror Android: every row carries `bytes`
+                    // (`File.length()`), including directories.
+                    row.insert("bytes".to_string(), json!(e.bytes));
                     row.insert("local".to_string(), json!(true));
                     row.insert("remoteVerified".to_string(), json!(false));
                     rows.push(Value::Object(row));
@@ -957,11 +1010,16 @@ impl<K: VaultKeyProvider> DesktopDrive<K> {
 
     /// Open a cached file with its default macOS handler (LaunchServices
     /// equivalent of Android's `ACTION_VIEW` + FileProvider grant).
+    /// Mirror Android `require(f.isFile())`: anything that is not a regular
+    /// file is a client bug. The final component is re-checked for symlinks
+    /// just before launch so a swapped-in link cannot escape the drive root,
+    /// and `--` plus `Command` argv (no shell) blocks argument injection.
     #[cfg(target_os = "macos")]
     fn op_open(&self, q: &Value) -> Result<Value, String> {
         let f = self.vault.files()?.resolve(Vault::<K>::req_str(q, "path")?)?;
-        if !f.is_file() {
-            return Err("invalid-path".into());
+        let md = fs::symlink_metadata(&f).map_err(|_| "drive-operation-failed".to_string())?;
+        if md.file_type().is_symlink() || !md.file_type().is_file() {
+            return Err("drive-operation-failed".into());
         }
         std::process::Command::new("/usr/bin/open")
             .arg("--")
@@ -1233,7 +1291,8 @@ mod tests {
         assert_eq!(root_entries[0]["name"], json!("docs"));
         assert_eq!(root_entries[0]["local"], json!(true));
         assert_eq!(root_entries[0]["remoteVerified"], json!(false));
-        assert!(root_entries[0].get("bytes").is_none(), "directories carry no bytes key");
+        // Android rows always carry `bytes` (`File.length()`), even for dirs.
+        assert!(root_entries[0].get("bytes").and_then(Value::as_u64).is_some());
         let sub = call(&d, "list", json!({"parent": "docs"})).unwrap();
         let files = sub["entries"].as_array().unwrap();
         assert_eq!(files.len(), 1);
@@ -1273,5 +1332,145 @@ mod tests {
         assert!(root["entries"].as_array().unwrap().iter().any(|e| e["name"] == json!(folder)));
         // Legacy evict must refuse while a WNFS head is pinned.
         assert_eq!(call(&d, "vaultEvict", json!({"origin": origin})).unwrap_err(), "unsynced-data");
+    }
+
+    /// Android `vaultRead` uses `getInt("length")` plus explicit range checks,
+    /// so a negative length is `invalid-path` (only non-integral or missing
+    /// fields are client bugs).
+    #[test]
+    fn read_rejects_negative_length_like_android() {
+        let (_tmp, d) = drive();
+        call(&d, "vaultSession", json!({"initialize": true})).unwrap();
+        call(&d, "vaultRecord", json!({"record": "r"})).unwrap();
+        call(&d, "createText", json!({"parent": "", "name": "n.txt", "text": "hi"})).unwrap();
+        assert_eq!(
+            call(&d, "vaultRead", json!({"path": "n.txt", "offset": 0, "length": -1})).unwrap_err(),
+            "invalid-path"
+        );
+    }
+
+    /// Android `list` rows always carry `bytes` (`File.length()`), including
+    /// directories; the JS file view only reads it for files.
+    #[test]
+    fn list_rows_carry_bytes_for_directories() {
+        let (_tmp, d) = drive();
+        call(&d, "mkdir", json!({"parent": "", "name": "docs"})).unwrap();
+        let list = call(&d, "list", json!({"parent": ""})).unwrap();
+        let row = &list["entries"].as_array().unwrap()[0];
+        assert_eq!(row["directory"], json!(true));
+        assert!(row.get("bytes").and_then(Value::as_u64).is_some(), "dir row: {row}");
+    }
+
+    /// Android `commitWnfs` reads `packs`/`capsule`/`root` with `getString`:
+    /// a missing or mistyped field throws (client bug), while a well-typed
+    /// non-hex id is `invalid-root`.
+    #[test]
+    fn wnfs_commit_field_errors_match_android() {
+        let (_tmp, d) = drive();
+        call(&d, "vaultSession", json!({"initialize": true})).unwrap();
+        call(&d, "vaultRecord", json!({"record": "wnfs-record"})).unwrap();
+        let entries = call(&d, "vaultWnfsInventory", json!({})).unwrap()["entries"].clone();
+        let base = || {
+            let mut m = Map::new();
+            m.insert("root".to_string(), json!("aa".repeat(32)));
+            m.insert("capsule".to_string(), json!("bb".repeat(32)));
+            m.insert("packs".to_string(), json!(["cc".repeat(32)]));
+            m.insert("origin".to_string(), json!("https://example.invalid"));
+            m.insert("entries".to_string(), entries.clone());
+            Value::Object(m)
+        };
+        // Missing packs array is a client bug, not an invalid root.
+        let mut q = base();
+        q.as_object_mut().unwrap().remove("packs");
+        assert_eq!(call(&d, "vaultWnfsCommit", q).unwrap_err(), "drive-operation-failed");
+        // A non-string capsule is a client bug; a non-hex string is invalid-root.
+        let mut q = base();
+        q["capsule"] = json!(42);
+        assert_eq!(call(&d, "vaultWnfsCommit", q).unwrap_err(), "drive-operation-failed");
+        let mut q = base();
+        q["capsule"] = json!("ZZ".repeat(32));
+        assert_eq!(call(&d, "vaultWnfsCommit", q).unwrap_err(), "invalid-root");
+        let mut q = base();
+        q.as_object_mut().unwrap().remove("root");
+        assert_eq!(call(&d, "vaultWnfsCommit", q).unwrap_err(), "drive-operation-failed");
+    }
+
+    /// Android `equalInventory` throws on malformed rows (a client bug);
+    /// only well-formed mismatches are `unsynced-data`.
+    #[test]
+    fn commit_rejects_malformed_entries_like_android() {
+        let (_tmp, d) = drive();
+        call(&d, "vaultSession", json!({"initialize": true})).unwrap();
+        call(&d, "vaultRecord", json!({"record": "r"})).unwrap();
+        call(&d, "createText", json!({"parent": "", "name": "a.txt", "text": "x"})).unwrap();
+        for entries in [
+            json!([{"path": "a.txt"}]),
+            json!([42]),
+            json!([{"path": "a.txt", "directory": "false", "size": 1, "sha256": "xx"}]),
+        ] {
+            assert_eq!(
+                call(
+                    &d,
+                    "vaultCommit",
+                    json!({"root": "ab".repeat(32), "pack": "cd".repeat(32), "origin": "o", "entries": entries})
+                )
+                .unwrap_err(),
+                "drive-operation-failed",
+                "entries: {entries}"
+            );
+        }
+    }
+
+    /// A control file that decrypts but is not a JSON object is a client
+    /// bug on Android (`new JSONObject` throws), not `recovery-required`.
+    #[test]
+    fn corrupt_control_json_is_client_bug_not_recovery() {
+        let (_tmp, d) = drive();
+        call(&d, "vaultSession", json!({"initialize": true})).unwrap();
+        let dek = d.vault.keys.load_key().expect("load").expect("key");
+        let blob = encrypt_control(&dek, b"[1,2,3]").expect("encrypt");
+        std::fs::write(&d.vault.control, blob).expect("overwrite control");
+        assert_eq!(call(&d, "vaultStatus", json!({})).unwrap_err(), "drive-operation-failed");
+    }
+
+    /// A WNFS head without an entries array fails `getJSONArray` on Android
+    /// (client bug), instead of the Rust port's `recovery-required`.
+    #[test]
+    fn wnfs_head_without_entries_is_client_bug() {
+        let (_tmp, d) = drive();
+        call(&d, "vaultSession", json!({"initialize": true})).unwrap();
+        let mut control = Map::new();
+        control.insert(
+            "wnfs".to_string(),
+            json!({"schema": WNFS_SCHEMA, "origin": "https://example.invalid"}),
+        );
+        d.vault.save(&control).expect("save corrupt head");
+        assert_eq!(call(&d, "vaultStatus", json!({})).unwrap_err(), "drive-operation-failed");
+    }
+
+    /// Android `open` requires `f.isFile()`, and a failed require is a
+    /// client bug; the port must not report it as `invalid-path`.
+    #[test]
+    fn open_refuses_directory_like_android() {
+        let (_tmp, d) = drive();
+        call(&d, "mkdir", json!({"parent": "", "name": "docs"})).unwrap();
+        assert_eq!(
+            call(&d, "open", json!({"path": "docs"})).unwrap_err(),
+            "drive-operation-failed"
+        );
+    }
+
+    /// Authenticated control-file framing: flipping one ciphertext byte must
+    /// refuse with the generic failure code, exactly like Android's
+    /// `Tag mismatch` path through `DrivePlugin.code`.
+    #[test]
+    fn tampered_control_file_refuses_with_generic_code() {
+        let (tmp, d) = drive();
+        call(&d, "vaultSession", json!({"initialize": true})).unwrap();
+        let mut blob = std::fs::read(tmp.path().join("drive-vault-v1.bin")).expect("control");
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        std::fs::write(tmp.path().join("drive-vault-v1.bin"), blob).expect("tamper");
+        assert_eq!(call(&d, "vaultStatus", json!({})).unwrap_err(), "drive-operation-failed");
     }
 }

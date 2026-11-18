@@ -15,7 +15,9 @@
 //! unit: on macOS `pick` refuses with the documented `pick-unsupported`
 //! code instead of a fake success.
 
+#[cfg(target_os = "macos")]
 mod drive_files;
+#[cfg(target_os = "macos")]
 mod vault;
 #[cfg(target_os = "macos")]
 mod keychain;

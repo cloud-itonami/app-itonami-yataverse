@@ -25,20 +25,31 @@ pub struct Entry {
     pub bytes: u64,
 }
 
-/// Validate and NFC-normalize one path segment. Mirrors `DriveFiles.name`.
+/// Validate and NFC-normalize one path segment. Mirrors `DriveFiles.name`
+/// exactly: only the emptiness check trims, the 160-unit cap counts raw
+/// UTF-16 units, and the stored name is NFC of the raw input (never trimmed,
+/// so padded names stay distinct files like on Android).
 pub fn valid_name(n: &str) -> Result<String, String> {
     // Java `String.trim()` strips chars <= U+0020; mirror that exactly.
-    let trimmed: String = n.trim_matches(|c: char| c <= '\u{20}').to_string();
-    if trimmed.is_empty()
-        || trimmed.encode_utf16().count() > 160
-        || trimmed == "."
-        || trimmed == ".."
-        || trimmed.starts_with(".pending-")
-        || trimmed.chars().any(|c| c == '/' || c == '\\' || c < '\u{20}' || c == '\u{7f}')
+    if n.trim_matches(|c: char| c <= '\u{20}').is_empty()
+        || n.encode_utf16().count() > 160
+        || n == "."
+        || n == ".."
+        || n.starts_with(".pending-")
+        || n.chars().any(|c| c == '/' || c == '\\' || c < '\u{20}' || c == '\u{7f}')
     {
         return Err("invalid-name".into());
     }
-    Ok(trimmed.chars().nfc().collect())
+    Ok(n.chars().nfc().collect())
+}
+
+/// Compare names the way `String.compareTo` does: by UTF-16 code unit.
+/// UTF-8 byte order disagrees for supplementary characters (e.g. U+E000 vs
+/// U+1F600), and inventory order feeds digests downstream.
+fn cmp_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> std::cmp::Ordering {
+    a.to_string_lossy()
+        .encode_utf16()
+        .cmp(b.to_string_lossy().encode_utf16())
 }
 
 pub struct DriveFiles {
@@ -182,10 +193,11 @@ impl DriveFiles {
             match (ad, bd) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => a
-                    .file_name()
-                    .cmp(&b.file_name())
-                    .then_with(|| a.cmp(b)),
+                _ => {
+                    let an = a.file_name().unwrap_or_else(|| std::ffi::OsStr::new(""));
+                    let bn = b.file_name().unwrap_or_else(|| std::ffi::OsStr::new(""));
+                    cmp_name(an, bn).then_with(|| a.cmp(b))
+                }
             }
         });
         let mut out = Vec::with_capacity(files.len());
@@ -383,6 +395,48 @@ fn lock_exclusive_nb(f: &File) -> Result<(), String> {
     {
         let _ = f;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `DriveFiles.name` validates the raw name: only the emptiness check
+    /// trims, the length cap counts raw UTF-16 units, and the stored name is
+    /// NFC of the raw input (never trimmed).
+    #[test]
+    fn name_mirrors_java_raw_validation_and_nfc() {
+        assert_eq!(valid_name(" a").unwrap(), " a");
+        assert_eq!(valid_name("a ").unwrap(), "a ");
+        assert_eq!(valid_name("é").unwrap(), "é");
+        // 161 raw UTF-16 units with trimmable padding: Java rejects on the
+        // raw length even though the trimmed rest is short.
+        let padded = format!("{}b", " ".repeat(160));
+        assert_eq!(valid_name(&padded).unwrap_err(), "invalid-name");
+        for bad in [".", "..", ".pending-x", "a/b", "a\\b", "bad\nname", " dot-padded "] {
+            if bad == " dot-padded " {
+                // Leading/trailing spaces are legal on Android; only the
+                // all-blank name is rejected.
+                assert!(valid_name(bad).is_ok(), "name {bad:?}");
+                continue;
+            }
+            assert_eq!(valid_name(bad).unwrap_err(), "invalid-name", "name {bad:?}");
+        }
+        assert_eq!(valid_name("   ").unwrap_err(), "invalid-name");
+    }
+
+    /// `DriveFiles.list` sorts by `String.compareTo`: UTF-16 code units.
+    /// The emoji lead surrogate (0xD83D) sorts before U+E000, while UTF-8
+    /// byte order would put U+E000 first.
+    #[test]
+    fn list_order_matches_java_utf16_comparison() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = DriveFiles::new(dir.path()).expect("files");
+        files.copy_bytes("", "\u{e000}.txt", b"x", 1).expect("e000");
+        files.copy_bytes("", "\u{1f600}.txt", b"x", 1).expect("emoji");
+        let names: Vec<String> = files.list("").expect("list").into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["\u{1f600}.txt".to_string(), "\u{e000}.txt".to_string()]);
     }
 }
 

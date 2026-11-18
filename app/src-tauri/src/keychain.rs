@@ -32,8 +32,12 @@ mod provider {
 
         fn get(&self) -> Result<Option<[u8; 32]>, String> {
             use security_framework::passwords::get_generic_password;
+            use zeroize::Zeroizing;
             match get_generic_password(&self.service, ALIAS) {
                 Ok(secret) => {
+                    // Wipe the Keychain copy on the way out: key material
+                    // only travels in the fixed-size return array.
+                    let secret = Zeroizing::new(secret);
                     if secret.len() != 32 {
                         // A foreign or corrupt item under our name refuses
                         // closed rather than decrypting with the wrong key.
@@ -90,8 +94,6 @@ mod provider {
 
 #[cfg(target_os = "macos")]
 pub use provider::KeychainKeyProvider;
-#[cfg(all(target_os = "macos", test))]
-pub use provider::delete_item;
 
 #[cfg(test)]
 mod tests {
