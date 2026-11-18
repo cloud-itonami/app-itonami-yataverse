@@ -5,7 +5,16 @@
 //   car:    POST <url><prefix> (CAR import) and GET <readUrl>/ipfs/<root>?format=car (export);
 //           neither follows a redirect
 // Every read and every write is checked by re-deriving the CID from the bytes.
-import { cidFor, verifyBlock, isCidShape } from './cid.mjs';
+//
+// Signed storage receipts (docs/storage-receipt-design.md, AWAI-3268 stage 4): every write sends
+// a fresh Yataverse-Request-Id. When the response carries a receipt, it is verified against the
+// write host's published keys (/.well-known/yataverse-receipt-keys.json, or keys pinned with
+// opts.receiptKeys) and the client's own subject, digest, size, request id and requester; a
+// receipt that fails is an error even though the bytes were stored. A missing receipt is an error
+// when receipts are required: by default for https://yataverse.com, or cfg.requireReceipt.
+import crypto from 'node:crypto';
+import { cidFor, verifyBlock, isCidShape, cidToBytes, parseCid } from './cid.mjs';
+import { verifyReceipt, envelopeFromJson, envelopeToDagCbor, rootsCommitment, blockSetDigest, requesterFor, KIND, ReceiptError } from './receipt.mjs';
 import { checkWritableBlock, WRITABLE_CODECS } from './block.mjs';
 import { parseCar, CarError, CAR_CONTENT_TYPE } from './car.mjs';
 import { checkClosure, DagError } from './dag.mjs';
@@ -51,10 +60,54 @@ async function readCapped(res, maxBytes) {
   return Buffer.concat(chunks);
 }
 
-export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureForTests = false } = {}) {
+/** Hosts known to issue receipts: a write there without a valid receipt is an error. */
+export const RECEIPT_HOSTS = new Set(['yataverse.com']);
+const RECEIPT_KEYS_PATH = '/.well-known/yataverse-receipt-keys.json';
+export const REQUEST_ID_HEADER = 'yataverse-request-id';
+
+export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureForTests = false, receiptKeys: pinnedKeys } = {}) {
   const readOrigin = new URL(cfg.readUrl);
   const okScheme = (u) => u.protocol === 'https:' || (allowInsecureForTests && u.protocol === 'http:');
   const timeout = () => AbortSignal.timeout(30_000);
+  const requireReceipt = cfg.requireReceipt ?? RECEIPT_HOSTS.has(new URL(cfg.url).hostname);
+
+  /** The write host's published receipt keys (fetched once, no redirects), or the pinned set. */
+  let keysPromise = pinnedKeys ? Promise.resolve(pinnedKeys) : null;
+  function receiptKeys() {
+    keysPromise ??= (async () => {
+      const url = new URL(RECEIPT_KEYS_PATH, new URL(cfg.url));
+      if (!okScheme(url)) throw new YataverseError('receipt-keys-url-not-https');
+      const res = await fetchImpl(url, { redirect: 'manual', signal: timeout(), headers: { accept: 'application/json' } });
+      if (res.status !== 200) throw new YataverseError('receipt-keys-unavailable', `HTTP ${res.status}`);
+      try { return JSON.parse((await readCapped(res, 64 * 1024)).toString('utf8')); }
+      catch (e) { if (e instanceof YataverseError) throw e; throw new YataverseError('receipt-keys-not-json'); }
+    })().catch((e) => { keysPromise = null; throw e; });
+    return keysPromise;
+  }
+
+  /** Verify a write response's receipt against what this client sent. -> extra result fields. */
+  async function checkReceipt(body, expect) {
+    if (!body?.receipt) {
+      if (requireReceipt) throw new YataverseError('receipt-missing', 'the write host issues receipts; this response has none');
+      return {};
+    }
+    let env;
+    try {
+      env = envelopeFromJson(body.receipt);
+      await verifyReceipt(env, await receiptKeys(), expect);
+    } catch (e) { if (e instanceof ReceiptError) throw new YataverseError(`receipt-${e.code}`); throw e; }
+    const { cid } = envelopeToDagCbor(env);
+    if (body.receiptCid !== undefined && body.receiptCid !== cid) throw new YataverseError('receipt-cid-mismatch');
+    return { receipt: body.receipt, receiptCid: cid, receiptVerified: true };
+  }
+
+  const newRequestId = (given) => {
+    if (given === undefined) return crypto.randomBytes(32);
+    const m = /^(?:0x)?([0-9a-f]{64})$/.exec(String(given).toLowerCase());
+    if (!m) throw new YataverseError('bad-request-id', 'expected 64 hex characters');
+    return Buffer.from(m[1], 'hex');
+  };
+  const jsonOrNull = async (res) => { try { return await res.json(); } catch { return null; } };
 
   /** GET with same-parent-domain redirects. -> Buffer | null (absent). Throws on any doubt. */
   async function get(cid, { maxBytes = DEFAULT_MAX_BYTES } = {}) {
@@ -83,7 +136,8 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
     throw new YataverseError('too-many-redirects');
   }
 
-  async function putBlock(cid, bytes) {
+  /** PUT one block. -> { body (parsed JSON or null), requestId, auth }. */
+  async function putBlock(cid, bytes, { requestId } = {}) {
     if (!isCidShape(cid)) throw new YataverseError('bad-cid');
     const bad = checkWritableBlock(cid, bytes);
     if (bad) throw new YataverseError(bad);
@@ -91,24 +145,27 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
     const auth = await authorize();
     const base = new URL(cfg.url);
     if (!okScheme(base)) throw new YataverseError('write-url-not-https');
+    const rid = newRequestId(requestId);
     const res = await fetchImpl(new URL(`${cfg.prefix}${cid}`, base), {
       method: 'PUT', redirect: 'manual', signal: timeout(),
-      headers: { authorization: auth, 'content-type': 'application/vnd.ipld.raw' }, body: bytes,
+      headers: { authorization: auth, 'content-type': 'application/vnd.ipld.raw', [REQUEST_ID_HEADER]: rid.toString('hex') }, body: bytes,
     });
-    if (res.status >= 200 && res.status < 300) return true;
+    if (res.status >= 200 && res.status < 300) return { body: await jsonOrNull(res), requestId: rid, auth };
     if (REDIRECTS.has(res.status)) throw new YataverseError('put-redirected', 'a write is never followed to another host');
-    const why = { 401: 'unauthorized', 403: 'forbidden', 405: 'method-not-allowed', 413: 'too-large', 400: 'rejected-as-not-matching-cid' }[res.status];
+    const why = { 401: 'unauthorized', 403: 'forbidden', 405: 'method-not-allowed', 409: 'request-id-conflict', 413: 'too-large', 400: 'rejected-as-not-matching-cid' }[res.status];
     throw new YataverseError(why ? `put-${why}` : 'put-failed', `HTTP ${res.status}`);
   }
 
-  /** Write bytes, then read them back and verify. -> {cid, verified} */
-  async function putBytes(bytes, { codec = 'raw' } = {}) {
+  /** Write bytes, verify the receipt, then read them back and verify. -> {cid, verified, bytes, receipt...} */
+  async function putBytes(bytes, { codec = 'raw', requestId } = {}) {
     if (!(codec in WRITABLE_CODECS)) throw new YataverseError('put-codec-not-accepted', codec);
     const cid = cidFor(bytes, WRITABLE_CODECS[codec]);
-    await putBlock(cid, bytes);
+    const put = await putBlock(cid, bytes, { requestId });
+    const receipt = await checkReceipt(put.body, { kind: KIND.block, subject: cidToBytes(cid), contentDigest: new Uint8Array(parseCid(cid).digest),
+      size: bytes.length, requestId: put.requestId, requester: requesterFor(put.auth) });
     const back = await get(cid);
     if (!back) throw new YataverseError('readback-absent');
-    return { cid, verified: true, bytes: bytes.length };
+    return { cid, verified: true, bytes: bytes.length, ...receipt };
   }
 
   async function verifyRemote(cid) {
@@ -145,19 +202,24 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
   }
 
   /** Import a CAR, then export every root and check each uploaded block came back identical. */
-  async function putCar(bytes) {
+  async function putCar(bytes, { requestId } = {}) {
     const local = checkCarLocally(bytes);
+    const rid = newRequestId(requestId);
     if (!authorize) throw new YataverseError('no-authorization-configured');
     const auth = await authorize();
     const base = new URL(cfg.url);
     if (!okScheme(base)) throw new YataverseError('write-url-not-https');
     const res = await fetchImpl(new URL(cfg.prefix, base), {
       method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(120_000),
-      headers: { authorization: auth, 'content-type': CAR_CONTENT_TYPE }, body: bytes,
+      headers: { authorization: auth, 'content-type': CAR_CONTENT_TYPE, [REQUEST_ID_HEADER]: rid.toString('hex') }, body: bytes,
     });
     if (REDIRECTS.has(res.status)) throw new YataverseError('car-put-redirected', 'a write is never followed to another host');
     let j = null; try { j = await res.json(); } catch { /* not JSON */ }
     if (res.status !== 201) throw new YataverseError('car-put-failed', `HTTP ${res.status}${j?.error ? ` ${j.error}` : ''}`);
+    let size = 0; for (const b of local.blocks.values()) size += b.length;
+    const external = Array.isArray(j?.external) ? j.external.map(String) : [];
+    const receipt = await checkReceipt(j, { kind: KIND.car, subject: rootsCommitment(local.roots),
+      contentDigest: blockSetDigest([...local.blocks.keys(), ...external]), size, requestId: rid, requester: requesterFor(auth) });
     const seen = new Map();
     for (const r of local.roots) {
       const back = await getCar(r, { scope: 'all' });
@@ -168,8 +230,8 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
       const got = seen.get(c);
       if (!got || Buffer.compare(Buffer.from(got), Buffer.from(b)) !== 0) throw new YataverseError('car-readback-mismatch', c);
     }
-    return { roots: local.roots, blocks: local.blocks.size, external: j?.external ?? [], verified: true };
+    return { roots: local.roots, blocks: local.blocks.size, external: j?.external ?? [], verified: true, ...receipt };
   }
 
-  return { get, putBlock, putBytes, verifyRemote, getCar, putCar };
+  return { get, putBlock, putBytes, verifyRemote, getCar, putCar, receiptKeys, checkReceipt };
 }

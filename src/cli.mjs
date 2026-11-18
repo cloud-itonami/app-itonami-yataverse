@@ -6,6 +6,7 @@ import { rawCid, parseCid, normalizeCid } from './cid.mjs';
 import { loadConfig, saveConfig, status, configDir, ConfigError } from './config.mjs';
 import { makeAuthorizer } from './auth.mjs';
 import { makeClient } from './client.mjs';
+import { verifyReceiptInput } from './verify-receipt.mjs';
 import { serve } from './mcp.mjs';
 import { keygen, adminStatus, makeAdmin, AdminError } from './admin.mjs';
 import { canonicalAssetManifest } from './asset-manifest.mjs';
@@ -20,6 +21,12 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse verify <cid>               is it present, and do the served bytes hash to it?
   yataverse put <file|-> [--codec raw|dag-cbor]  publish a block (dag-cbor must be canonical), then read it back and verify
   yataverse car-put <file.car|->       import a CARv1/CARv2 (roots + complete closure), then export and compare
+      put and car-put also verify the signed storage receipt (required from yataverse.com) and print it.
+      [--request-id <64 hex>]          reuse an id to retry a write and get the same receipt back
+      [--keys <file>]                  verify against this key set instead of the host's /.well-known keys
+  yataverse verify-receipt <response.json|-> [--keys <file>] [--file <path> --kind block|car|drive-pack [--codec raw|dag-cbor]]
+                                       check a saved receipt: signature, key validity at acceptedAt, state; with
+                                       --file, also the subject, digest and size recomputed from the file
   yataverse car-get <cid> [--scope all|block] [-o file.car]  export a root as a verified CARv1
   yataverse asset-manifest <json|->    validate and canonicalize a training-asset manifest
   yataverse training-run-manifest <json|-> validate and canonicalize run provenance (unverified)
@@ -164,7 +171,7 @@ function flags(argv) {
   return out;
 }
 
-export async function main(argv, { stdout = process.stdout, stderr = process.stderr } = {}) {
+export async function main(argv, { stdout = process.stdout, stderr = process.stderr, fetchImpl } = {}) {
   const [cmd, ...rest] = argv;
   const f = flags(rest);
   const out = (x) => stdout.write(typeof x === 'string' ? x : JSON.stringify(x, null, 2) + '\n');
@@ -208,11 +215,18 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         out({ wrote: dir, saTokenStored: saToken !== undefined });
         return 0;
       }
+      case 'verify-receipt': {
+        const input = JSON.parse(readInput(f._[0]).toString('utf8'));
+        const keys = f.keys ? JSON.parse(fs.readFileSync(f.keys, 'utf8')) : await makeClient(loadConfig(), fetchImpl ? { fetchImpl } : {}).receiptKeys();
+        out(await verifyReceiptInput(input, keys, { file: f.file ? fs.readFileSync(f.file) : undefined, kind: f.kind, codec: f.codec }));
+        return 0;
+      }
       case 'get': case 'verify': case 'put': case 'token': case 'car-put': case 'car-get': {
         const cfg = loadConfig();
         const authorize = makeAuthorizer(cfg);
         if (cmd === 'token') { stdout.write(await authorize() + '\n'); return 0; }
-        const client = makeClient(cfg, { authorize });
+        const client = makeClient(cfg, { authorize, ...(fetchImpl ? { fetchImpl } : {}),
+          ...(f.keys ? { receiptKeys: JSON.parse(fs.readFileSync(f.keys, 'utf8')) } : {}) });
         if (cmd === 'get') {
           const bytes = await client.get(f._[0]);
           if (!bytes) { stderr.write('not found\n'); return 1; }
@@ -220,7 +234,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
           return 0;
         }
         if (cmd === 'verify') { const r = await client.verifyRemote(f._[0]); out(r); return r.verified ? 0 : 1; }
-        if (cmd === 'car-put') { out(await client.putCar(readInput(f._[0]))); return 0; }
+        if (cmd === 'car-put') { out(await client.putCar(readInput(f._[0]), { requestId: f.requestId })); return 0; }
         if (cmd === 'car-get') {
           const r = await client.getCar(f._[0], { scope: f.scope ?? 'all' });
           if (!r) { stderr.write('not found\n'); return 1; }
@@ -228,7 +242,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
           else stdout.write(r.bytes);
           return 0;
         }
-        const r = await client.putBytes(readInput(f._[0]), { codec: f.codec ?? 'raw' }); out(r); return 0;
+        const r = await client.putBytes(readInput(f._[0]), { codec: f.codec ?? 'raw', requestId: f.requestId }); out(r); return 0;
       }
       case 'mcp': serve(); return await new Promise(() => {});
       case 'bootstrap': {

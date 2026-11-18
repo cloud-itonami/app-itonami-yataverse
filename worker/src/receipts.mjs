@@ -15,7 +15,7 @@
 import crypto from 'node:crypto';
 import {
   importSigningKey, signReceipt, envelopeToJson, envelopeToDagCbor, envelopeFromDagCbor, policyRecord,
-  checkFields, ReceiptError, SIGNER_DID, STATE, STORE_CLASS, ZERO32,
+  checkFields, requesterFor, ReceiptError, SIGNER_DID, STATE, STORE_CLASS, ZERO32,
 } from '../../src/receipt.mjs';
 
 const hex = (b) => Buffer.from(b).toString('hex');
@@ -148,8 +148,5 @@ export function wellKnown(pathname, env, limits, json) {
   return null;
 }
 
-export const tokenDigest = (authorization) => {
-  const m = /^Bearer ([\x21-\x7e]{16,512})$/.exec(authorization ?? '');
-  return m ? sha256(m[1]) : ZERO32;
-};
+export const tokenDigest = requesterFor;
 export { sha256 };

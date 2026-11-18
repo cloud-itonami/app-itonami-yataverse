@@ -159,7 +159,7 @@ export async function verifyReceipt(env, keys, expect = {}) {
   const pub = await subtle().importKey('raw', publicKey, { name: 'Ed25519' }, false, ['verify']);
   if (!(await subtle().verify('Ed25519', pub, env.sig.sig, receiptDigest(r)))) bad('bad-signature');
   // 3. The caller's own values.
-  for (const k of ['subject', 'contentDigest', 'requestId']) if (expect[k] !== undefined && !sameBytes(expect[k], r[k])) bad(`${k}-mismatch`);
+  for (const k of ['subject', 'contentDigest', 'requestId', 'requester']) if (expect[k] !== undefined && !sameBytes(expect[k], r[k])) bad(`${k}-mismatch`);
   for (const k of ['size', 'kind']) if (expect[k] !== undefined && expect[k] !== r[k]) bad(`${k}-mismatch`);
   // 4. What an entry gateway may claim.
   if (r.state === STATE.policySatisfied) bad('gateway-claims-policy-satisfied');
@@ -185,6 +185,15 @@ export function blockSetDigest(cids) {
     parts.push(Uint8Array.from(v), b);
   }
   return sha256(Buffer.concat(parts));
+}
+
+/**
+ * The requester field for a write: SHA-256 of the bearer token, as the gateway computes it from
+ * the Authorization header (16 to 512 visible ASCII characters), or 32 zero bytes without one.
+ */
+export function requesterFor(authorization) {
+  const m = /^Bearer ([\x21-\x7e]{16,512})$/.exec(authorization ?? '');
+  return m ? sha256(m[1]) : ZERO32;
 }
 
 /** Policy record {source, limits, store} -> { bytes (DAG-CBOR), revision (its sha256), cid }. */
