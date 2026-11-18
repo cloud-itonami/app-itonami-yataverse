@@ -4,9 +4,26 @@
   "description": "CLI and MCP server for the yataverse bytes plane (formerly kotobase): content-addressed blocks, verified on read and after every write.",
   "type": "module",
   "license": "Apache-2.0",
-  "bin": { "yataverse": "bin/yataverse.mjs" },
-  "engines": { "node": ">=18" },
-  "files": ["bin", "src", "README.md", "LICENSE"],
-  "scripts": { "test": "node --test" },
-  "repository": { "type": "git", "url": "git+https://github.com/kotoba-lang/yataverse.git" }
+  "bin": {
+    "yataverse": "bin/yataverse.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kotoba-lang/yataverse.git"
+  },
+  "dependencies": {
+    "@noble/curves": "1.9.7"
+  }
 }

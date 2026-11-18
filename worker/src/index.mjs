@@ -10,7 +10,8 @@
 //                          CARv1, order=dfs, dups=n; dag-scope=all (default) or block.
 //                          Every block is verified; an incomplete DAG is an error, never a
 //                          truncated CAR.
-//   POST /ipfs/           Authorization: Bearer <write token>, a CARv1 or CARv2 body. All
+//   POST /ipfs/           Authorization: Bearer <write token> or a person's ATProto service-auth
+//                          JWT (lxm com.yataverse.importCar, service-auth.mjs), a CARv1 or CARv2 body. All
 //                          blocks, roots and the closure are checked before anything is stored.
 //   OPTIONS /ipfs, /ipfs/<cid>
 //                          CORS preflight. Only origins in IPFS_ALLOWED_ORIGINS (default
@@ -40,6 +41,7 @@ import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
 import { handleDrivePack, DRIVE_PACK_PATH } from './drive-packs.mjs';
 import { admitWriteRequest, admitWriteBytes } from './write-limits.mjs';
+import { isServiceAuth, verifyServiceAuth, IMPORT_CAR_LXM } from './service-auth.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
@@ -230,10 +232,23 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
  */
 async function importCar(request, env, deps, store) {
   if (contentType(request) !== CAR_CONTENT_TYPE) return fail(415, 'content-type-must-be-ipld-car');
-  const denied = writeAuthFailure(request, env);
-  if (denied) return denied;
+  // Two ways to write a CAR: a write token (WRITE_TOKEN_SHA256) or a person's ATProto service
+  // auth (service-auth.mjs, AWAI-3274). Service auth needs network lookups, so it is checked
+  // after the request is counted by the rate limiter.
+  const authorization = request.headers.get('authorization');
+  const viaServiceAuth = isServiceAuth(authorization);
+  if (!viaServiceAuth) {
+    const denied = writeAuthFailure(request, env);
+    if (denied) return denied;
+  }
   const limited = await admitWriteRequest(request, env);
   if (limited) return fail(...limited);
+  let requester;
+  if (viaServiceAuth) {
+    const v = await verifyServiceAuth(authorization, IMPORT_CAR_LXM, env, deps);
+    if (v.error) return fail(...v.error, v.error[0] === 401 ? { 'www-authenticate': 'Bearer' } : {});
+    requester = sha256(v.did);
+  } else requester = tokenDigest(authorization);
   const limits = carLimits(env);
   const body = await readCapped(request, limits.maxBytes);
   if (!body) return fail(413, 'car-too-large');
@@ -265,7 +280,7 @@ async function importCar(request, env, deps, store) {
   const rid = requestIdOf(request, contentDigest);
   if (rid.error) return fail(...rid.error);
   const claim = { kind: KIND.car, subject: rootsCommitment(car.roots), size: total, contentDigest,
-                  requestId: rid.requestId, requester: tokenDigest(request.headers.get('authorization')) };
+                  requestId: rid.requestId, requester };
   const ops = receiptOps(env, deps, store);
   const begun = await ops.begin(claim);
   if (begun.error) return fail(...begun.error);
