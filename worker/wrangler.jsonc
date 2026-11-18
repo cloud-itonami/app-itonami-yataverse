@@ -36,6 +36,10 @@
     // CORS (comma-separated) and the largest pack accepted (12 MiB, Drive's CAR bound).
     "DRIVE_ALLOWED_ORIGINS": "http://tauri.localhost",
     "DRIVE_MAX_PACK_BYTES": "12582912",
+    // Web origins allowed by CORS on /ipfs (comma-separated, AWAI-3274): the Nagare WebView.
+    // Browsers from these origins may POST /ipfs (CAR, still with a write token) and GET/HEAD
+    // /ipfs/<cid>. A write with any other Origin header is refused with 403.
+    "IPFS_ALLOWED_ORIGINS": "https://tauri.localhost",
     // Published receipt signing keys (/.well-known/yataverse-receipt-keys.json, did:web:yataverse.com).
     // keyId = sha256(0xed01 || public key). Times are Unix milliseconds. Rotation: add a key with
     // keyEpoch + 1, set notAfter on the old one and keep it listed; revocation sets revokedAt.
