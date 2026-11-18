@@ -40,6 +40,11 @@
     // Browsers from these origins may POST /ipfs (CAR, still with a write token) and GET/HEAD
     // /ipfs/<cid>. A write with any other Origin header is refused with 403.
     "IPFS_ALLOWED_ORIGINS": "https://tauri.localhost",
+    // Read-only CORS origins on GET/HEAD /ipfs/<cid> (AWAI-3472): Tauri WebViews that read public
+    // blocks (http://tauri.localhost on Android without useHttpsScheme, tauri://localhost on
+    // macOS/iOS). They get no CORS answer on POST /ipfs, and a PUT/POST carrying one of these
+    // Origin headers is refused with 403, as for any origin outside IPFS_ALLOWED_ORIGINS.
+    "IPFS_READ_ORIGINS": "http://tauri.localhost, tauri://localhost",
     // Per-person CAR writes by ATProto service auth (AWAI-3274, worker/src/service-auth.mjs; owner
     // decision 2026-11-18). The JWT's aud must equal SERVICE_AUTH_AUD and its lxm
     // com.yataverse.importCar; its issuer's #atproto_pds must be in SERVICE_AUTH_PDS and that PDS
