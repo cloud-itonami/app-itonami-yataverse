@@ -28,7 +28,7 @@ android {
     }
     buildTypes {
         getByName("debug") {
-            if (System.getenv("AWAI_WNFS_QA") == "1") applicationIdSuffix = ".awai3399"
+            if (System.getenv("AWAI_WNFS_QA") == "1") applicationIdSuffix = ".awai3401"
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isDebuggable = true
             isJniDebuggable = false
