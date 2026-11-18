@@ -10,8 +10,13 @@
 //                          CARv1, order=dfs, dups=n; dag-scope=all (default) or block.
 //                          Every block is verified; an incomplete DAG is an error, never a
 //                          truncated CAR.
-//   POST /ipfs/           Authorization: Bearer <write token>, a CARv1 or CARv2 body. All
+//   POST /ipfs/           Authorization: Bearer <write token> or a person's ATProto service-auth
+//                          JWT (lxm com.yataverse.importCar, service-auth.mjs), a CARv1 or CARv2 body. All
 //                          blocks, roots and the closure are checked before anything is stored.
+//   OPTIONS /ipfs, /ipfs/<cid>
+//                          CORS preflight. Only origins in IPFS_ALLOWED_ORIGINS (default
+//                          https://tauri.localhost, the Nagare WebView, AWAI-3274) are answered:
+//                          POST on /ipfs, GET/HEAD on /ipfs/<cid>. Block PUT stays non-browser.
 //   PUT|GET|HEAD|OPTIONS /awai-drive/v1/packs/<sha256>
 //                          Awai Drive encrypted snapshot packs (see drive-packs.mjs).
 //   GET /health           liveness, no configuration values.
@@ -36,6 +41,7 @@ import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
 import { handleDrivePack, DRIVE_PACK_PATH } from './drive-packs.mjs';
 import { admitWriteRequest, admitWriteBytes } from './write-limits.mjs';
+import { isServiceAuth, verifyServiceAuth, IMPORT_CAR_LXM } from './service-auth.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
@@ -226,10 +232,23 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
  */
 async function importCar(request, env, deps, store) {
   if (contentType(request) !== CAR_CONTENT_TYPE) return fail(415, 'content-type-must-be-ipld-car');
-  const denied = writeAuthFailure(request, env);
-  if (denied) return denied;
+  // Two ways to write a CAR: a write token (WRITE_TOKEN_SHA256) or a person's ATProto service
+  // auth (service-auth.mjs, AWAI-3274). Service auth needs network lookups, so it is checked
+  // after the request is counted by the rate limiter.
+  const authorization = request.headers.get('authorization');
+  const viaServiceAuth = isServiceAuth(authorization);
+  if (!viaServiceAuth) {
+    const denied = writeAuthFailure(request, env);
+    if (denied) return denied;
+  }
   const limited = await admitWriteRequest(request, env);
   if (limited) return fail(...limited);
+  let requester;
+  if (viaServiceAuth) {
+    const v = await verifyServiceAuth(authorization, IMPORT_CAR_LXM, env, deps);
+    if (v.error) return fail(...v.error, v.error[0] === 401 ? { 'www-authenticate': 'Bearer' } : {});
+    requester = sha256(v.did);
+  } else requester = tokenDigest(authorization);
   const limits = carLimits(env);
   const body = await readCapped(request, limits.maxBytes);
   if (!body) return fail(413, 'car-too-large');
@@ -261,7 +280,7 @@ async function importCar(request, env, deps, store) {
   const rid = requestIdOf(request, contentDigest);
   if (rid.error) return fail(...rid.error);
   const claim = { kind: KIND.car, subject: rootsCommitment(car.roots), size: total, contentDigest,
-                  requestId: rid.requestId, requester: tokenDigest(request.headers.get('authorization')) };
+                  requestId: rid.requestId, requester };
   const ops = receiptOps(env, deps, store);
   const begun = await ops.begin(claim);
   if (begun.error) return fail(...begun.error);
@@ -311,7 +330,72 @@ function wantsCar(request, url) {
   return (request.headers.get('accept') ?? '').toLowerCase().includes(CAR_CONTENT_TYPE);
 }
 
+// ---- CORS for /ipfs (AWAI-3274) ----------------------------------------------------------
+// CORS decides which web pages may read a response; it is not access control against other
+// clients. Writes still need a write token or service auth, and every byte is still checked
+// against its CID.
+// A write that carries an Origin header outside the list is refused before anything is read,
+// so a page on another origin cannot use a token that leaked into it. Non-browser clients send
+// no Origin and are unaffected.
+export const DEFAULT_IPFS_ALLOWED_ORIGINS = 'https://tauri.localhost';
+
+export function ipfsAllowedOrigins(env) {
+  return String(env.IPFS_ALLOWED_ORIGINS ?? DEFAULT_IPFS_ALLOWED_ORIGINS).split(',').map((s) => s.trim())
+    .filter((o) => { try { return new URL(o).origin === o; } catch { return false; } });
+}
+
+/** The CORS headers for one /ipfs response. `methods` are what this path answers in a browser. */
+function ipfsCors(request, env, methods) {
+  const origin = request.headers.get('origin');
+  const h = { vary: 'Origin' };
+  if (!origin || !ipfsAllowedOrigins(env).includes(origin)) return h;
+  h['access-control-allow-origin'] = origin;
+  h['access-control-allow-methods'] = methods;
+  h['access-control-allow-headers'] = methods.includes('POST') ? 'authorization, content-type, yataverse-request-id' : 'accept';
+  h['access-control-expose-headers'] = 'content-length, etag';
+  h['access-control-max-age'] = '600';
+  return h;
+}
+
+const originRefused = (request, env) => {
+  const origin = request.headers.get('origin');
+  return origin !== null && !ipfsAllowedOrigins(env).includes(origin);
+};
+
+function withHeaders(res, extra) {
+  const headers = new Headers(res.headers);
+  for (const [k, v] of Object.entries(extra)) {
+    if (k === 'vary') {
+      const have = (headers.get('vary') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (!have.some((x) => x.toLowerCase() === 'origin')) have.push(v);
+      headers.set('vary', have.join(', '));
+    } else headers.set(k, v);
+  }
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+/** Preflight: 204 with CORS headers for an allowed origin and method, otherwise 403. */
+function ipfsPreflight(request, env, methods) {
+  const cors = ipfsCors(request, env, methods);
+  const asked = (request.headers.get('access-control-request-method') ?? '').toUpperCase();
+  if (!cors['access-control-allow-origin'] || !methods.split(', ').includes(asked))
+    return fail(403, 'cors-not-allowed', { vary: 'Origin', 'cache-control': 'no-store' });
+  return new Response(null, { status: 204, headers: { ...cors, 'cache-control': 'no-store' } });
+}
+
 export async function handle(request, env, deps = {}) {
+  const url = new URL(request.url);
+  if (url.pathname === '/ipfs' || url.pathname.startsWith('/ipfs/')) {
+    const methods = (url.pathname === '/ipfs' || url.pathname === '/ipfs/') ? 'POST' : 'GET, HEAD';
+    if (request.method === 'OPTIONS') return ipfsPreflight(request, env, methods);
+    if ((request.method === 'POST' || request.method === 'PUT') && originRefused(request, env))
+      return fail(403, 'origin-not-allowed', { vary: 'Origin' });
+    return withHeaders(await handleCore(request, env, deps), ipfsCors(request, env, methods));
+  }
+  return handleCore(request, env, deps);
+}
+
+async function handleCore(request, env, deps = {}) {
   // Call the global fetch unbound: Workers throws "Illegal invocation" when fetch runs
   // with another object as `this` (as `deps.fetchImpl(...)` would).
   deps = { fetchImpl: (input, init) => fetch(input, init), now: () => new Date(), ...deps };
@@ -333,7 +417,7 @@ export async function handle(request, env, deps = {}) {
     catch (e) { return storeFailure(e); }
   }
   if (url.pathname === '/ipfs/' || url.pathname === '/ipfs') {
-    if (request.method !== 'POST') return fail(405, 'method-not-allowed', { allow: 'POST' });
+    if (request.method !== 'POST') return fail(405, 'method-not-allowed', { allow: 'POST, OPTIONS' });
     const store = b2(env, deps);
     if (!store) return fail(503, 'store-not-configured');
     try { return await importCar(request, env, deps, store); } catch (e) { return storeFailure(e); }
@@ -357,7 +441,7 @@ export async function handle(request, env, deps = {}) {
       return serveBlock(cid, r.bytes, request.method === 'HEAD');
     }
   } catch (e) { return storeFailure(e); }
-  return fail(405, 'method-not-allowed', { allow: 'GET, HEAD, PUT' });
+  return fail(405, 'method-not-allowed', { allow: 'GET, HEAD, PUT, OPTIONS' });
 }
 
 function storeFailure(e) {
