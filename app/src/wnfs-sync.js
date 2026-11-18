@@ -1,6 +1,10 @@
 const CHUNK_BYTES = 65531;
 const PACK_BYTES = 12 * 1024 * 1024;
 const PACK_ID = /^[a-f0-9]{64}$/;
+const DEVICE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const BASIS_ID = /^b[a-z2-7]{20,128}$/;
+const SUBJECT = /^did:[a-z0-9]+:[A-Za-z0-9._:%-]{1,192}$/;
+const MAX_ACCOUNT_SOURCES = 8;
 const b64 = bytes => {
   let text = '';
   for (let start = 0; start < bytes.length; start += 16384) {
@@ -58,8 +62,7 @@ export function createWnfsSync({ invoke, origin, packs, verifyReceipt, sha256, c
     }
   }
 
-  async function readSnapshot(session, operation, extension) {
-    const head = session.wnfs;
+  function validateHead(head) {
     if (head?.schema !== 'awai.drive.wnfs.v1' || head.origin !== origin ||
         !PACK_ID.test(head.root) || !PACK_ID.test(head.capsule) || !Array.isArray(head.packs) ||
         head.packs.length < 1 || head.packs.length > 8 ||
@@ -67,6 +70,11 @@ export function createWnfsSync({ invoke, origin, packs, verifyReceipt, sha256, c
         new Set([head.capsule, ...head.packs]).size !== head.packs.length + 1) {
       throw Error('recovery-required');
     }
+  }
+
+  async function readSnapshot(session, operation, extension) {
+    const head = session.wnfs;
+    validateHead(head);
     const started = performance.now();
     const capsule = await packs.download(head.capsule);
     if (capsule.length > 262144) throw Error('invalid-wnfs-snapshot');
@@ -152,7 +160,46 @@ export function createWnfsSync({ invoke, origin, packs, verifyReceipt, sha256, c
       }
     },
 
-    catalog: session => readSnapshot(session, 'catalog'),
+    async catalog(session) {
+      const { rows } = await readSnapshot(session, 'catalog');
+      return rows;
+    },
+
+    // The owner host supplies these grants after authenticating the account,
+    // confirming device authorization and binding the stored heads to it.
+    async catalogAuthorizedAccount({ subject, sources }) {
+      if (typeof subject !== 'string' || !SUBJECT.test(subject) || !Array.isArray(sources) ||
+          sources.length > MAX_ACCOUNT_SOURCES) throw Error('invalid-account-snapshot-grant');
+      const deviceIds = new Set();
+      for (const source of sources) {
+        if (source?.subject !== subject || typeof source.deviceId !== 'string' || !DEVICE_ID.test(source.deviceId) ||
+            deviceIds.has(source.deviceId) || typeof source.basis !== 'string' || !BASIS_ID.test(source.basis) ||
+            typeof source.owner?.record !== 'string' || !source.owner.record || source.owner.record.length > 16000 ||
+            !(source.owner.secret instanceof Uint8Array) || source.owner.secret.length !== 32) {
+          throw Error('invalid-account-snapshot-grant');
+        }
+        validateHead(source.owner.wnfs);
+        deviceIds.add(source.deviceId);
+      }
+      const entries = [];
+      const admitted = sources.map(({ owner, deviceId, basis }) => ({
+        deviceId, basis,
+        owner: { record: owner.record, secret: owner.secret.slice(),
+          wnfs: { ...owner.wnfs, packs: [...owner.wnfs.packs] } }
+      }));
+      try {
+        for (const { owner, deviceId, basis } of admitted) {
+          const catalog = await readSnapshot(owner, 'catalog');
+          if (catalog.basis !== basis) throw Error('snapshot-basis-mismatch');
+          for (const { path, directory = false } of catalog.rows) {
+            entries.push({ path, directory, sourceDevice: deviceId });
+          }
+        }
+        return entries;
+      } finally {
+        for (const { owner } of admitted) owner.secret.fill(0);
+      }
+    },
     async restore(session) {
       const snapshot = await readSnapshot(session, 'open', 'txt');
       // The production worker returns basis and query results with the
