@@ -17,6 +17,15 @@
 // The person is recorded in the receipt as `requester` = SHA-256 of the DID. No secret is held
 // by the app or by this Worker. Without SERVICE_AUTH_AUD the scheme is off.
 //
+// PDS-attested tokens (AWAI-3370, owner decision 2026-11-18). Aozora's PDS never holds a member's
+// repo key, so it cannot sign the token above. Instead it signs, with its own service key,
+//   {iss: <PDS did:web>, sub: <member DID>, aud, lxm, iat, exp}
+// and this Worker accepts it only when `iss` is pinned in SERVICE_AUTH_PDS_KEYS
+// ("<pds did:web>=<secp256k1 Multikey>", comma-separated) and that PDS's origin is in
+// SERVICE_AUTH_PDS. The member (`sub`, which may be did:key) must still be reported active by that
+// PDS, and SERVICE_AUTH_DENY_DIDS applies to it. A token with a `sub` other than `iss` from any
+// other issuer is refused.
+//
 // Residual risks (recorded in the PR and Linear): there is no `jti` replay store (no KV/D1/DO,
 // ADR 0031 D1), so a token can be reused until it expires, only for the same method and
 // audience; DID documents and repo status are cached for CACHE_MS per isolate, so a key rotation
@@ -75,6 +84,7 @@ export function multikeyToK256(mb) {
 // ---- DID documents and the PDS ------------------------------------------------------------
 const PLC_DID = /^did:plc:[a-z2-7]{24}$/;
 const WEB_DID = /^did:web:([a-z0-9-]+(\.[a-z0-9-]+)+)$/;
+const KEY_DID = /^did:key:z[1-9A-HJ-NP-Za-km-z]{40,60}$/;
 
 export function didDocUrl(did, env) {
   if (PLC_DID.test(did)) return `${env.PLC_DIRECTORY_URL || DEFAULT_PLC}/${did}`;
@@ -117,6 +127,20 @@ async function cached(key, now, f) {
   return value;
 }
 export const clearServiceAuthCache = () => cache.clear();
+
+/** SERVICE_AUTH_PDS_KEYS -> Map(pds did:web -> {key, pds}); entries whose PDS is not allowed are dropped. */
+export function attesters(env) {
+  const allowed = listVar(env.SERVICE_AUTH_PDS, DEFAULT_PDS);
+  const out = new Map();
+  for (const entry of listVar(env.SERVICE_AUTH_PDS_KEYS, '')) {
+    const [did, mk] = entry.split('=').map((x) => x.trim());
+    const m = WEB_DID.exec(did ?? ''); const key = multikeyToK256(mk);
+    if (!m || !key) continue;
+    const pds = `https://${m[1]}`;
+    if (allowed.includes(pds)) out.set(did, { key, pds });
+  }
+  return out;
+}
 
 async function resolveIdentity(did, env, deps, now) {
   return cached(`doc:${did}`, now, async () => {
@@ -165,13 +189,26 @@ export async function verifyServiceAuth(authorization, lxm, env, deps) {
   if (exp <= now) return { error: [401, 'service-auth-expired'] };
   if (iat > now + CLOCK_SKEW_S || exp - iat > MAX_LIFETIME_S || exp <= iat) return { error: [401, 'service-auth-lifetime-not-allowed'] };
   if (typeof iss !== 'string' || !(PLC_DID.test(iss) || WEB_DID.test(iss))) return { error: [401, 'service-auth-issuer-not-supported'] };
-  if (listVar(env.SERVICE_AUTH_DENY_DIDS, '').includes(iss)) return { error: [403, 'service-auth-issuer-denied'] };
+  const denied = listVar(env.SERVICE_AUTH_DENY_DIDS, '');
+  if (denied.includes(iss)) return { error: [403, 'service-auth-issuer-denied'] };
   const nowMs = now * 1000;
+  const signed = Buffer.from(`${m[1]}.${m[2]}`, 'ascii');
+  const sig = new Uint8Array(Buffer.from(m[3], 'base64url'));
+  const attester = attesters(env).get(iss);
+  if (attester) {
+    const { sub } = claims;
+    if (typeof sub !== 'string' || !(PLC_DID.test(sub) || WEB_DID.test(sub) || KEY_DID.test(sub))) return { error: [401, 'service-auth-subject-not-supported'] };
+    if (denied.includes(sub)) return { error: [403, 'service-auth-issuer-denied'] };
+    if (!verifyK256(attester.key, signed, sig)) return { error: [401, 'service-auth-bad-signature'] };
+    const hosted = await hostedActive(sub, attester.pds, deps, nowMs);
+    if (hosted.error) return { error: [hosted.error === 'issuer-pds-unreachable' ? 502 : 403, hosted.error] };
+    return { did: sub };
+  }
+  if (claims.sub !== undefined && claims.sub !== iss) return { error: [401, 'service-auth-attester-not-trusted'] };
   const id = await resolveIdentity(iss, env, deps, nowMs);
   if (id.error) return { error: [id.error === 'issuer-did-unresolvable' ? 502 : 401, id.error] };
   if (!listVar(env.SERVICE_AUTH_PDS, DEFAULT_PDS).includes(id.pds)) return { error: [403, 'service-auth-pds-not-allowed'] };
-  const sig = Buffer.from(m[3], 'base64url');
-  if (!verifyK256(id.key, Buffer.from(`${m[1]}.${m[2]}`, 'ascii'), new Uint8Array(sig))) return { error: [401, 'service-auth-bad-signature'] };
+  if (!verifyK256(id.key, signed, sig)) return { error: [401, 'service-auth-bad-signature'] };
   const hosted = await hostedActive(iss, id.pds, deps, nowMs);
   if (hosted.error) return { error: [hosted.error === 'issuer-pds-unreachable' ? 502 : 403, hosted.error] };
   return { did: iss };
