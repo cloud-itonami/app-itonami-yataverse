@@ -332,7 +332,8 @@ function wantsCar(request, url) {
 
 // ---- CORS for /ipfs (AWAI-3274) ----------------------------------------------------------
 // CORS decides which web pages may read a response; it is not access control against other
-// clients. Writes still need a write token, and every byte is still checked against its CID.
+// clients. Writes still need a write token or service auth, and every byte is still checked
+// against its CID.
 // A write that carries an Origin header outside the list is refused before anything is read,
 // so a page on another origin cannot use a token that leaked into it. Non-browser clients send
 // no Origin and are unaffected.
