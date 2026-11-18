@@ -46,16 +46,19 @@ round trip through yataverse.com also succeeded: seal, PUT, GET, then open, with
 | Unit tests (`npm test`) | 10/10 pass |
 | Android emulator (arm64, API 36, debug APK) | Verified: key warning, consent Deny sends nothing, save (upload and read-back consents), free up space, restore through yataverse.com |
 | Android real device | Not checked yet |
-| macOS / desktop | Not available: key custody adapter missing ([AWAI-3339](https://linear.app/kotobalabs/issue/AWAI-3339)) |
+| macOS desktop custody | Implemented: `app/src-tauri/src/vault.rs` + `keychain.rs` serve `drive_call` with the device key in the macOS Keychain (service `network.awai.yataverse.vault`), AES-256-GCM control-file framing identical to Android. `cargo test` in `app/src-tauri` on macOS (2026-11-18): 18/18 pass — save → evict → restore → decrypt identical bytes, ciphertext-at-rest, fixed error codes, WNFS commit/staged-restore, custody state machine, Android-parity checks for names, ordering and error codes, and a real-Keychain round trip under a test-only service (`network.awai.yataverse.vault.test-<pid>`, item removed afterwards). The Keychain test needs a session that may write to the login Keychain; a sandbox that denies Keychain writes fails it. macOS GUI app run and code-signing/Keychain access-group behaviour are not verified ([AWAI-3339](https://linear.app/kotobalabs/issue/AWAI-3339)) |
 | Expired or tampered data, through the UI | Not checked yet (covered by core tests only) |
 
 Tracking: [AWAI-3130](https://linear.app/kotobalabs/issue/AWAI-3130) (parent), [AWAI-3338](https://linear.app/kotobalabs/issue/AWAI-3338) (this α, done).
 
 ## Limits (α)
 
-- **Android only for now.** Like Drive, the desktop target returns `android-adapter-required` because key
-  custody is only implemented with Android Keystore. Desktop custody (macOS Keychain and others) is a
-  follow-up.
+- **Desktop custody is macOS-only.** macOS serves `drive_call` from the Keychain-backed adapter with
+  the same JSON shapes and error codes as Android, so the JS layer has no platform branches. The adapter and its crates are compiled for macOS only. Linux and
+  Windows fail closed with `desktop-adapter-unavailable`. On macOS the interactive file picker is
+  refused with the documented `pick-unsupported` code instead of a fake success; `open` delegates to
+  the default handler. Nothing in the Rust adapter touches the network; consent and sync networking
+  stay in the JS layer.
 - **Size:** encrypted snapshots are limited to 8 MiB / 1000 entries. Larger local files stay on the device.
 - **Recovery:** there is no key recovery yet (AwaiFS owner enrollment). Uninstalling the app or clearing
   its data makes saved data unreadable.
