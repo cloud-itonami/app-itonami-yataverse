@@ -13,11 +13,16 @@ export function mountWnfsSharing(controls, sync, task, enabled, refresh) {
   output.setAttribute('aria-label', label('Sharing output', '共有の出力'));
   const advice = document.createElement('p');
   advice.textContent = label(
-    'Verify the key fingerprint with the recipient before adding them. Sync to issue new grants. Removing a recipient affects future snapshots.',
-    '追加する前に相手の鍵の指紋を本人と照合してください。同期すると新しい共有情報が表示されます。失効は今後のスナップショットに適用されます。');
+    'Confirm the account DID and key fingerprint with the other person. Sync to issue new grants. Removing a recipient affects future snapshots.',
+    '相手のアカウント DID と鍵の指紋を本人と照合してください。同期すると新しい共有情報が表示されます。失効は今後のスナップショットに適用されます。');
+  const sender = document.createElement('input');
+  sender.type = 'text';
+  sender.maxLength = 132;
+  sender.placeholder = label('Expected sender account DID', '共有元から確認したアカウント DID');
+  sender.setAttribute('aria-label', sender.placeholder);
   const status = document.createElement('p');
   status.setAttribute('role', 'status');
-  details.append(heading, advice, input);
+  details.append(heading, advice, input, sender);
   const actions = document.createElement('div');
   function button(text, callback) {
     const control = document.createElement('button');
@@ -39,13 +44,14 @@ export function mountWnfsSharing(controls, sync, task, enabled, refresh) {
     return label('Recipient added for the next sync.', '次の同期の受信者を追加しました。');
   });
   button(label('Revoke for future snapshots', '次回以降の共有を失効'), async () => {
-    await sync.revokeSnapshotRecipient(parse().id);
+    const value = parse();
+    await sync.revokeSnapshotRecipient(value.publicKey?.id ?? value.id);
     return label('Recipient removed for future snapshots.', '今後のスナップショットから受信者を除外しました。');
   });
   button(label('Restore shared snapshot', '共有スナップショットを復元'), async () => {
     const value = parse();
     const grant = Array.isArray(value) && value.length === 1 ? value[0] : value;
-    const result = await sync.restoreSharedSnapshot(grant);
+    const result = await sync.restoreSharedSnapshot(grant, sender.value.trim());
     await refresh();
     return label('Shared folder: ', '復元した共有フォルダ ') + result.folder;
   });

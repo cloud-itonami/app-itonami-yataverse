@@ -69,6 +69,8 @@ public final class DriveVault {
   String id=request.getString("id");
   if(!id.matches("kv1:[A-Za-z0-9_-]{43}"))throw new IOException("invalid-recipient");
   JSONObject state=recipients(control), items=state.getJSONObject("items");
+  JSONObject proofs=state.optJSONObject("proofs");
+  if(proofs==null)proofs=new JSONObject();
   if(request.has("recipient")){
    JSONObject entry=request.getJSONObject("recipient");
    if(entry.length()!=3||!id.equals(entry.getString("id"))||
@@ -76,7 +78,13 @@ public final class DriveVault {
       !entry.getString("pq").matches("[A-Za-z0-9_-]{1579}"))throw new IOException("invalid-recipient");
    if(!items.has(id)&&items.length()>=8)throw new IOException("recipient-limit");
    items.put(id,entry);
-  }else items.remove(id);
+   JSONObject proof=request.optJSONObject("proof");
+   if(proof!=null){
+    if(proof.toString().length()>16384)throw new IOException("invalid-recipient");
+    proofs.put(id,proof);
+   }else proofs.remove(id);
+  }else{items.remove(id);proofs.remove(id);}
+  state.put("proofs",proofs);
   state.put("revision",Math.addExact(state.getLong("revision"),1));
   control.put("wnfsRecipients",state);
   save(control,false);
@@ -179,6 +187,18 @@ public final class DriveVault {
  case "vaultRecord":{if(v==null||v.has("record"))throw new IOException("recovery-required");String record=q.getString("record");if(record.length()>16000)throw new IOException("state-limit");v.put("record",record);save(v,false);return new JSONObject();}
  case "vaultWnfsInventory":return new JSONObject().put("entries",inventory(WNFS_BYTES));
  case "vaultWnfsCommit":return commitWnfs(v,q);
+ case "vaultWnfsBindAccount":{
+  if(v==null||!v.has("record"))throw new IOException("recovery-required");
+  String account=q.getString("account");
+  if(!account.matches("did:key:z[1-9A-HJ-NP-Za-km-z]{20,110}"))throw new IOException("account-vault-mismatch");
+  if(v.has("wnfsAccount")){
+   if(!account.equals(v.getString("wnfsAccount")))throw new IOException("account-vault-mismatch");
+  }else{
+   v.put("wnfsAccount",account);
+   save(v,false);
+  }
+  return new JSONObject();
+ }
  case "vaultWnfsRecipients":return recipients(v);
  case "vaultWnfsRecipientSet":return updateRecipient(v,q);
  case "vaultWnfsRestoreBegin":{

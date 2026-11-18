@@ -98,9 +98,9 @@ export function createWnfsSync({ invoke, origin, packs, verifyReceipt, sha256, c
   return {
     restoreCopy,
     publicRecipient: session => compute('public-recipient', session, {}, []),
-    async grant(session, recipient) {
+    async grant(session, recipient, proof) {
       const verified = await compute('validate-recipient', session, { recipient }, []);
-      return invoke('vaultWnfsRecipientSet', { id: verified.id, recipient: verified });
+      return invoke('vaultWnfsRecipientSet', { id: verified.id, recipient: verified, proof });
     },
     revoke: id => invoke('vaultWnfsRecipientSet', { id }),
     async restoreShared(session, grant) {
@@ -126,9 +126,10 @@ export function createWnfsSync({ invoke, origin, packs, verifyReceipt, sha256, c
       const published = await restoreCopy(rows, false, { share: grant.head.capsule, entries });
       return { ...published, ...verified };
     },
-    async sync(session) {
+    async sync(session, selectRecipients = items => Object.values(items)) {
       const { entries } = await invoke('vaultWnfsInventory');
-      const { revision, items } = await invoke('vaultWnfsRecipients');
+      const { revision, items, proofs } = await invoke('vaultWnfsRecipients');
+      const recipients = await selectRecipients(items, proofs);
       if (!entries.length) throw Error('empty-sync-snapshot');
       const rows = [];
       let sealed;
@@ -150,7 +151,7 @@ export function createWnfsSync({ invoke, origin, packs, verifyReceipt, sha256, c
           if (await sha256(bytes) !== entry.sha256) throw Error('source-size-changed');
         }
         const sealStart = performance.now();
-        sealed = await compute('seal', session, { rows, recipients: Object.values(items) },
+        sealed = await compute('seal', session, { rows, recipients },
           rows.flatMap(row => row.bytes ? [row.bytes.buffer] : []));
         const publishStart = performance.now();
         const packBytes = sealed.packs.reduce((n, pack) => n + pack.length, sealed.capsule.bytes.length);
