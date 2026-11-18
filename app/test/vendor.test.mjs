@@ -12,3 +12,10 @@ test('the store origin is yataverse.com and only it is reachable',()=>{
  const csp=JSON.parse(fs.readFileSync(new URL('../src-tauri/tauri.conf.json',import.meta.url))).app.security.csp;
  assert.match(csp,/connect-src https:\/\/yataverse\.com ipc:/);
 });
+
+test('consent denial from the canonical broker maps to its own message', async () => {
+  const runtime = fs.readFileSync(new URL('../vendor/awai-os/otehon/shell/vendor/kotoba-client-runtime.js', import.meta.url), 'utf8');
+  const i18n = fs.readFileSync(new URL('../src/i18n.js', import.meta.url), 'utf8');
+  const thrown = runtime.match(/throw new Error\('client (operation was not approved)'\)/)[1];
+  assert.ok(i18n.includes(`"error.${thrown}"`), 'i18n must key the broker denial text');
+});

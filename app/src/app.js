@@ -23,7 +23,7 @@ $('folder').onclick=()=>edit('mkdir');$('note').onclick=()=>edit('createText');$
 $('entry').onsubmit=e=>{e.preventDefault();if(!core.validName($('name').value)){$('form-error').textContent=t('error.invalid-name');return;}task(async()=>{await call(mode,{name:$('name').value,text:$('content').value});$('edit').close();await list();message(t('status.saved'));});};
 await task(async()=>{await host.initialize();await list();});
 
-const keyAcknowledged=async()=>{const s=await encryptedSync.state();if(s.root||s.synced)return true;return new Promise(done=>{const d=$('key-confirm');$('key-accept').onclick=()=>{d.close();done(true);};$('key-back').onclick=()=>{d.close();done(false);};d.oncancel=()=>done(false);d.showModal();});};
+const keyAcknowledged=async()=>{const s=await encryptedSync.state();if(s.root||s.synced)return true;return new Promise(done=>{const d=$('key-confirm');d.returnValue='';$('key-accept').onclick=()=>d.close('ok');$('key-back').onclick=()=>d.close('');d.onclose=()=>done(d.returnValue==='ok');d.showModal();});};
 $('sync').onclick=()=>task(async()=>{if(!(await keyAcknowledged()))return;message(t('sync.busy'));await encryptedSync.sync();await list();$('storage').textContent=t('sync.ready');message(t('sync.success'));});
 $('restore').onclick=()=>task(async()=>{message(t('sync.restoring'));await encryptedSync.restore();parent='';await list();$('storage').textContent=t('sync.ready');message(t('sync.restored'));});
 $('evict').onclick=()=>{$('evict-confirm').showModal();};

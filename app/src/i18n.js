@@ -38,7 +38,7 @@ export const messages={
     "key.body": "この端末の鍵を失うと（アンインストール・データ消去・端末の紛失）、Yataverse に保存した内容は誰にも復元できません。復旧方法は準備中です。",
     "key.accept": "理解して続ける",
     "key.back": "戻る",
-    "error.operation cancelled": "送信を許可しませんでした。通信は行っていません。ファイルはこの端末だけにあります。",
+    "error.operation was not approved": "送信を許可しませんでした。通信は行っていません。ファイルはこの端末だけにあります。",
     "error.sync-unavailable": "yataverse.com に接続できませんでした。ファイルはこの端末に残っています。",
     "error.Failed to fetch": "yataverse.com に接続できませんでした。ファイルはこの端末に残っています。"
   },
@@ -81,7 +81,7 @@ export const messages={
     "key.body": "If this device's key is lost (uninstall, cleared data or a lost device), nobody can recover what you saved to Yataverse. Recovery is not available yet.",
     "key.accept": "I understand, continue",
     "key.back": "Back",
-    "error.operation cancelled": "You did not allow the upload. Nothing was sent; your files stay only on this device.",
+    "error.operation was not approved": "You did not allow the upload. Nothing was sent; your files stay only on this device.",
     "error.sync-unavailable": "Could not reach yataverse.com. Your files are still on this device.",
     "error.Failed to fetch": "Could not reach yataverse.com. Your files are still on this device."
   }
