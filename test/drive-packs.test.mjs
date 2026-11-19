@@ -86,6 +86,23 @@ test('CORS: the exact Drive WebView origins are allowed', async () => {
   assert.equal(custom.headers.get('access-control-allow-origin'), 'https://drive.example');
 });
 
+test('CORS: the Wrangler Drive origin binding allows Android and macOS preflights', async () => {
+  const config = fs.readFileSync(new URL('../worker/wrangler.jsonc', import.meta.url), 'utf8');
+  const binding = config.match(/^\s*"DRIVE_ALLOWED_ORIGINS"\s*:\s*("[^"]*")/m);
+  assert.ok(binding, 'Wrangler must set the Drive origin binding');
+  const env = { ...ENV, DRIVE_ALLOWED_ORIGINS: JSON.parse(binding[1]) };
+  const s = fakeStore();
+  const id = sha(fixture('drive-v1.car'));
+  for (const origin of [DRIVE_ORIGIN, 'tauri://localhost', 'null', 'https://other.example']) {
+    const request = new Request(url(id), { method: 'OPTIONS', headers: {
+      origin, 'access-control-request-method': 'PUT', 'access-control-request-headers': 'content-type',
+    } });
+    const response = await handle(request, env, deps(s));
+    const allowed = origin === DRIVE_ORIGIN || origin === 'tauri://localhost';
+    assert.equal(response.headers.get('access-control-allow-origin'), allowed ? origin : null);
+  }
+});
+
 test('downloads: 404 when absent, 502 when the stored pack does not hash to its id', async () => {
   const s = fakeStore(); const bytes = fixture('drive-v1.car'); const id = sha(bytes);
   assert.equal((await handle(driveGet(id), ENV, deps(s))).status, 404);
