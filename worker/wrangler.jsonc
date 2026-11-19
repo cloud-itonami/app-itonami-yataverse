@@ -32,9 +32,9 @@
     // Read tier used only when B2 has no copy: the existing self-hosted Reader
     // (JUN-228). Its bytes are verified against the CID like every other read.
     "READ_FALLBACK_URL": "https://ipfs.yataverse.com",
-    // Awai Drive packs (/awai-drive/v1/packs/<sha256>): the Drive WebView origin allowed by
+    // Awai Drive packs (/awai-drive/v1/packs/<sha256>): the Drive WebView origins allowed by
     // CORS (comma-separated) and the largest pack accepted (12 MiB, Drive's CAR bound).
-    "DRIVE_ALLOWED_ORIGINS": "http://tauri.localhost",
+    "DRIVE_ALLOWED_ORIGINS": "http://tauri.localhost,tauri://localhost",
     "DRIVE_MAX_PACK_BYTES": "12582912",
     // Web origins allowed by CORS on /ipfs (comma-separated, AWAI-3274): the Nagare WebView.
     // Browsers from these origins may POST /ipfs (CAR, still with a write token) and GET/HEAD

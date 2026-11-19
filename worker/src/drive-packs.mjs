@@ -12,8 +12,8 @@
 // well-formed CAR whose blocks all hash to their CIDs. Anyone can still store opaque packs
 // within those limits; that residual risk is tracked in Linear (AWAI-3126).
 //
-// CORS: only origins in DRIVE_ALLOWED_ORIGINS (default http://tauri.localhost, the Android
-// WebView origin of the Drive app) get Access-Control-Allow-Origin. CORS restricts which web
+// CORS: only origins in DRIVE_ALLOWED_ORIGINS get Access-Control-Allow-Origin. The
+// defaults are the exact Android and macOS Drive WebView origins. CORS restricts which web
 // pages can read responses; it is not access control against non-browser clients.
 import crypto from 'node:crypto';
 import { parseCar, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
@@ -22,7 +22,7 @@ import { KIND, ZERO32 } from '../../src/receipt.mjs';
 
 export const DRIVE_PACK_PATH = /^\/awai-drive\/v1\/packs\/([a-f0-9]{64})$/;
 export const DEFAULT_DRIVE_MAX_PACK_BYTES = 12 * 1024 * 1024;
-const DEFAULT_ORIGINS = 'http://tauri.localhost';
+const DEFAULT_ORIGINS = 'http://tauri.localhost,tauri://localhost';
 
 const sha256Hex = (b) => crypto.createHash('sha256').update(b).digest('hex');
 

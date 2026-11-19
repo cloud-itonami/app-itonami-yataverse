@@ -67,18 +67,40 @@ test('uploads are refused unless the body is the named, bounded, well-formed pac
   assert.equal(dataKeys(s).length, 0);
 });
 
-test('CORS: the Drive origin gets a preflight answer, other origins do not', async () => {
+test('CORS: the exact Drive WebView origins are allowed', async () => {
   const s = fakeStore(); const id = sha(fixture('drive-v1.car'));
   const pre = (origin) => handle(new Request(url(id), { method: 'OPTIONS', headers: { origin, 'access-control-request-method': 'PUT', 'access-control-request-headers': 'content-type' } }), ENV, deps(s));
-  const ok = await pre(DRIVE_ORIGIN);
-  assert.equal(ok.status, 204);
-  assert.equal(ok.headers.get('access-control-allow-origin'), DRIVE_ORIGIN);
-  assert.match(ok.headers.get('access-control-allow-methods'), /PUT/);
-  assert.equal(ok.headers.get('access-control-allow-headers'), 'content-type');
-  const other = await pre('https://evil.example');
-  assert.equal(other.headers.get('access-control-allow-origin'), null);
+  for (const origin of [DRIVE_ORIGIN, 'tauri://localhost']) {
+    const ok = await pre(origin);
+    assert.equal(ok.status, 204);
+    assert.equal(ok.headers.get('access-control-allow-origin'), origin);
+    assert.match(ok.headers.get('access-control-allow-methods'), /GET/);
+    assert.match(ok.headers.get('access-control-allow-methods'), /PUT/);
+    assert.equal(ok.headers.get('access-control-allow-headers'), 'content-type');
+  }
+  for (const origin of ['https://other.example', 'tauri://other', 'null']) {
+    const other = await pre(origin);
+    assert.equal(other.headers.get('access-control-allow-origin'), null);
+  }
   const custom = await handle(new Request(url(id), { method: 'OPTIONS', headers: { origin: 'https://drive.example' } }), { ...ENV, DRIVE_ALLOWED_ORIGINS: 'https://drive.example' }, deps(s));
   assert.equal(custom.headers.get('access-control-allow-origin'), 'https://drive.example');
+});
+
+test('CORS: the Wrangler Drive origin binding allows Android and macOS preflights', async () => {
+  const config = fs.readFileSync(new URL('../worker/wrangler.jsonc', import.meta.url), 'utf8');
+  const binding = config.match(/^\s*"DRIVE_ALLOWED_ORIGINS"\s*:\s*("[^"]*")/m);
+  assert.ok(binding, 'Wrangler must set the Drive origin binding');
+  const env = { ...ENV, DRIVE_ALLOWED_ORIGINS: JSON.parse(binding[1]) };
+  const s = fakeStore();
+  const id = sha(fixture('drive-v1.car'));
+  for (const origin of [DRIVE_ORIGIN, 'tauri://localhost', 'null', 'https://other.example']) {
+    const request = new Request(url(id), { method: 'OPTIONS', headers: {
+      origin, 'access-control-request-method': 'PUT', 'access-control-request-headers': 'content-type',
+    } });
+    const response = await handle(request, env, deps(s));
+    const allowed = origin === DRIVE_ORIGIN || origin === 'tauri://localhost';
+    assert.equal(response.headers.get('access-control-allow-origin'), allowed ? origin : null);
+  }
 });
 
 test('downloads: 404 when absent, 502 when the stored pack does not hash to its id', async () => {
