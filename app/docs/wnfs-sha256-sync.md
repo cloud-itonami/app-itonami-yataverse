@@ -17,3 +17,7 @@ and key transfer are separate from this test interface.
 
 See [Drive #12](https://github.com/network-awai/app-drive/pull/12) and
 [AWAI-3399](https://linear.app/kotobalabs/issue/AWAI-3399).
+
+The WNFS codec artifacts use the Drive and AwaiFS revisions in `codecBuild`.
+The host bridge and receipt files retain their existing Drive revision and
+Android IPC contract.
