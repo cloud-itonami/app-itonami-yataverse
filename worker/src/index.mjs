@@ -17,6 +17,7 @@
 //                          CORS preflight. Only origins in IPFS_ALLOWED_ORIGINS (default
 //                          https://tauri.localhost, the Nagare WebView, AWAI-3274) are answered:
 //                          POST on /ipfs, GET/HEAD on /ipfs/<cid>. Block PUT stays non-browser.
+//                          IPFS_READ_ORIGINS (AWAI-3472) are answered for GET/HEAD /ipfs/<cid> only.
 //   PUT|GET|HEAD|OPTIONS /awai-drive/v1/packs/<sha256>
 //                          Awai Drive encrypted snapshot packs (see drive-packs.mjs).
 //   GET /health           liveness, no configuration values.
@@ -344,11 +345,24 @@ export function ipfsAllowedOrigins(env) {
     .filter((o) => { try { return new URL(o).origin === o; } catch { return false; } });
 }
 
+// Read-only origins (AWAI-3472): pages that may read public blocks (GET/HEAD /ipfs/<cid>) but
+// not write. Reads are public anyway; this only lets a browser page see the response. These
+// origins never pass the write check below (originRefused uses IPFS_ALLOWED_ORIGINS alone) and
+// get no CORS answer on POST /ipfs. Empty by default. An entry is `scheme://host[:port]`,
+// lower-case, so app schemes such as `tauri://localhost` (whose URL origin is "null") work.
+const READ_ORIGIN = /^[a-z][a-z0-9+.-]*:\/\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$/;
+
+export function ipfsReadOrigins(env) {
+  return String(env.IPFS_READ_ORIGINS ?? '').split(',').map((s) => s.trim())
+    .filter((o) => READ_ORIGIN.test(o));
+}
+
 /** The CORS headers for one /ipfs response. `methods` are what this path answers in a browser. */
 function ipfsCors(request, env, methods) {
   const origin = request.headers.get('origin');
   const h = { vary: 'Origin' };
-  if (!origin || !ipfsAllowedOrigins(env).includes(origin)) return h;
+  const readOnly = !methods.includes('POST') && origin !== null && ipfsReadOrigins(env).includes(origin);
+  if (!origin || !(ipfsAllowedOrigins(env).includes(origin) || readOnly)) return h;
   h['access-control-allow-origin'] = origin;
   h['access-control-allow-methods'] = methods;
   h['access-control-allow-headers'] = methods.includes('POST') ? 'authorization, content-type, yataverse-request-id' : 'accept';

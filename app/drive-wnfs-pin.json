@@ -1,15 +1,22 @@
 {
   "repository": "https://github.com/network-awai/app-drive",
   "files": {
-    "generated/core.js": "8df9bb0bdfb2a089fde993cee145ab6fdb1e41fca6b51cde119f55538ddb27ca",
+    "generated/core.js": "43a4d6a8af4feaede03082e50d2148fb430d6bf666e05b0e72facb8ffaf9c97b",
     "generated/receipt.js": "845a2a2c53ad875ece362f2499b2fe2d679f0cb65072b8c0609efe8017ccd610",
-    "generated/wnfs-core.js": "13b630175893351ebf05e70d1f1c70f4d780a640ac55911c9931837d7416997f",
+    "generated/wnfs-core.js": "e43a2549d3a1d11e7c830486013062d1d26b59523ba1879c1af87c58cb42922d",
     "receipt-trust.json": "dc38207bdb1c591d5cc1191c4d0c2e455532a852e81791fb4b15687351f4022f",
-    "src/wnfs-sync.js": "03f88b87c8c21b6fc0d5b67d127d9e7b2fd7770dbdf0b71f5054ddde043dd634",
+    "src/wnfs-sync.js": "a5ddef6f18b1e4a7e4b7faad8615820ba3c595f0f140792e80aeebe8b18c1d9d",
     "src/wnfs-worker.js": "2bf1b5ef7130bd56496fd2b8ecd024217927888d455e5c4863c303f5aabddea9",
     "src/share-controls.js": "959bbaa3919726600b996a2533c41830a0bd8763e2754469571fe40fbda60fe1",
     "src/account-share.js": "14f41476c8449fc07848c546da31d75f6ecca4ca23dec7e2ae46eff034a27f2d",
     "src/wnfs-account.js": "376e9b8500b3a59f84050d84d851debfeee7705f6c52f94c149d833bc13c54c5"
   },
-  "revision": "02c79f3d16b62c8557831c5397b662534c093e35"
+  "revision": "02c79f3d16b62c8557831c5397b662534c093e35",
+  "codecBuild": {
+    "driveRevision": "fb3c0694d3668bb36f6a612e765045f4f2edb541",
+    "awaiFsRevision": "c9a29ce12597a3388aa4190ecd019ca31206c113",
+    "artifacts": [
+      "generated/wnfs-core.js"
+    ]
+  }
 }

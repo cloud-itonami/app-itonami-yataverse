@@ -35,12 +35,18 @@ function computeInWorker(operation, session, input, buffers) {
   });
 }
 
-export function createWnfsSync({ invoke, origin, packs, verifyReceipt, sha256, compute = computeInWorker }) {
+export function createWnfsSync({ invoke, origin, packs, verifyReceipt, sha256, compute = computeInWorker, supportsSharing = async () => true }) {
   async function restoreCopy(rows, legacy = false, shared) {
+    let transaction;
     let operation;
+    let begun = false;
     try {
-      ({ operation } = await invoke('vaultWnfsRestoreBegin', { legacy, ...shared }));
-      if (!operation) throw Error('restore-operation-missing');
+      transaction = await supportsSharing();
+      if (shared && !transaction) throw Error('unsupported-operation');
+      const started = await invoke('vaultWnfsRestoreBegin', { legacy, ...shared });
+      begun = true;
+      if (transaction) operation = started?.operation;
+      if (transaction && !operation) throw Error('restore-operation-missing');
       for (const { path, directory, chunks } of rows) {
         if (directory) continue;
         let offset = 0;
@@ -53,9 +59,9 @@ export function createWnfsSync({ invoke, origin, packs, verifyReceipt, sha256, c
         }
         if (offset === 0) await invoke('vaultWnfsRestoreWrite', { operation, path, offset: 0, bytes: '' });
       }
-      return await invoke('vaultWnfsRestorePublish', { operation });
+      return await invoke('vaultWnfsRestorePublish', transaction ? { operation } : { legacy });
     } catch (error) {
-      if (operation) await invoke('vaultWnfsRestoreAbort', { operation }).catch(() => {});
+      if (operation || (begun && !transaction)) await invoke('vaultWnfsRestoreAbort', { operation }).catch(() => {});
       throw error;
     } finally {
       for (const { chunks = [] } of rows) for (const chunk of chunks) chunk.fill(0);
@@ -128,8 +134,9 @@ export function createWnfsSync({ invoke, origin, packs, verifyReceipt, sha256, c
     },
     async sync(session, selectRecipients = items => Object.values(items)) {
       const { entries } = await invoke('vaultWnfsInventory');
-      const { revision, items, proofs } = await invoke('vaultWnfsRecipients');
-      const recipients = await selectRecipients(items, proofs);
+      const sharing = await supportsSharing();
+      const { revision, items, proofs } = sharing ? await invoke('vaultWnfsRecipients') : {};
+      const recipients = sharing ? await selectRecipients(items, proofs) : [];
       if (!entries.length) throw Error('empty-sync-snapshot');
       const rows = [];
       let sealed;
