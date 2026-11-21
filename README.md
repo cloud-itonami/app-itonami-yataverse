@@ -395,6 +395,28 @@ await fetch(`https://yataverse.com/ipfs/${cid}`, { method: 'PUT', body: bytes,
 Refusals name their reason (`cacao-bad-signature`, `cacao-nonce-expired`, `cacao-nonce-not-issued-here`,
 `cacao-resource-does-not-match-this-write`, `cacao-writer-not-allowed`, …) and store nothing.
 
+Deployed 2026-11-21 (owner approval, JUN-1426): merge commit `00c73c6898704784d86693a9772814498df1d36f`,
+Worker version `1c16390b-0969-4280-af28-d6b1dbc47b02` (the version before it is
+`fae5293f-57f8-4590-b95a-7204d806902e`), account `cloud-kotoba`, wrangler 4.103.0. `CACAO_NONCE_SECRET` was
+generated on the operator's machine and piped straight into `wrangler secret put`; it was not printed or saved.
+Measured on `https://yataverse.com` right after the deploy:
+
+| Request | Answer |
+|---|---|
+| `GET /auth/nonce` | 200, `cache-control: no-store` |
+| `PUT` signed by a key that is not a writer | 403 `cacao-writer-not-allowed` |
+| `PUT` with a nonce the client chose | 401 `cacao-nonce-not-issued-here` |
+| `PUT` whose CACAO names another CID | 403 `cacao-resource-does-not-match-this-write` |
+| `PUT` with another `aud` | 401 `cacao-wrong-audience` |
+| `PUT` with a malformed header | 401 `cacao-malformed` |
+| `PUT` signed by the writer, naming this CID | 201, `verified: true`, receipt names SHA-256 of the writer DID |
+| `GET` of that block | 200, the same bytes |
+| The same header replayed for another block | 403 `cacao-resource-does-not-match-this-write`; that block is not served |
+
+Not measured: a CAR import by CACAO on the live service, expiry of a nonce or a CACAO on the live service
+(both are covered by `test/worker-cacao.test.mjs`), and the write-token and service-auth paths after this
+deploy. Write tokens and service auth are still accepted and do not use a nonce.
+
 Residual risks. There is no one-time nonce store, so a captured header can be replayed until the nonce or
 the CACAO expires; because the resource names the content, a replay can only repeat the same
 content-addressed write (it still spends rate limit). Authorization is a list of writer DIDs; a delegation
