@@ -29,6 +29,9 @@
 //       /.well-known/yataverse-policy/<revision>.json (and current.json)
 //                          the receipt signing keys (did:web:yataverse.com) and the write policy.
 //
+//   GET /auth/nonce        a fresh, server-issued nonce for `Authorization: CACAO ...` writes
+//                          (cacao-auth.mjs, JUN-1426). Off unless the CACAO_* settings are present.
+//
 // Every successful write returns a signed storage receipt (receipts.mjs): `receipt` (JSON
 // envelope) and `receiptCid` (its DAG-CBOR record). An optional Yataverse-Request-Id header
 // (64 hex) names the request; a repeat gets the same receipt, a different write under the
@@ -52,6 +55,7 @@ import { handleDrivePack, DRIVE_PACK_PATH } from './drive-packs.mjs';
 import { admitWriteRequest, admitWriteBytes } from './write-limits.mjs';
 import { isServiceAuth, verifyServiceAuth, IMPORT_CAR_LXM } from './service-auth.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
+import { isCacao, verifyCacao, issueNonce, blockResource, carResource, claimedCarDigest } from './cacao-auth.mjs';
 import { isNameHost, underNameSuffix, handleName } from './names.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
@@ -234,8 +238,17 @@ async function storeBlock(cid, bytes, env, store) {
 
 async function writeBlock(request, cid, parsed, env, deps, store) {
   if (contentType(request) !== RAW) return fail(415, 'content-type-must-be-ipld-raw');
-  const denied = writeAuthFailure(request, env);
-  if (denied) return denied;
+  // A block may be written with a write token or with a CACAO that names this CID (cacao-auth.mjs).
+  const authorization = request.headers.get('authorization');
+  let writerDid = null;
+  if (isCacao(authorization)) {
+    const v = verifyCacao(authorization, blockResource(cid), env, deps);
+    if (v.error) return fail(...v.error, v.error[0] === 401 ? { 'www-authenticate': 'CACAO' } : {});
+    writerDid = v.did;
+  } else {
+    const denied = writeAuthFailure(request, env);
+    if (denied) return denied;
+  }
   if (parsed.version !== 1) return fail(400, 'put-requires-cidv1-sha2-256');
   const limited = await admitWriteRequest(request, env);
   if (limited) return fail(...limited);
@@ -249,7 +262,7 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
   const rid = requestIdOf(request, contentDigest);
   if (rid.error) return fail(...rid.error);
   const claim = { kind: KIND.block, subject: cidToBytes(cid), size: bytes.length, contentDigest,
-                  requestId: rid.requestId, requester: tokenDigest(request.headers.get('authorization')) };
+                  requestId: rid.requestId, requester: writerDid ? sha256(writerDid) : tokenDigest(authorization) };
   // A write that carries a lease asks for a retention promise: it is locked or refused, never
   // stored as an ordinary block instead.
   if (request.headers.has(LEASE_HEADER)) return await writeLeasedBlock(request, cid, bytes, claim, env, deps, store);
@@ -410,7 +423,16 @@ async function importCar(request, env, deps, store) {
   // after the request is counted by the rate limiter.
   const authorization = request.headers.get('authorization');
   const viaServiceAuth = isServiceAuth(authorization);
-  if (!viaServiceAuth) {
+  // A CACAO names the SHA-256 of the CAR body it authorizes (cacao-auth.mjs). Signature, nonce,
+  // audience and writer are checked here, before the body is read; the body is compared below.
+  const viaCacao = isCacao(authorization);
+  let cacaoDid = null; let cacaoDigest = null;
+  if (viaCacao) {
+    cacaoDigest = claimedCarDigest(authorization);
+    const v = verifyCacao(authorization, carResource(cacaoDigest ?? ''), env, deps);
+    if (v.error) return fail(...v.error, v.error[0] === 401 ? { 'www-authenticate': 'CACAO' } : {});
+    cacaoDid = v.did;
+  } else if (!viaServiceAuth) {
     const denied = writeAuthFailure(request, env);
     if (denied) return denied;
   }
@@ -421,10 +443,12 @@ async function importCar(request, env, deps, store) {
     const v = await verifyServiceAuth(authorization, IMPORT_CAR_LXM, env, deps);
     if (v.error) return fail(...v.error, v.error[0] === 401 ? { 'www-authenticate': 'Bearer' } : {});
     requester = sha256(v.did);
-  } else requester = tokenDigest(authorization);
+  } else if (viaCacao) requester = sha256(cacaoDid);
+  else requester = tokenDigest(authorization);
   const limits = carLimits(env);
   const body = await readCapped(request, limits.maxBytes);
   if (!body) return fail(413, 'car-too-large');
+  if (viaCacao && hex(sha256(body)) !== cacaoDigest) return fail(403, 'cacao-resource-does-not-match-this-write');
   const overBytes = await admitWriteBytes(request, env, body.length);
   if (overBytes) return fail(...overBytes);
   let car;
@@ -596,6 +620,11 @@ async function handleCore(request, env, deps = {}) {
   // with another object as `this` (as `deps.fetchImpl(...)` would).
   deps = { fetchImpl: (input, init) => fetch(input, init), now: () => new Date(), ...deps };
   const url = new URL(request.url);
+  if (url.pathname === '/auth/nonce') {
+    if (request.method !== 'GET') return fail(405, 'method-not-allowed', { allow: 'GET' });
+    const n = issueNonce(env, deps);
+    return n.error ? fail(...n.error) : json(200, n, { 'cache-control': 'no-store' });
+  }
   if (url.pathname === '/health') {
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
     return json(200, { ok: true, service: 'yataverse-bytes' });

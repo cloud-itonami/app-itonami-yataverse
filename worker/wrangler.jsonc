@@ -59,6 +59,14 @@
     // here when that key is provisioned. Empty: no PDS attestation is accepted.
     "SERVICE_AUTH_PDS_KEYS": "",
     "PLC_DIRECTORY_URL": "https://plc.directory",
+    // Writes by CACAO with a fresh server-issued nonce (JUN-1426, worker/src/cacao-auth.mjs; the
+    // `:fresh-cacao-nonce` requirement of the durable-plane policy). The scheme is OFF until all four
+    // are set: these two vars, CACAO_WRITER_DIDS (comma-separated ed25519 did:key values allowed to
+    // write) and the secret CACAO_NONCE_SECRET (`wrangler secret put CACAO_NONCE_SECRET`, 32+ random
+    // bytes). CACAO_WRITER_DIDS is left empty here: turning the scheme on is a separate owner decision.
+    "CACAO_AUD": "https://yataverse.com",
+    "CACAO_DOMAIN": "yataverse.com",
+    "CACAO_WRITER_DIDS": "",
     // Name plane (worker/src/names.mjs, JUN-1414): comma-separated host suffixes, each starting
     // with "." (for example ".itonami.app"). A host one label under a suffix is served as a site
     // from its _dnslink TXT record. Empty: off. Turning it on also needs a route for those hosts

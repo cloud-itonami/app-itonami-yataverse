@@ -355,12 +355,49 @@ KV, D1 or Durable Objects.
 | Write limits | **In effect: a WAF rate limiting rule on the `yataverse.com` zone** (AWAI-3242, owner decision 2026-11-18): `(http.request.method in {"PUT" "POST"} and (starts_with(http.request.uri.path, "/ipfs/") or starts_with(http.request.uri.path, "/awai-drive/")))`, counted per client IP, 10 requests / 10 s, action Block for 10 s (Free plan: one rule, 10 s period and duration, request counts only). Blocked writes get Cloudflare's `429` (`error code: 1015`, `Retry-After: 10`) and never reach the Worker. It is approximate per location; a burst can pass a few more before it engages (observed: 16 of 40 parallel writes passed). The Worker also carries per-IP Workers Rate Limiting bindings (`WRITE_REQUEST_LIMITER` 60 / 60 s, `WRITE_MIB_LIMITER` 64 MiB / 60 s, `worker/src/write-limits.mjs`), but on 2026-11-18 they did not refuse any request in this account, even at 3 requests / 10 s; treat them as inactive. Writes still fail closed (`503`) without those bindings. There is no byte budget in effect. |
 | Receipts | **Every successful write returns a signed storage receipt** (AWAI-3305; design [docs/storage-receipt-design.md](docs/storage-receipt-design.md)): `receipt` is a `YataverseStorageReceipt` v1 (EIP-712 typed data, Ed25519 over the EIP-712 digest), `receiptCid` its canonical DAG-CBOR record, stored at `ipld/receipts/by-request/<requestId>`. It claims only that this gateway stored and read back the bytes (`state` 1 `local-durable-readback`, `storeClass` 1 `edge-gateway`, `retentionUntil` 0); it is not retention or independent-replica evidence. Optional header `Yataverse-Request-Id: <64 hex>` (default: the content digest). A repeat gets the same receipt; a different write under the same id is `409 request-id-conflict` and is not stored. `requester` is the SHA-256 of the write token, 0 for Drive. Without a signing key that is published and valid now, writes are `503` and nothing is stored. Drive packs get the receipt in the same JSON; Drive does not check it yet. |
 | `GET /.well-known/…` | `yataverse-receipt-keys.json` (signing keys: `keyId`, `keyEpoch`, public JWK, `notBefore`/`notAfter`/`revokedAt` in Unix ms), `did.json` (`did:web:yataverse.com`), `yataverse-policy/<revision>.json` and `current.json` (the limits and store a receipt's `policyRevision` names; every revision is also a dag-cbor block at `/ipfs/<cid>`). |
+| CACAO writes (`PUT /ipfs/<cid>` and `POST /ipfs/`) | **CACAO with a fresh server-issued nonce** (JUN-1426, `worker/src/cacao-auth.mjs`; off by default). See "Writes by CACAO" below. |
+| `GET /auth/nonce` | `{nonce, expiresAt}` for a CACAO write. `503 cacao-not-configured` while the scheme is off. |
 | `GET /health` | Liveness only. |
 | `GET` / `HEAD https://{name}{suffix}/{path}` | **Name plane** (JUN-1414, `worker/src/names.mjs`; off by default). See "Name plane" below. |
 
 The Worker never follows a redirect. Write tokens are checked against `WRITE_TOKEN_SHA256`
 (comma-separated SHA-256 hex digests), so the Worker holds no token in clear. Verifying the
 Authn Biscuit instead is a follow-up: the Authn service does not publish its verification key.
+
+### Writes by CACAO
+
+A third way to authorize a write (JUN-1426), beside write tokens and ATProto service auth. It is the
+`:fresh-cacao-nonce` requirement of the durable-plane policy (root ADR-2611212100). It is **off** until
+`CACAO_NONCE_SECRET` (secret), `CACAO_AUD`, `CACAO_DOMAIN` and `CACAO_WRITER_DIDS` are all set;
+`worker/wrangler.jsonc` ships with an empty writer list, and turning it on is a separate owner decision.
+
+1. `GET /auth/nonce` returns `{nonce, expiresAt}`. The nonce is signed by the service (HMAC) and lives for
+   120 seconds. Nothing is stored: the Worker uses no KV, D1 or Durable Object.
+2. The writer signs a CACAO (the `direct` profile of `src/cacao.mjs`, an ed25519 `did:key`) with that
+   nonce, `aud` = `CACAO_AUD`, `domain` = `CACAO_DOMAIN`, a lifetime of at most 300 seconds, and exactly one
+   resource naming the write: `yataverse:put:<cid>` for a block, `yataverse:car:<sha256 hex of the body>`
+   for a CAR.
+3. The write carries `Authorization: CACAO <base64>`. The Worker checks the signature, audience, times,
+   that the nonce is its own and unexpired, that the resource is this write, and that the issuer is in
+   `CACAO_WRITER_DIDS`. The receipt records `requester` = SHA-256 of the DID.
+
+```js
+import { keyFromSeed, mintDirect } from './src/cacao.mjs';
+const key = keyFromSeed(seedHex);                                  // the caller holds the key
+const { nonce } = await (await fetch('https://yataverse.com/auth/nonce')).json();
+const { cacaoB64 } = mintDirect(key, { aud: 'https://yataverse.com', domain: 'yataverse.com', nonce,
+                                       resources: [`yataverse:put:${cid}`], ttlSec: 120 });
+await fetch(`https://yataverse.com/ipfs/${cid}`, { method: 'PUT', body: bytes,
+  headers: { authorization: `CACAO ${cacaoB64}`, 'content-type': 'application/vnd.ipld.raw' } });
+```
+
+Refusals name their reason (`cacao-bad-signature`, `cacao-nonce-expired`, `cacao-nonce-not-issued-here`,
+`cacao-resource-does-not-match-this-write`, `cacao-writer-not-allowed`, …) and store nothing.
+
+Residual risks. There is no one-time nonce store, so a captured header can be replayed until the nonce or
+the CACAO expires; because the resource names the content, a replay can only repeat the same
+content-addressed write (it still spends rate limit). Authorization is a list of writer DIDs; a delegation
+chain rooted in a Kotoba ID is not implemented. The CLI does not mint these yet (`mintDirect` is the API).
 
 ### UnixFS sites (dag-pb)
 
