@@ -181,7 +181,7 @@ Owner approval 2026-11-21 for replacing the Worker's secrets.
   that key is no longer needed by the gateway, and reducing or retiring it is the owner's call
   once its other users are known.
 
-## 4c. The lock key limited to `ipld/`, 2026-11-21T15:03Z to 15:10Z
+## 4c. The lock key limited to `ipld/`, 2026-11-21T15:03Z to 15:05Z
 
 Owner instruction: give the lock key the same prefix. Tracking: AWAI-3760. B2 keys cannot be
 edited, so the key was created again and the old one deleted. The Worker had no lock key
@@ -203,10 +203,45 @@ edited, so the key was created again and the old one deleted. The Worker had no 
 - **With the lock key alone:** a locked write outside `ipld/`, a plain write outside `ipld/`, a
   read outside `ipld/`, a read in another bucket, listing under `ipld/`, and deleting the locked
   version were each answered `403`.
-- **Left in the bucket:** three objects under `ipld/zz-lock-check/` (the block, locked until
-  2026-11-21T15:08:45Z; a policy block; an archive receipt record).
+- **Left in the bucket, then removed:** three objects under `ipld/zz-lock-check/` (the block,
+  locked until 2026-11-21T15:08:45Z; a policy block; an archive receipt record). A first attempt
+  at 15:06:41Z stopped because the lock was still running; they were deleted by version at
+  15:09:22Z (owner approval) and the prefix is empty.
 - **Follow-on.** With the prefix, the lock key cannot write under `retention-test/`, where the
   earlier lock experiments ran; later checks use a name under `ipld/`.
+
+## 4d. The verifier's read-only key limited to `ipld/`, 2026-11-21T15:15Z
+
+Owner instruction: give the verifier's read-only key the same prefix. Tracking: AWAI-3769. The
+key was created again and the old one deleted. No verifier is installed anywhere, so nothing
+that runs changed.
+
+- **Key.** `yataverse-retention-verifier-ro` (id ending `00003d`): bucket `yataverse-blocks`,
+  prefix `ipld/`, `readFiles` `readFileRetentions` `listBuckets`, no expiry. It replaces the key
+  ending `000035` (`readFiles` `readFileRetentions`, no prefix), which was deleted. The secret is
+  in `~/.config/yataverse/archive-verifier-key.json` (mode 0600) on the workstation used.
+- **Why `listBuckets` was added.** The probe (`src/archive-probe.mjs`) reports a `404` as "the
+  object is absent" and throws on anything else. With the old key a missing copy gave `403`, so
+  the verifier failed instead of judging. With the new key it judges.
+- **Checked against the real bucket** (`ipld/zz-verifier-check/`; a leased write through the
+  Worker handler with the gateway key and the lock key, then the verifier with this key):
+  - `head` of the locked version: the size, `COMPLIANCE`, and the same lock end the write returned;
+  - `runVerifierOnce` with a full read: `policy-satisfied`, and its status record verifies;
+  - `head` of a block that is not stored: absent (`null`);
+  - the verifier pointed at a place where the copy is not: `degraded`, reason `object-missing`.
+- **With the key alone:** a write under `ipld/`, hiding the test block (`DELETE` by name),
+  deleting the locked version, a read outside `ipld/`, a read in another bucket, and listing under
+  `ipld/` were each answered `403`; the test block was still readable afterwards.
+- **Left in the bucket:** three objects under `ipld/zz-verifier-check/` (the block, locked until
+  2026-11-21T15:19:12Z; a policy block; an archive receipt record).
+- **State of the keys.** All three Yataverse keys are now limited to `yataverse-blocks` and
+  `ipld/`:
+
+  | Key | Permissions | Held by |
+  |---|---|---|
+  | `yataverse-gateway` | `readFiles` `writeFiles` `listBuckets` | the Worker |
+  | `yataverse-retention-lock` | `readFiles` `writeFiles` `readFileRetentions` `writeFileRetentions` | nobody yet (workstation file) |
+  | `yataverse-retention-verifier-ro` | `readFiles` `readFileRetentions` `listBuckets` | nobody yet (workstation file) |
 
 ## 5. Going back
 
