@@ -3,11 +3,10 @@
 How to turn on the name plane (`{name}.itonami.app` served from this Worker) and how to turn it
 off again. Tracking: JUN-1414 (decision and remaining work), JUN-1417 (this runbook).
 
-**The name plane has not been turned on.** On 2026-11-21 `main` was deployed with it off (section 2a),
-so the store already accepts UnixFS blocks. The name plane is in `main` but off: `NAME_PLANE_SUFFIXES` is empty
-and no route for `itonami.app` hosts exists on this Worker. Turning it on is a production route
-change and needs the owner's approval for that step. Approval to deploy another change to this
-Worker does not cover it.
+**The name plane is on since 2026-11-21** (section 2b, JUN-1425): the route `*.itonami.app/*` is
+on this Worker and `NAME_PLANE_SUFFIXES` is `.itonami.app`. No site is published yet: no name has
+a `_dnslink` record whose blocks are in the store. Sections 2 and 2a describe the state before
+that; sections 3 to 5 are kept as the record of the steps and for a later re-enable.
 
 ## 1. What turning it on changes
 
@@ -65,6 +64,47 @@ Owner approval 2026-11-21: deploy `main` including the retention work. Tracking:
 - Not checked: leased writes, Drive packs, service-auth writes, CORS answers. Reading a block
   that is not in the store takes about 15 s and ends in `504 read-fallback-unreachable`, because
   `READ_FALLBACK_URL` (`ipfs.yataverse.com`) does not answer; that was already so before.
+
+## 2b. Name plane turned on, 2026-11-21
+
+Owner approval 2026-11-21 for the route and the suffix. Tracking: JUN-1425 (parent JUN-1414).
+
+- **Change.** Pull request #52, merge commit `3f495682d24b26d470baf6060a8cfa97589c4982`
+  (2026-11-21T14:03:11Z): the route, `NAME_PLANE_SUFFIXES: ".itonami.app"` and
+  `NAME_PLANE_MAX_FILE_BLOCKS: "40"`.
+- **Deploy.** From a clean checkout of that commit, in `worker/`, account `cloud-kotoba`:
+  `wrangler deploy --var SOURCE_COMMIT:<commit>` (wrangler 4.103.0). Version
+  `fae5293f-57f8-4590-b95a-7204d806902e`. The version before it, with the name plane off, is
+  `33945e82-1bf4-49f8-876f-28c1ae1919cc`.
+- **Zone account.** The zone list could not be read through the API (authentication error with
+  the local token). The deploy attached `*.itonami.app/*` with `zone_name: itonami.app` in
+  `cloud-kotoba`, which it can only do for a zone in that account.
+- **Workers plan.** Could not be read (same error). The 40-block cap is set for that reason: a
+  served file is limited to about 10 MiB. On a paid plan, remove the var.
+- **Checked at 14:03Z, before the deploy.** `x-probe`, `www` and `tsukuru` `.itonami.app`: 522.
+  `kaisya.itonami.app`: a DNS-only A record, no answer from that address. `itonami.app`: no A record.
+- **Checked at 14:03:51Z, after the deploy.**
+
+  | Request | Answer |
+  |---|---|
+  | `GET https://yataverse.com/health` | 200 `{"ok":true,"service":"yataverse-bytes"}` |
+  | `current.json` | source `3f495682…` |
+  | `GET https://yataverse.com/ipfs/<a stored raw block>`, receipt keys | 200, 200 |
+  | `GET https://x-probe.itonami.app/`, `https://www.itonami.app/` | 404 `name-not-published` |
+  | `PUT https://x-probe.itonami.app/ipfs/x` | 405 |
+  | `GET https://x-probe.itonami.app/health` | 404 (no bytes-plane API on a name host) |
+  | `GET https://tsukuru.itonami.app/` | 504 `read-fallback-unreachable` after 15.6 s |
+  | `GET https://kaisya.itonami.app/` | no answer, as before (does not reach the Worker) |
+  | `https://itonami.app/`, `https://a.b.itonami.app/` | no connection, as before (no record, or no certificate for two labels) |
+
+- **`tsukuru.itonami.app`.** Its `_dnslink` record already existed and names
+  `bafkreiau4wb3mxom2pqtl3aqpvtxqb4hfxr3cv5mfgygvcrseq57wbmrue`, a raw block that is not in the
+  store. The host answered 522 before and answers 504 after 15 s now. To serve it, write that
+  block (and the site it belongs to) to the store, or point the record at a stored site.
+- **Not checked.** A published site end to end on a real `itonami.app` name (needs a `_dnslink`
+  record, a DNS change in the dashboard); `HEAD`; files near the 40-block cap. The serving path
+  itself is covered by `test/worker-names.test.mjs` only.
+- **To publish the first site:** section 4, then steps 5 and 6 of section 5, then section 6.
 
 ## 3. Before deploying
 
