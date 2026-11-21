@@ -3,7 +3,8 @@
 How to turn on the name plane (`{name}.itonami.app` served from this Worker) and how to turn it
 off again. Tracking: JUN-1414 (decision and remaining work), JUN-1417 (this runbook).
 
-**Nothing here has been run.** The name plane is in `main` but off: `NAME_PLANE_SUFFIXES` is empty
+**The name plane has not been turned on.** On 2026-11-21 `main` was deployed with it off (section 2a),
+so the store already accepts UnixFS blocks. The name plane is in `main` but off: `NAME_PLANE_SUFFIXES` is empty
 and no route for `itonami.app` hosts exists on this Worker. Turning it on is a production route
 change and needs the owner's approval for that step. Approval to deploy another change to this
 Worker does not cover it.
@@ -43,10 +44,32 @@ an app's own Worker on `foo.itonami.app/*`) takes precedence over the wildcard r
   the default limit in the code (`NAME_PLANE_MAX_FILE_BLOCKS` = 128) assumes a paid plan. If the
   account is on Free, set that var to 40 in the enabling change.
 
+## 2a. Deploy of `main` on 2026-11-21 (name plane off)
+
+Owner approval 2026-11-21: deploy `main` including the retention work. Tracking: JUN-1418.
+
+- Deployed `79241d81f28cc6f5cd2d86b759a3848e925cc494` from a clean checkout of `main`, with
+  `NAME_PLANE_SUFFIXES` empty and only the `yataverse.com` route. Version
+  `33945e82-1bf4-49f8-876f-28c1ae1919cc`; the version before it is
+  `7d411f55-2c3a-4ae4-bace-8aca4bafe2aa` (source `54cab52`).
+- This supersedes the "deployed version" and "`main` is ahead" items in section 2.
+- **Retention is deployed but dormant.** Its secrets (`B2_LOCK_KEY_ID`, `B2_LOCK_APP_KEY`,
+  `ARCHIVE_RECEIPT_SIGNING_KEY`) are not provisioned, so a write that carries a lease is refused
+  (`503`) and ordinary writes are unchanged. Provisioning them is that work's own step.
+- Checked after the deploy: `/health` 200; `current.json` reports the new source; the receipt key
+  set is served; a raw block write returned a verified receipt and read back; a two-file UnixFS
+  probe site (`yataverse site-pack` then `car-put`) was stored with a verified receipt and read
+  back, root `bafybeie5ud226hhxyopmltfus7tajhhn7xl7ypbtk3ql4gv4ycc4qi3sim`, the same root
+  `ipfs add -r --cid-version=1 -n` (0.41.0) gives for that directory; its CAR export works;
+  `x-probe.itonami.app` still answers 522 (no route was added).
+- Not checked: leased writes, Drive packs, service-auth writes, CORS answers. Reading a block
+  that is not in the store takes about 15 s and ends in `504 read-fallback-unreachable`, because
+  `READ_FALLBACK_URL` (`ipfs.yataverse.com`) does not answer; that was already so before.
+
 ## 3. Before deploying
 
-1. Owner approval for: the route `*.itonami.app/*`, the suffix `.itonami.app`, and shipping the
-   commits listed in section 2.
+1. Owner approval for the route `*.itonami.app/*` and the suffix `.itonami.app`. (Shipping the
+   commits listed in section 2 was approved and done, section 2a.)
 2. Re-run the checks in section 2 (deployed source, commits ahead, DNS).
 3. Choose the first name. It must not be a host that already works another way. `kaisya` cannot
    be first: its record is IPNS and the name plane answers `501` for IPNS.
@@ -54,9 +77,8 @@ an app's own Worker on `foo.itonami.app/*`) takes precedence over the wildcard r
 
 ## 4. Publish the site's blocks (can be done before the deploy)
 
-The store accepts UnixFS blocks as soon as a version containing #50 is deployed. Until then
-`car-put` of a UnixFS CAR is refused (`put-codec-not-accepted`), so on the first rollout this step
-comes after step 5.2.
+The deployed version accepts UnixFS blocks (section 2a), so this can be done before turning the
+name plane on.
 
 ```sh
 yataverse site-pack ./site -o ./site-cars        # prints root, dnslink value and the CAR files
@@ -107,7 +129,7 @@ hosts go back to 522; `yataverse.com` is unaffected. Then set `NAME_PLANE_SUFFIX
 remove the route from `wrangler.jsonc` and deploy, so the next deploy does not bring it back.
 
 `wrangler rollback` to the previous version also turns it off, but it rolls back every other
-change in that deploy too (see section 2).
+change in that deploy too.
 
 DNS records and stored blocks can stay; with the route gone they have no effect.
 
