@@ -8,6 +8,18 @@ CIDv1 sha2-256 blocks, including multi-byte codec IDs in the Multiformats unsign
 `yataverse` requests the raw block representation and refuses any response whose bytes do not match
 the CID's multihash.
 
+## Position: a service that uses the kotobase library
+
+Yataverse is a **service**: it stores, serves and delivers content-addressed blocks behind `yataverse.com`,
+authenticates writes, issues storage receipts and (off by default) serves named sites. **kotobase is a library**
+(datoms, signed commit DAG, queries; `kotoba-lang/kotobase`) with no host of its own. The dependency runs one way,
+from this service to that library. New hosts, services and repositories use the Yataverse name, not kotobase
+([ADR 0050](https://github.com/network-awai/network-awai-apex/blob/main/docs/adr/0050-kotobase-is-a-library-yataverse-is-the-service.md), owner decision 2026-11-21).
+
+Current state: this repository does not import kotobase yet. It carries its own CID, CAR, DAG-CBOR and DAG
+traversal code (`src/cid.mjs`, `src/car.mjs`, `src/dag-cbor.mjs`, `src/dag.mjs`). Connecting the two, and
+whether these stay as an independent verified implementation, is open work in that ADR (§4).
+
 ```sh
 yataverse cid file.bin                 # the CID a file would have (local)
 yataverse canonical-cid Qm...           # normalize a legacy CIDv0 to CIDv1 base32
