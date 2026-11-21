@@ -22,7 +22,10 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
   "routes": [
-    { "pattern": "yataverse.com", "custom_domain": true }
+    { "pattern": "yataverse.com", "custom_domain": true },
+    // Name plane (JUN-1414): one-label hosts under itonami.app that fall to the proxied wildcard
+    // record are served as sites. A host with its own DNS-only record never reaches this Worker.
+    { "pattern": "*.itonami.app/*", "zone_name": "itonami.app" }
   ],
   "vars": {
     // Object key = B2_PREFIX + CID. "ipld/" matches the earlier graph layout in B2.
@@ -61,10 +64,9 @@
     "PLC_DIRECTORY_URL": "https://plc.directory",
     // Name plane (worker/src/names.mjs, JUN-1414): comma-separated host suffixes, each starting
     // with "." (for example ".itonami.app"). A host one label under a suffix is served as a site
-    // from its _dnslink TXT record. Empty: off. Turning it on also needs a route for those hosts
-    // on this Worker; that is a production route change and needs the owner's approval. Do not
-    // add the route or a suffix here as part of an unrelated deploy.
-    "NAME_PLANE_SUFFIXES": "",
+    // from its _dnslink TXT record. Empty: off. On since the owner approved the route above
+    // (docs/name-plane-deploy-runbook.md). To turn it off, empty this and remove the route.
+    "NAME_PLANE_SUFFIXES": ".itonami.app",
     // Published receipt signing keys (/.well-known/yataverse-receipt-keys.json, did:web:yataverse.com).
     // keyId = sha256(0xed01 || public key). Times are Unix milliseconds. Rotation: add a key with
     // keyEpoch + 1, set notAfter on the old one and keep it listed; revocation sets revokedAt.
