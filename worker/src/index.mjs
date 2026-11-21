@@ -36,7 +36,8 @@
 import crypto from 'node:crypto';
 import { parseCid, verifyBlock, cidToBytes, SHA2_256 } from '../../src/cid.mjs';
 import { KIND, rootsCommitment, blockSetDigest } from '../../src/receipt.mjs';
-import { beginReceipt, finishReceipt, requestIdOf, tokenDigest, wellKnown, sha256 } from './receipts.mjs';
+import { beginReceipt, finishReceipt, beginArchiveReceipt, finishArchiveReceipt, publishedKeys, requestIdOf, tokenDigest, wellKnown, sha256 } from './receipts.mjs';
+import { verifyLease, leaseEnvelopeFromDagCbor, RetentionError } from '../../src/retention.mjs';
 import { checkWritableBlock } from '../../src/block.mjs';
 import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
@@ -121,13 +122,34 @@ function b2(env, deps) {
   const prefix = env.B2_PREFIX ?? 'ipld/';
   // Object keys: blocks at <B2_PREFIX><cid>, Drive packs at <B2_PREFIX>drive-packs/<sha256>.
   // A block CID never contains '/', so the two namespaces cannot collide.
-  const objectUrl = (key) => new URL(`/${env.B2_BUCKET}/${prefix}${key}`, endpoint).toString();
-  const call = (method, key, { body, payloadHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', headers = {} } = {}) => {
-    const url = objectUrl(key);
-    const signed = signV4({ method, url, headers, payloadHash, keyId: env.B2_KEY_ID, secret: env.B2_APP_KEY, region, now: deps.now() });
+  const objectUrl = (key, versionId) => {
+    const u = new URL(`/${env.B2_BUCKET}/${prefix}${key}`, endpoint);
+    if (versionId !== undefined) u.searchParams.set('versionId', versionId);
+    return u.toString();
+  };
+  const callAs = (cred) => (method, key, { body, payloadHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', headers = {}, versionId } = {}) => {
+    const url = objectUrl(key, versionId);
+    const signed = signV4({ method, url, headers, payloadHash, keyId: cred.keyId, secret: cred.secret, region, now: deps.now() });
     return deps.fetchImpl(url, { method, headers: signed, body, redirect: 'manual', signal: AbortSignal.timeout(B2_TIMEOUT_MS) });
   };
+  const call = callAs({ keyId: env.B2_KEY_ID, secret: env.B2_APP_KEY });
+  // Locking writes use their own credential (B2_LOCK_KEY_ID / B2_LOCK_APP_KEY), so the key the
+  // gateway uses for ordinary writes needs no permission to set a retention. Without it the
+  // archive operations are absent and a leased write is refused.
+  const lockCall = env.B2_LOCK_KEY_ID && env.B2_LOCK_APP_KEY ? callAs({ keyId: env.B2_LOCK_KEY_ID, secret: env.B2_LOCK_APP_KEY }) : null;
+  const archive = lockCall && {
+    // S3 PutObject with Object Lock headers; the answer names the version that was locked.
+    putLocked: (cid, bytes, digestHex, retainUntilIso) => lockCall('PUT', cid, { body: bytes, payloadHash: digestHex, headers: {
+      'content-type': 'application/octet-stream', 'content-md5': crypto.createHash('md5').update(bytes).digest('base64'),
+      'x-amz-object-lock-mode': 'COMPLIANCE', 'x-amz-object-lock-retain-until-date': retainUntilIso } }),
+    headVersion: (cid, versionId) => lockCall('HEAD', cid, { versionId }),
+    getVersion: (cid, versionId) => lockCall('GET', cid, { versionId }),
+  };
   return {
+    archive,
+    getArchiveReceipt: (rid) => call('GET', `receipts/archive/by-request/${rid}`),
+    putArchiveReceipt: (rid, bytes) => call('PUT', `receipts/archive/by-request/${rid}`, { body: bytes, payloadHash: hex(sha256(bytes)),
+      headers: { 'content-type': 'application/json' } }),
     get: (cid) => call('GET', cid),
     head: (cid) => call('HEAD', cid),
     // Content-Length is left to fetch (it is derived from the body) and is not signed.
@@ -216,6 +238,9 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
   if (rid.error) return fail(...rid.error);
   const claim = { kind: KIND.block, subject: cidToBytes(cid), size: bytes.length, contentDigest,
                   requestId: rid.requestId, requester: tokenDigest(request.headers.get('authorization')) };
+  // A write that carries a lease asks for a retention promise: it is locked or refused, never
+  // stored as an ordinary block instead.
+  if (request.headers.has(LEASE_HEADER)) return await writeLeasedBlock(request, cid, bytes, claim, env, deps, store);
   const ops = receiptOps(env, deps, store);
   const begun = await ops.begin(claim);
   if (begun.error) return fail(...begun.error);
@@ -224,6 +249,63 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
   const receipt = await ops.finish(begun, claim);
   if (receipt.error) return fail(...receipt.error);
   return json(201, { cid, bytes: bytes.length, verified: true, receipt: receipt.json, receiptCid: receipt.cid });
+}
+
+export const LEASE_HEADER = 'yataverse-lease';
+const DAY_MS = 86_400_000;
+const DEFAULT_ARCHIVE_MAX_LOCK_DAYS = 90;
+const LEASE_START_SKEW_MS = 5 * 60 * 1000;
+
+/**
+ * PUT /ipfs/<cid> with a Yataverse-Lease header (base64url of the lease envelope's DAG-CBOR
+ * record): store the block under a compliance-mode Object Lock until the lease ends, check the
+ * locked version, and answer with a storeClass 3 (operator-archive) receipt
+ * (docs/retention-design.md §3.1, §5). A compliance lock cannot be removed by anyone, so every
+ * check that can refuse the request runs before anything is stored.
+ */
+async function writeLeasedBlock(request, cid, bytes, claim, env, deps, store) {
+  if (!store.archive) return fail(503, 'archive-not-configured');
+  // 1. The lease: both signatures, a published verifier, and terms that fit this block.
+  const raw = request.headers.get(LEASE_HEADER) ?? '';
+  if (!/^[A-Za-z0-9_-]{16,4096}$/.test(raw)) return fail(400, 'bad-lease-header');
+  let lease;
+  try { lease = await verifyLease(leaseEnvelopeFromDagCbor(new Uint8Array(Buffer.from(raw, 'base64url'))), publishedKeys(env)); }
+  catch (e) { if (e instanceof RetentionError) return fail(400, `lease-${e.code}`); throw e; }
+  const now = deps.now().getTime();
+  const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+  if (!same(lease.subject, claim.subject)) return fail(400, 'lease-subject-is-not-this-block');
+  if (lease.size !== bytes.length) return fail(400, 'lease-size-mismatch');
+  if (!(lease.notBefore <= now + LEASE_START_SKEW_MS)) return fail(400, 'lease-not-started');
+  if (!(now < lease.retentionUntil)) return fail(400, 'lease-expired');
+  const maxDays = intVar(env.ARCHIVE_MAX_LOCK_DAYS, DEFAULT_ARCHIVE_MAX_LOCK_DAYS);
+  if (lease.retentionUntil - now > maxDays * DAY_MS) return fail(400, 'lease-longer-than-the-lock-limit');
+  // 2. The archive signer, and an earlier receipt for the same request.
+  const aclaim = { ...claim, leaseId: lease.leaseId };
+  const begun = await beginArchiveReceipt(aclaim, env, deps, store);
+  if (begun.error) return fail(...begun.error);
+  if (begun.prior) return json(201, { cid, bytes: bytes.length, verified: true, receipt: begun.prior.json, receiptCid: begun.prior.cid, archive: begun.prior.archive });
+  // 3. Store under the lock.
+  const untilIso = new Date(lease.retentionUntil).toISOString();
+  const put = await store.archive.putLocked(cid, bytes, hex(claim.contentDigest), untilIso);
+  if (put.status !== 200) return fail(502, `archive-write-failed-${put.status}`);
+  const versionId = put.headers.get('x-amz-version-id');
+  if (!versionId || !/^[A-Za-z0-9._-]{1,200}$/.test(versionId)) return fail(502, 'archive-write-returned-no-version');
+  // 4. Check that exact version: length, lock mode, lock end, and the bytes.
+  const head = await store.archive.headVersion(cid, versionId);
+  if (head.status !== 200) return fail(502, `archive-head-failed-${head.status}`);
+  if (head.headers.get('x-amz-object-lock-mode') !== 'COMPLIANCE') return fail(502, 'archive-version-not-locked');
+  const retainUntil = Date.parse(head.headers.get('x-amz-object-lock-retain-until-date') ?? '');
+  if (!Number.isFinite(retainUntil) || retainUntil < lease.retentionUntil) return fail(502, 'archive-lock-ends-before-the-lease');
+  if (head.headers.get('content-length') !== String(bytes.length)) return fail(502, 'archive-version-size-mismatch');
+  const back = await store.archive.getVersion(cid, versionId);
+  if (back.status !== 200) return fail(502, `archive-readback-failed-${back.status}`);
+  const again = await readCapped(back, maxBytes(env));
+  if (!again || !verifyBlock(cid, again)) return fail(502, 'archive-readback-does-not-hash-to-cid');
+  // 5. The receipt promises what the store reported, not what was asked for.
+  const archive = { versionId, lockMode: 'COMPLIANCE', retainUntil };
+  const receipt = await finishArchiveReceipt(begun, aclaim, archive, env, deps, store, writeLimits(env));
+  if (receipt.error) return fail(...receipt.error);
+  return json(201, { cid, bytes: bytes.length, verified: true, receipt: receipt.json, receiptCid: receipt.cid, archive });
 }
 
 /**

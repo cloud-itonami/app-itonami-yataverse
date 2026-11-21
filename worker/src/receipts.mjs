@@ -14,8 +14,8 @@
 // the Worker never returns an unsigned or unverifiable success.
 import crypto from 'node:crypto';
 import {
-  importSigningKey, signReceipt, envelopeToJson, envelopeToDagCbor, envelopeFromDagCbor, policyRecord,
-  checkFields, requesterFor, ReceiptError, SIGNER_DID, STATE, STORE_CLASS, ZERO32,
+  importSigningKey, signReceipt, envelopeToJson, envelopeFromJson, envelopeToDagCbor, envelopeFromDagCbor, policyRecord,
+  checkFields, requesterFor, keyUses, ReceiptError, SIGNER_DID, STATE, STORE_CLASS, KEY_USE, ZERO32,
 } from '../../src/receipt.mjs';
 
 const hex = (b) => Buffer.from(b).toString('hex');
@@ -37,13 +37,11 @@ export function publishedKeys(env) {
 
 const active = (k, nowMs) => k.notBefore <= nowMs && (k.notAfter == null || nowMs < k.notAfter) && (k.revokedAt == null || nowMs < k.revokedAt);
 
-let cachedSigner = { source: null, signer: null };
-async function signerFor(env) {
-  if (!env.RECEIPT_SIGNING_KEY) return null;
-  if (cachedSigner.source !== env.RECEIPT_SIGNING_KEY) {
-    cachedSigner = { source: env.RECEIPT_SIGNING_KEY, signer: await importSigningKey(env.RECEIPT_SIGNING_KEY) };
-  }
-  return cachedSigner.signer;
+const cachedSigners = new Map();   // secret name -> { source, signer }
+async function signerFor(env, name = 'RECEIPT_SIGNING_KEY') {
+  if (!env[name]) return null;
+  if (cachedSigners.get(name)?.source !== env[name]) cachedSigners.set(name, { source: env[name], signer: await importSigningKey(env[name]) });
+  return cachedSigners.get(name).signer;
 }
 
 /** The policy in force: {source, limits, store} and its revision (design §3.1). */
@@ -146,6 +144,60 @@ export function wellKnown(pathname, env, limits, json) {
     return json(200, { revision: '0x' + hex(pol.revision), cid: pol.cid, policy: pol.policy });
   }
   return null;
+}
+
+// --- Operator archive receipts (docs/retention-design.md §3.1, §5; AWAI-3675) ---
+
+const ARCHIVE_SAME = ['kind', 'subject', 'size', 'contentDigest', 'requester', 'leaseId'];
+
+/**
+ * Before a locking write: the archive signer (ARCHIVE_RECEIPT_SIGNING_KEY, a different key from the
+ * gateway's, published with use operator-archive-receipt) and any earlier archive receipt for this
+ * requestId. -> { error } | { prior: { json, cid, record } } | { fresh: true, signer, entry }.
+ */
+export async function beginArchiveReceipt(claim, env, deps, store) {
+  let signer;
+  try { signer = await signerFor(env, 'ARCHIVE_RECEIPT_SIGNING_KEY'); } catch (e) { if (e instanceof ReceiptError) return { error: [503, 'archive-receipt-key-invalid'] }; throw e; }
+  if (!signer) return { error: [503, 'archive-not-configured'] };
+  const entry = publishedKeys(env).keys?.find((k) => k.keyId === '0x' + hex(signer.keyId));
+  if (!entry) return { error: [503, 'archive-receipt-key-not-published'] };
+  if (!keyUses(entry).includes(KEY_USE.operatorArchiveReceipt)) return { error: [503, 'archive-receipt-key-not-allowed'] };
+  if (!active(entry, deps.now().getTime())) return { error: [503, 'archive-receipt-key-not-valid-now'] };
+  const res = await store.getArchiveReceipt(hex(claim.requestId));
+  if (res.status === 404) return { fresh: true, signer, entry };
+  if (res.status !== 200) return { error: [502, `archive-receipt-read-failed-${res.status}`] };
+  let rec;
+  try { rec = JSON.parse(Buffer.from(await res.arrayBuffer()).toString('utf8')); } catch { return { error: [502, 'stored-archive-receipt-unreadable'] }; }
+  let env1;
+  try { env1 = envelopeFromJson(rec.receipt); } catch { return { error: [502, 'stored-archive-receipt-unreadable'] }; }
+  for (const k of ARCHIVE_SAME) {
+    const a = env1.receipt[k], b = claim[k];
+    if (a instanceof Uint8Array ? !sameBytes(a, b) : a !== b) return { error: [409, 'request-id-conflict'] };
+  }
+  return { prior: { json: rec.receipt, cid: envelopeToDagCbor(env1).cid, archive: rec.archive }, signer, entry };
+}
+
+/**
+ * After the locked version was stored and checked: sign and store the storeClass 3 receipt.
+ * `archive` = { versionId, lockMode, retainUntil (Unix ms, read back from the store) }.
+ */
+export async function finishArchiveReceipt(begun, claim, archive, env, deps, store, limits) {
+  const pol = currentPolicy(env, limits);
+  await ensurePolicyStored(pol, store);
+  const fields = checkFields({
+    kind: claim.kind, subject: claim.subject, size: claim.size, contentDigest: claim.contentDigest,
+    requestId: claim.requestId, requester: claim.requester ?? ZERO32,
+    reservationId: ZERO32, leaseId: claim.leaseId, pieceCommitment: ZERO32, policyRevision: pol.revision,
+    state: STATE.localDurableReadback, storeClass: STORE_CLASS.operatorArchive,
+    acceptedAt: deps.now().getTime(), retentionUntil: archive.retainUntil, keyId: begun.signer.keyId, keyEpoch: begun.entry.keyEpoch,
+  });
+  const envelope = await signReceipt(fields, begun.signer);
+  const json = envelopeToJson(envelope);
+  // The record keeps the version id next to the receipt, so a repeated request gets both back.
+  const bytes = Buffer.from(JSON.stringify({ v: 1, receipt: json, archive }));
+  const put = await store.putArchiveReceipt(hex(claim.requestId), bytes);
+  if (put.status !== 200) return { error: [502, `archive-receipt-write-failed-${put.status}`] };
+  return { json, cid: envelopeToDagCbor(envelope).cid, archive };
 }
 
 export const tokenDigest = requesterFor;

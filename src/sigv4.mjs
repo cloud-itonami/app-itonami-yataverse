@@ -1,5 +1,5 @@
 // AWS Signature Version 4 for the Backblaze B2 S3-compatible API.
-// Only what the Worker and the archive probe need: path-style object URLs, no query string, a caller-supplied
+// Only what the Worker and the archive probe need: path-style object URLs, a caller-supplied
 // payload hash. Uses node:crypto (Workers `nodejs_compat`, Node 18+ in tests).
 import crypto from 'node:crypto';
 
@@ -18,6 +18,15 @@ export function regionFromEndpoint(endpoint) {
   return m ? m[1] : null;
 }
 
+// RFC 3986 encoding as SigV4 wants it: everything but A-Z a-z 0-9 - _ . ~ is percent-encoded.
+const enc = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+/** The canonical query string: parameters sorted by encoded name, then by encoded value. */
+export function canonicalQuery(u) {
+  return [...u.searchParams.entries()].map(([k, v]) => [enc(k), enc(v)])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0))
+    .map(([k, v]) => `${k}=${v}`).join('&');
+}
+
 /**
  * Sign one request. `headers` holds every header to send besides Authorization; all of
  * them are signed. Returns a new header object that adds x-amz-date, x-amz-content-sha256
@@ -27,14 +36,13 @@ export function signV4({ method, url, headers = {}, payloadHash, keyId, secret, 
   if (!keyId || !secret || !region) throw new Error('sigv4-missing-credentials');
   if (!/^[0-9a-f]{64}$|^UNSIGNED-PAYLOAD$/.test(payloadHash)) throw new Error('sigv4-bad-payload-hash');
   const u = new URL(url);
-  if (u.search) throw new Error('sigv4-query-not-supported');
   const { amzDate, dateStamp } = amzDates(now);
   const all = { ...Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v).trim()])),
                 host: u.host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate };
   const names = Object.keys(all).sort();
   const canonicalHeaders = names.map((k) => `${k}:${all[k]}\n`).join('');
   const signedHeaders = names.join(';');
-  const canonicalRequest = [method, u.pathname, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+  const canonicalRequest = [method, u.pathname, canonicalQuery(u), canonicalHeaders, signedHeaders, payloadHash].join('\n');
   const scope = `${dateStamp}/${region}/${service}/aws4_request`;
   const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256Hex(canonicalRequest)].join('\n');
   const kSigning = hmac(hmac(hmac(hmac(`AWS4${secret}`, dateStamp), region), service), 'aws4_request');

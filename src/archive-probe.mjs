@@ -5,9 +5,9 @@
 // Checked against Backblaze B2 on 2026-11-21 (docs/retention-design.md §16, AWAI-3673): HEAD returns
 // x-amz-object-lock-mode and x-amz-object-lock-retain-until-date to a key with readFiles and
 // readFileRetentions. Two limits found there:
-// - This probe looks at the newest version of a name. A later unlocked write of the same name, or a
-//   hide marker, makes a locked older version invisible here, so the check fails (never passes wrongly).
-//   Checking the locked version by its id is still to be built.
+// - Without a versionId the probe sees the newest version of a name. A later unlocked write of the
+//   same name, or a hide marker, makes a locked older version invisible that way, so the check fails
+//   (never passes wrongly). Pass the versionId returned by the locking write to check that version.
 // - Without listFiles, B2 answers 403 instead of 404 for a missing object; head() then throws.
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 
@@ -18,22 +18,27 @@ const TIMEOUT_MS = 30_000;
 
 /**
  * makeArchiveProbe({ endpoint, bucket, prefix, keyId, secret, region?, fetchImpl?, now?, maxBytes? })
- * Object key = prefix + CID. -> { head(cid), read(cid) } for runVerifierOnce.
+ * Object key = prefix + CID. -> { head(cid, { versionId }), read(cid, { versionId }) } for runVerifierOnce.
  */
 export function makeArchiveProbe({ endpoint, bucket, prefix = '', keyId, secret, region, fetchImpl = fetch, now = () => new Date(), maxBytes = 16 * 1024 * 1024 }) {
   if (!endpoint || !bucket || !keyId || !secret) bad('archive-probe-not-configured');
   const base = new URL(endpoint);
   if (base.protocol !== 'https:' && !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) bad('archive-endpoint-not-https');
   const reg = region || regionFromEndpoint(endpoint) || bad('archive-region-unknown');
-  const urlFor = (cid) => {
+  const urlFor = (cid, versionId) => {
     if (!/^[a-z2-7]{20,120}$/.test(cid)) bad('bad-cid');
-    return new URL(`/${bucket}/${prefix}${cid}`, base).toString();
+    const u = new URL(`/${bucket}/${prefix}${cid}`, base);
+    if (versionId !== undefined) {
+      if (typeof versionId !== 'string' || !/^[A-Za-z0-9._-]{1,200}$/.test(versionId)) bad('bad-version-id');
+      u.searchParams.set('versionId', versionId);
+    }
+    return u.toString();
   };
   const send = (method, url) => fetchImpl(url, { method, redirect: 'manual', signal: AbortSignal.timeout(TIMEOUT_MS),
     headers: signV4({ method, url, payloadHash: EMPTY_SHA256, keyId, secret, region: reg, now: now() }) });
   return {
-    async head(cid) {
-      const res = await send('HEAD', urlFor(cid));
+    async head(cid, { versionId } = {}) {
+      const res = await send('HEAD', urlFor(cid, versionId));
       if (res.status === 404) return null;
       if (res.status !== 200) bad(`head-http-${res.status}`);
       const len = res.headers.get('content-length');
@@ -41,10 +46,11 @@ export function makeArchiveProbe({ endpoint, bucket, prefix = '', keyId, secret,
       const t = until ? Date.parse(until) : NaN;
       return { size: /^\d+$/.test(len ?? '') ? Number(len) : -1,
                lockMode: res.headers.get('x-amz-object-lock-mode') ?? '',
-               retainUntil: Number.isFinite(t) ? t : null };
+               retainUntil: Number.isFinite(t) ? t : null,
+               versionId: res.headers.get('x-amz-version-id') ?? '' };
     },
-    async read(cid) {
-      const res = await send('GET', urlFor(cid));
+    async read(cid, { versionId } = {}) {
+      const res = await send('GET', urlFor(cid, versionId));
       if (res.status !== 200) bad(`get-http-${res.status}`);
       const len = Number(res.headers.get('content-length') ?? -1);
       if (len > maxBytes) bad('object-too-large');

@@ -240,13 +240,18 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         // The verifier's private key: refuse a file that anyone but its owner can read.
         if (process.platform !== 'win32' && (fs.statSync(f.signingKeyFile).mode & 0o077) !== 0) { stderr.write('yataverse: signing-key-file-is-readable-by-others (chmod 600)\n'); return 1; }
         const signer = await importSigningKey(fs.readFileSync(f.signingKeyFile, 'utf8'));
+        // A receipt file is a bare envelope or a write response; a locking write's response also
+        // names the version it locked, which the verifier then checks instead of the newest one.
+        const versions = {};
         const receiptEnvs = (f.receipts ? f.receipts.split(',').filter(Boolean) : []).map((p) => {
-          const j = readJson(p); return envelopeFromJson(j && j.v === 1 && j.sig ? j : j?.receipt);
+          const j = readJson(p);
+          if (typeof j?.cid === 'string' && typeof j?.archive?.versionId === 'string') versions[j.cid] = j.archive.versionId;
+          return envelopeFromJson(j && j.v === 1 && j.sig ? j : j?.receipt);
         });
         const probe = f.archiveEndpoint ? makeArchiveProbe({ endpoint: f.archiveEndpoint, bucket: f.archiveBucket, prefix: f.archivePrefix ?? '',
           region: f.archiveRegion, keyId: env.YATAVERSE_ARCHIVE_KEY_ID, secret: env.YATAVERSE_ARCHIVE_APP_KEY, ...(fetchImpl ? { fetchImpl } : {}) }) : null;
         const run = await runVerifierOnce({ leaseEnv: leaseEnvelopeFromJson(readJson(f.lease)), receiptEnvs, keys: readJson(f.keys), probe, signer,
-          keyEpoch: Number(f.keyEpoch), now: now(), inventory: f.inventory ? readJson(f.inventory) : undefined, sampleRead: f.sampleRead === 'true' });
+          keyEpoch: Number(f.keyEpoch), now: now(), inventory: f.inventory ? readJson(f.inventory) : undefined, sampleRead: f.sampleRead === 'true', versions });
         if (f.evidenceOut) fs.writeFileSync(f.evidenceOut, run.evidence.bytes, { flag: 'wx' });
         out({ summary: run.summary, status: statusEnvelopeToJson(run.status), statusCid: statusEnvelopeToDagCbor(run.status).cid,
               evidenceCid: run.evidence.cid, evidenceRoot: '0x' + Buffer.from(run.evidence.root).toString('hex'),
