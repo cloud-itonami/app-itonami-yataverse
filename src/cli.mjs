@@ -7,8 +7,15 @@ import { loadConfig, saveConfig, status, configDir, ConfigError } from './config
 import { makeAuthorizer } from './auth.mjs';
 import { makeClient } from './client.mjs';
 import { verifyReceiptInput } from './verify-receipt.mjs';
-import { envelopeFromJson, importSigningKey } from './receipt.mjs';
-import { leaseEnvelopeFromJson, statusEnvelopeToJson, statusEnvelopeToDagCbor } from './retention.mjs';
+import crypto from 'node:crypto';
+import { envelopeFromJson, importSigningKey, keyIdFor, ZERO32 } from './receipt.mjs';
+import {
+  leaseEnvelopeFromJson, leaseEnvelopeToJson, leaseEnvelopeToDagCbor, statusEnvelopeToJson, statusEnvelopeToDagCbor, statusEnvelopeFromJson,
+  leaseFromTerms, signLeaseAsRequester, signLeaseAsVerifier, leaseProposalToJson, leaseProposalFromJson, verifyLeaseProposal,
+  verifyLease, verifyStatus, gradeSatisfied, GRADE, STATUS,
+} from './retention.mjs';
+import { cidToBytes } from './cid.mjs';
+import { statusName } from './verifier.mjs';
 import { runVerifierOnce } from './verifier.mjs';
 import { makeArchiveProbe } from './archive-probe.mjs';
 import { serve } from './mcp.mjs';
@@ -31,6 +38,18 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse verify-receipt <response.json|-> [--keys <file>] [--file <path> --kind block|car|drive-pack [--codec raw|dag-cbor]]
                                        check a saved receipt: signature, key validity at acceptedAt, state; with
                                        --file, also the subject, digest and size recomputed from the file
+  yataverse retention-keygen <file>    create an Ed25519 key for a lease requester or a retention verifier
+                                       (private JWK, owner-readable only, never overwritten); prints the keyId
+  yataverse lease-new --file <path> --until <ISO time|Nd> --verifier <0x keyId> --requester-key-file <jwk>
+                        [--challenge-period <seconds>] [-o proposal.json]
+                                       propose a grade R1 lease for one block, signed by the requester
+  yataverse lease-cosign --lease <proposal.json> --signing-key-file <jwk> [-o lease.json]
+                                       as the verifier the proposal names: check it and add the second signature
+  yataverse put <file> --lease <lease.json>   write under that lease: the answer must be a retention receipt
+                                       (store class operator-archive) for the lease, or the command fails
+  yataverse retention-status --status <status.json> --lease <lease.json> --keys <keys.json>
+                                       check a retention status record against its lease and the published keys;
+                                       a record past its validUntil is refused (the state is then unknown)
   yataverse retention-verify-once --lease <lease.json> --keys <keys.json> --signing-key-file <jwk> --key-epoch <n>
                         [--receipts <a.json,b.json,...>] [--inventory <cids.json>] [--sample-read true]
                         [--archive-endpoint U --archive-bucket B [--archive-prefix P] [--archive-region R]]
@@ -170,6 +189,14 @@ async function writeAssetDidIndex(inputPath, domain, stdout, summaryPath) {
   return summary;
 }
 
+/** A private signing key file: refused when anyone but its owner can read it. */
+async function readSigningKey(file) {
+  if (process.platform !== 'win32' && (fs.statSync(file).mode & 0o077) !== 0) {
+    const e = new Error('signing-key-file-is-readable-by-others (chmod 600)'); e.code = 'signing-key-file-is-readable-by-others'; throw e;
+  }
+  return importSigningKey(fs.readFileSync(file, 'utf8'));
+}
+
 function flags(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -234,12 +261,63 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         out(await verifyReceiptInput(input, keys, { file: f.file ? fs.readFileSync(f.file) : undefined, kind: f.kind, codec: f.codec }));
         return 0;
       }
+      case 'retention-keygen': {
+        if (!f._[0]) { stderr.write('yataverse: retention-keygen needs an output file\n'); return 2; }
+        const j = crypto.generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' });
+        // 'wx': never replace an existing key file.
+        fs.writeFileSync(f._[0], JSON.stringify({ kty: j.kty, crv: j.crv, d: j.d, x: j.x }) + '\n', { flag: 'wx', mode: 0o600 });
+        out({ file: f._[0], keyId: '0x' + Buffer.from(keyIdFor(new Uint8Array(Buffer.from(j.x, 'base64url')))).toString('hex'),
+              publicKeyJwk: { kty: 'OKP', crv: 'Ed25519', x: j.x }, note: 'the private key is in the file only; to act as a verifier this key must be published with use retention-verifier' });
+        return 0;
+      }
+      case 'lease-new': {
+        for (const k of ['file', 'until', 'verifier', 'requesterKeyFile']) if (!f[k]) { stderr.write(`yataverse: lease-new needs --${k.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase())}\n`); return 2; }
+        const bytes = fs.readFileSync(f.file);
+        const t0 = now();
+        const days = /^(\d{1,4})d$/.exec(f.until);
+        const until = days ? t0 + Number(days[1]) * 86_400_000 : Date.parse(f.until);
+        if (!Number.isFinite(until)) { stderr.write('yataverse: bad --until (an ISO time, or a number of days such as 30d)\n'); return 2; }
+        const vm = /^(?:0x)?([0-9a-f]{64})$/.exec(String(f.verifier).toLowerCase());
+        if (!vm) { stderr.write('yataverse: bad --verifier (64 hex)\n'); return 2; }
+        const signer = await readSigningKey(f.requesterKeyFile);
+        const lease = leaseFromTerms({ subject: cidToBytes(rawCid(bytes)), size: bytes.length, pieceCommitment: ZERO32, grade: GRADE.R1, providerReplicas: 0,
+          domainPolicy: ZERO32, notBefore: t0, retentionUntil: until, challengePeriod: f.challengePeriod ? Number(f.challengePeriod) : 86_400,
+          requester: signer.keyId, verifier: new Uint8Array(Buffer.from(vm[1], 'hex')), policyRevision: ZERO32 });
+        const proposal = leaseProposalToJson({ lease, sigs: { requester: await signLeaseAsRequester(lease, signer) } });
+        if (f.o) fs.writeFileSync(f.o, JSON.stringify(proposal, null, 2) + '\n', { flag: 'wx' });
+        out({ proposal, cid: rawCid(bytes), leaseId: proposal.lease.leaseId, retentionUntil: new Date(until).toISOString(),
+              next: 'the verifier named in the proposal runs: yataverse lease-cosign --lease <this file> --signing-key-file <its key>' });
+        return 0;
+      }
+      case 'lease-cosign': {
+        for (const k of ['lease', 'signingKeyFile']) if (!f[k]) { stderr.write(`yataverse: lease-cosign needs --${k.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase())}\n`); return 2; }
+        const proposal = leaseProposalFromJson(JSON.parse(fs.readFileSync(f.lease, 'utf8')));
+        const lease = await verifyLeaseProposal(proposal);
+        const signer = await readSigningKey(f.signingKeyFile);
+        const env = { v: 1, lease, sigs: { requester: proposal.sigs.requester, verifier: await signLeaseAsVerifier(lease, signer) } };
+        const j = leaseEnvelopeToJson(env);
+        if (f.o) fs.writeFileSync(f.o, JSON.stringify(j, null, 2) + '\n', { flag: 'wx' });
+        out({ lease: j, leaseId: j.lease.leaseId, leaseCid: leaseEnvelopeToDagCbor(env).cid });
+        return 0;
+      }
+      case 'retention-status': {
+        for (const k of ['status', 'lease', 'keys']) if (!f[k]) { stderr.write(`yataverse: retention-status needs --${k}\n`); return 2; }
+        const keys = JSON.parse(fs.readFileSync(f.keys, 'utf8'));
+        const lease = await verifyLease(leaseEnvelopeFromJson(JSON.parse(fs.readFileSync(f.lease, 'utf8'))), keys);
+        const sj = JSON.parse(fs.readFileSync(f.status, 'utf8'));
+        const s = await verifyStatus(statusEnvelopeFromJson(sj && sj.v === 1 && sj.sig ? sj : sj?.status), lease, keys, { now: now() });
+        const hex0x = (b) => '0x' + Buffer.from(b).toString('hex');
+        out({ verified: true, status: statusName(s.status), satisfied: s.status === STATUS.policySatisfied, grade: `R${s.grade}`,
+              operatorCopies: s.operatorCopies, providerReplicas: s.providerReplicas, countsMeetTheGrade: gradeSatisfied(lease, s),
+              observedAt: new Date(s.observedAt).toISOString(), validUntil: new Date(s.validUntil).toISOString(),
+              leaseId: hex0x(s.leaseId), leaseEnds: new Date(lease.retentionUntil).toISOString(), evidenceRoot: hex0x(s.evidenceRoot), verifier: hex0x(s.keyId),
+              claims: 'the lease verifier observed these counts at observedAt; trust it until validUntil, after which the state is unknown' });
+        return 0;
+      }
       case 'retention-verify-once': {
         for (const k of ['lease', 'keys', 'signingKeyFile', 'keyEpoch']) if (!f[k]) { stderr.write(`yataverse: retention-verify-once needs --${k.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase())}\n`); return 2; }
         const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
-        // The verifier's private key: refuse a file that anyone but its owner can read.
-        if (process.platform !== 'win32' && (fs.statSync(f.signingKeyFile).mode & 0o077) !== 0) { stderr.write('yataverse: signing-key-file-is-readable-by-others (chmod 600)\n'); return 1; }
-        const signer = await importSigningKey(fs.readFileSync(f.signingKeyFile, 'utf8'));
+        const signer = await readSigningKey(f.signingKeyFile);
         // A receipt file is a bare envelope or a write response; a locking write's response also
         // names the version it locked, which the verifier then checks instead of the newest one.
         const versions = {};
@@ -279,7 +357,8 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
           else stdout.write(r.bytes);
           return 0;
         }
-        const r = await client.putBytes(readInput(f._[0]), { codec: f.codec ?? 'raw', requestId: f.requestId }); out(r); return 0;
+        const lease = f.lease ? leaseEnvelopeFromJson(JSON.parse(fs.readFileSync(f.lease, 'utf8'))) : undefined;
+        const r = await client.putBytes(readInput(f._[0]), { codec: f.codec ?? 'raw', requestId: f.requestId, lease }); out(r); return 0;
       }
       case 'mcp': serve(); return await new Promise(() => {});
       case 'bootstrap': {

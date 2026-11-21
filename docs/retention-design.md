@@ -337,3 +337,11 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
   - **試験で使わなかった部分:** 通常の資格情報での呼び出し（受領証の記録と policy の block の読み書き）は、手元の memory で受けた。この部分は今の本番で動いている経路と同じ code である。
   - **bucket に残っているもの:** `retention-test/` の下に、lock された試験ファイルが 2 件（50 bytes、期限 2026-11-22T06:21:50Z。51 bytes、期限 2026-11-22T06:32:25Z）。期限の後に消す。lock のない試験用の object は bucket に書いていない。
   - **まだ無いもの:** Worker の deploy、本番の鍵の一覧への保持用の署名鍵と検証役の鍵の追加、検証役の定期実行と状態の公開、lease つきの書込みを行う CLI の command。
+- **S1-4 利用者側の command（[AWAI-3679](https://linear.app/kotobalabs/issue/AWAI-3679)）:** §11 の使い方を CLI に入れた。
+  - `yataverse retention-keygen <file>`: 要求者または検証役の Ed25519 鍵を作る。秘密鍵は file にだけ置き（所有者だけが読める、既存の file は上書きしない）、keyId と公開鍵を表示する。
+  - `yataverse lease-new`: 1 つの block に対する R1 の lease を作り、要求者が署名する。検証役の署名がまだ無い「提案」で、これだけでは lease として通らない。期限は時刻か日数（`30d`）で指定する。
+  - `yataverse lease-cosign`: 提案を確かめ（lease の id、要求者の署名）、提案が名指しした検証役の鍵で 2 つめの署名を足す。別の鍵では署名できない。
+  - `yataverse put <file> --lease <lease.json>`: 送る前に、lease を公開された鍵の一覧に照らして検証し、その bytes の lease であることを確かめる。応答は、その lease の保持の受領証（`storeClass 3`、同じ lease の id、期限が lease 以上）でなければ失敗にする。入口の通常の受領証が返ってきた場合（lease を知らない古い Worker など）も失敗にする。入口が拒否した理由は、そのまま利用者に伝える。
+  - `yataverse retention-status`: 状態の記録を lease と鍵の一覧に照らして検証し、状態、数、有効期限を表示する。有効期限を過ぎた記録は失敗にする（状態は不明）。別の lease の記録は通らない。状態の公開 endpoint はまだ無いので、照会の対象は file である。
+  - **未対応:** R2 と R3 の lease の作成（piece commitment が要る）、複数 block の lease、renew、release。
+  - **確認（2026-11-21）:** `npm test` は 142 件すべて通過（既存 140、追加 2）。test は keygen から状態の照会までを、試験用の Worker と偽の store で通している。検査 5 か所を 1 つずつ外すと、どれも test が失敗した。
