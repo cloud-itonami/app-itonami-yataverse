@@ -1,10 +1,10 @@
-# 保持の設計: 分散型の provider node と B2（案）
+# 保持の設計: 分散型の provider node と B2
 
-- Status: **案（Proposed）**。owner の決定待ち（§13）。実装、bucket の作成、鍵の発行、課金の変更は含まない。
+- Status: **owner 決定済み**（2026-11-21。§13 の 8 件すべて推奨案を採用）。この文書は設計で、実装、bucket の作成、鍵の発行、課金の変更は含まない。それぞれ §14 の段階ごとに別の承認を得る。
 - Owner direction（2026-11-21）:「yataverse.com で保持設計を分散型 + b2 で設計して」。
 - Tracking: [AWAI-3667](https://linear.app/kotobalabs/issue/AWAI-3667)（親 [AWAI-3618](https://linear.app/kotobalabs/issue/AWAI-3618)）。
 - 位置づけ: [受領証の設計](storage-receipt-design.md) §8 の「lease を入れる段階」と、[ADR 0041](https://github.com/network-awai/network-awai-apex/blob/main/docs/adr/0041-yataverse-proof-of-storage-network.md)（Proposed）の P1 を、B2 を併用する移行期つきで具体化する。
-- 既存文書との食い違いは §12 にまとめた。この文書は既存の ADR を書き換えない。
+- 既存文書との食い違いは §12 にまとめた。ADR 0041 D6 の改定は network-awai-apex の別の PR で行う。
 
 ## 1. 背景
 
@@ -244,7 +244,9 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
 | storage architecture §3 | 構成要素に「Kura」の行がある | ADR 0041 D2（案 B）に従い「保存層の検証役」と読む。改定は ADR 0041 の改定表のとおりで、まだ反映されていない |
 | storage architecture §8 | 既存の B2 運用の資格を独立ノード耐久性の証明に流用しない | 守る。B2 の確認（§8）は独立複製の証明と呼ばない |
 
-## 13. owner の決定事項
+## 13. owner の決定（2026-11-21: すべて推奨案）
+
+決定 7 の機器（最初の 2 台の provider node）は未定で、S2 の着手前に owner が選ぶ。
 
 | # | 決めること | 推奨 | 他の選択肢 |
 |---|---|---|---|
