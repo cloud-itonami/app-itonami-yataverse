@@ -4,8 +4,8 @@ How to turn on the name plane (`{name}.itonami.app` served from this Worker) and
 off again. Tracking: JUN-1414 (decision and remaining work), JUN-1417 (this runbook).
 
 **The name plane is on since 2026-11-21** (section 2b, JUN-1425): the route `*.itonami.app/*` is
-on this Worker and `NAME_PLANE_SUFFIXES` is `.itonami.app`. No site is published yet: no name has
-a `_dnslink` record whose blocks are in the store. Sections 2 and 2a describe the state before
+on this Worker and `NAME_PLANE_SUFFIXES` is `.itonami.app`. The first site is `tsukuru.itonami.app`
+(section 2c). Sections 2 and 2a describe the state before
 that; sections 3 to 5 are kept as the record of the steps and for a later re-enable.
 
 ## 1. What turning it on changes
@@ -106,7 +106,7 @@ Owner approval 2026-11-21 for the route and the suffix. Tracking: JUN-1425 (pare
   itself is covered by `test/worker-names.test.mjs` only.
 - **To publish the first site:** section 4, then steps 5 and 6 of section 5, then section 6.
 
-## 2c. First site: `tsukuru`, blocks written 2026-11-21 (DNS record not changed yet)
+## 2c. First site: `tsukuru`, live since 2026-11-21
 
 Owner instruction 2026-11-21: publish `tsukuru` first. Tracking: JUN-1427.
 
@@ -124,10 +124,25 @@ Owner instruction 2026-11-21: publish `tsukuru` first. Tracking: JUN-1427.
   `bafyreihvjkyvedfrlcnula54sygynp6y6xvxmhb5ymkq57kbuhzdl7hwoe`. `GET https://yataverse.com/ipfs/<root>`
   answers 200 (131 bytes). The root was not compared with `ipfs add` this time (no local IPFS
   repository); the packer was compared on 2026-11-21 in `docs/unixfs-kubo-comparison-2026-11-21.md`.
-- **Still to do.** Change the TXT record `_dnslink.tsukuru.itonami.app` to
-  `dnslink=/ipfs/bafybeieevppwzv7b3ifwkvovqlcauibsd5aphnu6koxj37uirs7bce76ai` in the Cloudflare
-  dashboard (replace the old value; exactly one record), then run section 6. Until then
-  `https://tsukuru.itonami.app/` answers 504 after about 15 s.
+- **DNS record changed.** Owner instruction 2026-11-21: the TXT record
+  `_dnslink.tsukuru.itonami.app` was edited in the Cloudflare dashboard (account `cloud-kotoba`)
+  at about 14:16Z, from the old value to
+  `dnslink=/ipfs/bafybeieevppwzv7b3ifwkvovqlcauibsd5aphnu6koxj37uirs7bce76ai`. One record, TTL
+  5 min, DNS only. The authoritative server, 1.1.1.1 and the DoH endpoint the Worker uses all
+  returned the new value at 14:17:05Z.
+- **Checked 14:17:07Z to 14:17:21Z.**
+
+  | Request | Answer |
+  |---|---|
+  | `GET https://tsukuru.itonami.app/` | 200, `text/html; charset=utf-8`, `x-ipfs-roots` = the root, body sha256 `b8d15e9d…5cd367` (equals the source `index.html`) |
+  | `GET /index.html` | same digest |
+  | `GET /mk1-enclosure-sandwich.usda` | 200, sha256 `24040fa0…ec1a48` (equals the source), `application/octet-stream` |
+  | `HEAD /` | 200 |
+  | `GET /nope`, `GET /health` | 404 `not-found` |
+  | `PUT /ipfs/x` | 405 |
+  | `https://yataverse.com/health`, `https://x-probe.itonami.app/` | 200, 404 (unchanged) |
+
+- **Not checked.** A browser rendering the page; a node serving the same root (section 8).
 
 ## 3. Before deploying
 
