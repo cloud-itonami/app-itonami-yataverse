@@ -34,7 +34,8 @@ test('put --codec dag-cbor writes a dag-cbor CID; non-canonical bytes and unknow
   assert.ok(r.cid.startsWith('bafyrei'));
   const before = s.log.length;
   await assert.rejects(client.putBytes(Buffer.from('a2616201616102', 'hex'), { codec: 'dag-cbor' }), (e) => e.code === 'not-canonical-dag-cbor:map-keys-not-sorted');
-  await assert.rejects(client.putBytes(doc, { codec: 'dag-pb' }), (e) => e.code === 'put-codec-not-accepted');
+  await assert.rejects(client.putBytes(doc, { codec: 'dag-json' }), (e) => e.code === 'put-codec-not-accepted');
+  await assert.rejects(client.putBytes(doc, { codec: 'dag-pb' }), (e) => e.code.startsWith('not-accepted-unixfs:'));   // dag-pb must be UnixFS
   assert.equal(s.log.length, before);
 }));
 

@@ -30,7 +30,7 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse canonical-cid <cid>        normalize a CIDv0 or CIDv1 to CIDv1 base32
   yataverse get <cid> [-o file]        read a block, verified against its CID (stdout if no -o)
   yataverse verify <cid>               is it present, and do the served bytes hash to it?
-  yataverse put <file|-> [--codec raw|dag-cbor]  publish a block (dag-cbor must be canonical), then read it back and verify
+  yataverse put <file|-> [--codec raw|dag-cbor|dag-pb]  publish a block (dag-cbor must be canonical, dag-pb a UnixFS node), then read it back and verify
   yataverse car-put <file.car|->       import a CARv1/CARv2 (roots + complete closure), then export and compare
       put and car-put also verify the signed storage receipt (required from yataverse.com) and print it.
       [--request-id <64 hex>]          reuse an id to retry a write and get the same receipt back

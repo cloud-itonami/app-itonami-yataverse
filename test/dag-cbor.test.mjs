@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { validateDagCbor, MAX_DEPTH } from '../src/dag-cbor.mjs';
 import { checkWritableBlock } from '../src/block.mjs';
-import { cidFor, rawCid, CODEC_DAG_CBOR, CODEC_RAW } from '../src/cid.mjs';
+import { cidFor, rawCid, base32, CODEC_DAG_CBOR, CODEC_RAW } from '../src/cid.mjs';
 
 const h = (s) => Buffer.from(s.replace(/\s+/g, ''), 'hex');
 const cidBytes = (bytes) => Buffer.concat([h('01551220'), crypto.createHash('sha256').update(bytes).digest()]);
@@ -63,8 +63,12 @@ test('checkWritableBlock: raw and canonical dag-cbor pass; other codecs, mismatc
   const unsorted = h('a2 6162 01 6161 02');
   assert.equal(checkWritableBlock(cidFor(unsorted, CODEC_DAG_CBOR), unsorted), 'not-canonical-dag-cbor:map-keys-not-sorted');
   assert.equal(checkWritableBlock(cidFor(doc, CODEC_DAG_CBOR), h('01')), 'bytes-do-not-hash-to-cid');
-  assert.equal(checkWritableBlock('bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi', doc), 'put-codec-not-accepted');
+  assert.equal(checkWritableBlock('bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi', doc), 'bytes-do-not-hash-to-cid');
+  // dag-pb is accepted only as canonical UnixFS (test/dag-pb.test.mjs); arbitrary bytes are not.
+  assert.match(checkWritableBlock(cidFor(doc, 0x70), doc), /^not-accepted-unixfs:/);
+  const gitRaw = 'b' + base32(Buffer.concat([Buffer.from([0x01, 0x78, 0x12, 0x20]), crypto.createHash('sha256').update(doc).digest()]));
+  assert.equal(checkWritableBlock(gitRaw, doc), 'put-codec-not-accepted');
   assert.equal(checkWritableBlock('QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG', doc), 'put-requires-cidv1-sha2-256');
-  assert.throws(() => cidFor(doc, 0x70), RangeError);
+  assert.throws(() => cidFor(doc, 0x78), RangeError);
   assert.equal(cidFor(doc, CODEC_RAW), rawCid(doc));
 });

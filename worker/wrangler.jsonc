@@ -59,6 +59,12 @@
     // here when that key is provisioned. Empty: no PDS attestation is accepted.
     "SERVICE_AUTH_PDS_KEYS": "",
     "PLC_DIRECTORY_URL": "https://plc.directory",
+    // Name plane (worker/src/names.mjs, JUN-1414): comma-separated host suffixes, each starting
+    // with "." (for example ".itonami.app"). A host one label under a suffix is served as a site
+    // from its _dnslink TXT record. Empty: off. Turning it on also needs a route for those hosts
+    // on this Worker; that is a production route change and needs the owner's approval. Do not
+    // add the route or a suffix here as part of an unrelated deploy.
+    "NAME_PLANE_SUFFIXES": "",
     // Published receipt signing keys (/.well-known/yataverse-receipt-keys.json, did:web:yataverse.com).
     // keyId = sha256(0xed01 || public key). Times are Unix milliseconds. Rotation: add a key with
     // keyEpoch + 1, set notAfter on the old one and keep it listed; revocation sets revokedAt.
