@@ -1,7 +1,8 @@
 // UnixFS over the accepted DAG-PB subset (dag-pb.mjs): walk a path from a root, read a file,
 // and pack a small file tree the way `ipfs add -r --cid-version=1` does.
 import { parseCid, cidFor, CODEC_RAW, CODEC_DAG_PB } from './cid.mjs';
-import { decodeUnixfs, encodePbNode, encodeUnixfsData, hashOf, UNIXFS_TYPE, DagPbError } from './dag-pb.mjs';
+import { decodeUnixfs, encodePbNode, encodeUnixfsData, hashOf, unixfsLinks, UNIXFS_TYPE, DagPbError } from './dag-pb.mjs';
+import { encodeCarV1 } from './car.mjs';
 
 export class UnixfsError extends Error { constructor(code, detail) { super(detail ? `${code}: ${detail}` : code); this.code = code; } }
 
@@ -88,6 +89,7 @@ function packDir(tree, blocks, chunkBytes) {
 /**
  * Pack files into a UnixFS directory. `files` maps a relative path ("a/b.html") to bytes.
  * -> { root, blocks: Map cid -> bytes }. Files larger than 174 chunks are refused.
+ * `blocks` is in post-order: every block comes after the blocks it links to.
  */
 export function packFiles(files, { chunkBytes = DEFAULT_CHUNK_BYTES } = {}) {
   const tree = new Map();
@@ -106,4 +108,26 @@ export function packFiles(files, { chunkBytes = DEFAULT_CHUNK_BYTES } = {}) {
   }
   const blocks = new Map();
   return { root: packDir(tree, blocks, chunkBytes).cid, blocks };
+}
+
+/**
+ * Split a packed site into CARs small enough for one import each (the Worker's limits are
+ * 256 blocks and 32 MiB per CAR). Import them in order: each CAR's closure is complete given
+ * the CARs before it, and its roots are the blocks no other block in the same CAR links to.
+ * -> [{ roots, blocks, bytes, car }]
+ */
+export function siteCars(blocks, { maxBlocks = 200, maxBytes = 24 * 1024 * 1024 } = {}) {
+  const batches = []; let cur = []; let size = 0;
+  for (const [cid, bytes] of blocks) {
+    if (bytes.length > maxBytes) throw new UnixfsError('block-larger-than-car-limit', cid);
+    if (cur.length && (cur.length + 1 > maxBlocks || size + bytes.length > maxBytes)) { batches.push(cur); cur = []; size = 0; }
+    cur.push({ cid, bytes }); size += bytes.length;
+  }
+  if (cur.length) batches.push(cur);
+  return batches.map((batch) => {
+    const linked = new Set();
+    for (const { cid, bytes } of batch) if (parseCid(cid).codec === CODEC_DAG_PB) for (const l of unixfsLinks(bytes)) linked.add(l);
+    const roots = batch.filter((b) => !linked.has(b.cid)).map((b) => b.cid);
+    return { roots, blocks: batch.length, bytes: batch.reduce((n, b) => n + b.bytes.length, 0), car: Buffer.from(encodeCarV1(roots, batch)) };
+  });
 }

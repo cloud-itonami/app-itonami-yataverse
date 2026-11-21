@@ -51,6 +51,16 @@ export function isNameHost(hostname, env) {
   return nameSuffixes(env).some((s) => host.endsWith(s) && LABEL.test(host.slice(0, -s.length)));
 }
 
+/**
+ * true when `hostname` is a configured suffix's own domain or anything under it. Such a host
+ * is either a name host or nothing: the bytes-plane API is never served there, so a wildcard
+ * route for the suffix cannot expose the API on unexpected hosts (the apex, deeper labels).
+ */
+export function underNameSuffix(hostname, env) {
+  const host = String(hostname).toLowerCase();
+  return nameSuffixes(env).some((s) => host.endsWith(s) || host === s.slice(1));
+}
+
 const cache = new Map();   // host -> { at, value }
 /** For tests: forget cached DNSLink answers. */
 export function clearNameCache() { cache.clear(); }

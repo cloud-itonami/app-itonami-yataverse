@@ -52,7 +52,7 @@ import { handleDrivePack, DRIVE_PACK_PATH } from './drive-packs.mjs';
 import { admitWriteRequest, admitWriteBytes } from './write-limits.mjs';
 import { isServiceAuth, verifyServiceAuth, IMPORT_CAR_LXM } from './service-auth.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
-import { isNameHost, handleName } from './names.mjs';
+import { isNameHost, underNameSuffix, handleName } from './names.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
 // Each imported block costs two store subrequests (PUT, readback GET) and each exported block
@@ -579,6 +579,8 @@ export async function handle(request, env, deps = {}) {
     try { return await handleName(request, url, env, deps, (cid) => readBlock(cid, env, deps, store)); }
     catch (e) { return storeFailure(e); }
   }
+  // Any other host under a name suffix (its apex, deeper labels) is not a site and not the API.
+  if (underNameSuffix(url.hostname, env)) return fail(404, 'not-a-name-host', { 'cache-control': 'no-store' });
   if (url.pathname === '/ipfs' || url.pathname.startsWith('/ipfs/')) {
     const methods = (url.pathname === '/ipfs' || url.pathname === '/ipfs/') ? 'POST' : 'GET, HEAD';
     if (request.method === 'OPTIONS') return ipfsPreflight(request, env, methods);
