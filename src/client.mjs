@@ -14,7 +14,8 @@
 // when receipts are required: by default for https://yataverse.com, or cfg.requireReceipt.
 import crypto from 'node:crypto';
 import { cidFor, verifyBlock, isCidShape, cidToBytes, parseCid } from './cid.mjs';
-import { verifyReceipt, envelopeFromJson, envelopeToDagCbor, rootsCommitment, blockSetDigest, requesterFor, KIND, ReceiptError } from './receipt.mjs';
+import { verifyReceipt, envelopeFromJson, envelopeToDagCbor, rootsCommitment, blockSetDigest, requesterFor, KIND, STORE_CLASS, ReceiptError } from './receipt.mjs';
+import { verifyLease, leaseEnvelopeToDagCbor, receiptCountsFor, RetentionError } from './retention.mjs';
 import { checkWritableBlock, WRITABLE_CODECS } from './block.mjs';
 import { parseCar, CarError, CAR_CONTENT_TYPE } from './car.mjs';
 import { checkClosure, DagError } from './dag.mjs';
@@ -64,6 +65,7 @@ async function readCapped(res, maxBytes) {
 export const RECEIPT_HOSTS = new Set(['yataverse.com']);
 const RECEIPT_KEYS_PATH = '/.well-known/yataverse-receipt-keys.json';
 export const REQUEST_ID_HEADER = 'yataverse-request-id';
+export const LEASE_HEADER = 'yataverse-lease';
 
 export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureForTests = false, receiptKeys: pinnedKeys } = {}) {
   const readOrigin = new URL(cfg.readUrl);
@@ -137,7 +139,7 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
   }
 
   /** PUT one block. -> { body (parsed JSON or null), requestId, auth }. */
-  async function putBlock(cid, bytes, { requestId } = {}) {
+  async function putBlock(cid, bytes, { requestId, leaseHeader } = {}) {
     if (!isCidShape(cid)) throw new YataverseError('bad-cid');
     const bad = checkWritableBlock(cid, bytes);
     if (bad) throw new YataverseError(bad);
@@ -148,24 +150,54 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
     const rid = newRequestId(requestId);
     const res = await fetchImpl(new URL(`${cfg.prefix}${cid}`, base), {
       method: 'PUT', redirect: 'manual', signal: timeout(),
-      headers: { authorization: auth, 'content-type': 'application/vnd.ipld.raw', [REQUEST_ID_HEADER]: rid.toString('hex') }, body: bytes,
+      headers: { authorization: auth, 'content-type': 'application/vnd.ipld.raw', [REQUEST_ID_HEADER]: rid.toString('hex'),
+                 ...(leaseHeader ? { [LEASE_HEADER]: leaseHeader } : {}) }, body: bytes,
     });
     if (res.status >= 200 && res.status < 300) return { body: await jsonOrNull(res), requestId: rid, auth };
     if (REDIRECTS.has(res.status)) throw new YataverseError('put-redirected', 'a write is never followed to another host');
+    // A leased write is refused for reasons a plain write never meets; pass the host's own code on.
+    if (leaseHeader) {
+      const j = await jsonOrNull(res);
+      const code = typeof j?.error === 'string' && /^[a-z0-9-]{1,80}$/.test(j.error) ? j.error : `http-${res.status}`;
+      throw new YataverseError(`leased-put-${code}`, `HTTP ${res.status}`);
+    }
     const why = { 401: 'unauthorized', 403: 'forbidden', 405: 'method-not-allowed', 409: 'request-id-conflict', 413: 'too-large', 400: 'rejected-as-not-matching-cid' }[res.status];
     throw new YataverseError(why ? `put-${why}` : 'put-failed', `HTTP ${res.status}`);
   }
 
   /** Write bytes, verify the receipt, then read them back and verify. -> {cid, verified, bytes, receipt...} */
-  async function putBytes(bytes, { codec = 'raw', requestId } = {}) {
+  async function putBytes(bytes, { codec = 'raw', requestId, lease } = {}) {
     if (!(codec in WRITABLE_CODECS)) throw new YataverseError('put-codec-not-accepted', codec);
     const cid = cidFor(bytes, WRITABLE_CODECS[codec]);
-    const put = await putBlock(cid, bytes, { requestId });
+    // With a lease (a full envelope: requester and verifier signatures) the write asks for a
+    // retention promise. Check the lease against the host's published keys and against these bytes
+    // before sending anything.
+    let leaseChecked = null, leaseHeader;
+    if (lease) {
+      try { leaseChecked = await verifyLease(lease, await receiptKeys()); }
+      catch (e) { if (e instanceof RetentionError) throw new YataverseError(`lease-${e.code}`); throw e; }
+      const subject = cidToBytes(cid);
+      if (leaseChecked.subject.length !== subject.length || !leaseChecked.subject.every((x, i) => x === subject[i])) throw new YataverseError('lease-is-for-another-block');
+      if (leaseChecked.size !== bytes.length) throw new YataverseError('lease-size-mismatch');
+      leaseHeader = Buffer.from(leaseEnvelopeToDagCbor(lease).bytes).toString('base64url');
+    }
+    const put = await putBlock(cid, bytes, { requestId, leaseHeader });
     const receipt = await checkReceipt(put.body, { kind: KIND.block, subject: cidToBytes(cid), contentDigest: new Uint8Array(parseCid(cid).digest),
       size: bytes.length, requestId: put.requestId, requester: requesterFor(put.auth) });
+    let archive;
+    if (leaseChecked) {
+      // The answer must be the retention promise that was asked for, not an ordinary gateway receipt.
+      if (!receipt.receiptVerified) throw new YataverseError('leased-put-without-receipt');
+      const r = envelopeFromJson(put.body.receipt).receipt;
+      if (r.storeClass !== STORE_CLASS.operatorArchive) throw new YataverseError('leased-put-answered-without-a-retention-receipt');
+      try { receiptCountsFor(r, leaseChecked); } catch (e) { if (e instanceof RetentionError) throw new YataverseError(`leased-put-${e.code}`); throw e; }
+      const a = put.body.archive;
+      archive = { versionId: typeof a?.versionId === 'string' ? a.versionId : null, lockMode: typeof a?.lockMode === 'string' ? a.lockMode : null,
+                  retentionUntil: new Date(r.retentionUntil).toISOString(), leaseId: '0x' + Buffer.from(r.leaseId).toString('hex') };
+    }
     const back = await get(cid);
     if (!back) throw new YataverseError('readback-absent');
-    return { cid, verified: true, bytes: bytes.length, ...receipt };
+    return { cid, verified: true, bytes: bytes.length, ...receipt, ...(archive ? { archive } : {}) };
   }
 
   async function verifyRemote(cid) {

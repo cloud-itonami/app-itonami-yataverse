@@ -204,6 +204,29 @@ export async function verifyLease(env, keys) {
   return l;
 }
 
+// A lease proposal is a lease the requester has signed and the verifier has not: the form in which
+// it travels to the verifier for the second signature. It is not a lease and verifyLease refuses it.
+export const leaseProposalToJson = (p) => ({ v: 1, lease: fieldsToJson(LEASE_FIELDS, checkLease(p.lease)), sigs: { requester: sigToJson(p.sigs.requester, 'publicKey') } });
+
+export function leaseProposalFromJson(j) {
+  if (!j || j.v !== 1 || !j.lease || !j.sigs?.requester) bad('not-a-v1-lease-proposal');
+  if (j.sigs.verifier !== undefined) bad('proposal-already-has-a-verifier-signature');
+  return { v: 1, lease: checkLease(fieldsFromJson(LEASE_FIELDS, j.lease)), sigs: { requester: sigFromJson(j.sigs.requester, 'publicKey') } };
+}
+
+/** Check a proposal: the lease id is its own and the requester named in it signed it. -> the lease. */
+export async function verifyLeaseProposal(p) {
+  if (!p || p.v !== 1) bad('not-a-v1-lease-proposal');
+  const l = checkLease(p.lease);
+  const digest = leaseDigest(l);
+  const rq = p.sigs?.requester;
+  if (!rq) bad('requester-signature-missing');
+  checkSigShape(rq, 'publicKey');
+  if (!sameBytes(keyIdFor(rq.publicKey), l.requester)) bad('requester-key-does-not-match-lease');
+  if (!(await verifyEd25519(rq.publicKey, rq.sig, digest))) bad('bad-requester-signature');
+  return l;
+}
+
 export const leaseEnvelopeToJson = (env) => ({ v: 1, lease: fieldsToJson(LEASE_FIELDS, checkLease(env.lease)),
   sigs: { requester: sigToJson(env.sigs.requester, 'publicKey'), verifier: sigToJson(env.sigs.verifier, 'key') } });
 
