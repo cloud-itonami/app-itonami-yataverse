@@ -1,8 +1,8 @@
 # The gateway's B2 key: what it needs, and how to replace it
 
 Tracking: AWAI-3754 (parent AWAI-3618). Status on 2026-11-21: the permissions the Worker needs are
-fixed by tests; the narrow key **exists and was checked against the real bucket** (section 4a);
-the Worker's secrets have **not** been changed. Replacing them needs the owner's approval.
+fixed by tests; the narrow key exists and was checked against the real bucket (section 4a), and
+**the Worker has used it since 2026-11-21T14:56Z** (section 4b).
 
 ## 1. State on 2026-11-21 (read-only checks)
 
@@ -146,6 +146,39 @@ Owner approval 2026-11-21 for creating the key and checking it from a workstatio
 - **Not checked:** CAR import, Drive packs, service-auth writes, status publication and leased
   writes with this key (they use the same three request kinds, which the test suite pins, but
   they were not run against the real bucket); behaviour under load.
+
+## 4b. Steps 3 and 4 as carried out, 2026-11-21
+
+Owner approval 2026-11-21 for replacing the Worker's secrets.
+
+- **Before.** `/health` 200. A block production serves (13,334 bytes) was read with the new key
+  at `yataverse-blocks/ipld/<cid>`: same bytes, hashing to the CID. This confirms the bucket and
+  prefix behind the unreadable `B2_BUCKET` secret. Deployed version
+  `a9f8bdfd-32f1-470d-b595-b825e104b9dc` (created 14:44:00Z, policy source `4ff2563e`).
+- **Change.** `wrangler secret bulk` (wrangler 4.103.0, account `cloud-kotoba`) with `B2_KEY_ID`
+  and `B2_APP_KEY`, between 14:56:02Z and 14:56:08Z. It produced **one** deployment, source
+  "Secret Change", version `f7f932f1-b8f3-471b-993f-8ab69dbda66b` (14:56:08Z). The code is
+  unchanged. The temporary file holding the two values was removed.
+- **After.**
+
+  | Request | Answer |
+  |---|---|
+  | `GET /health` | 200 |
+  | `GET /ipfs/<the block read before>` | 200, 13,334 bytes |
+  | `yataverse put` of a new 69-byte block | stored, receipt verified |
+  | `GET /ipfs/<that block>` | 200, same bytes, no cache status header |
+  | `GET /ipfs/<another stored block, not read earlier>` | 200, 552,409 bytes |
+  | `GET /.well-known/yataverse-receipt-keys.json` | 200 |
+  | `GET /ipfs/<a CID that is not stored>` | 504 `read-fallback-unreachable` after 15.6 s, as before the change (the store answered "absent"; the fallback reader does not answer) |
+
+- **Not checked in production:** CAR import, Drive packs, service-auth and CACAO writes, status
+  publication, name-plane reads of a multi-block file.
+- **Going back** (section 5): the previous version is `a9f8bdfd-…`. Whether `wrangler rollback`
+  to it restores the previous secret values was not tried.
+- **Still open:** the old key `260913` is untouched and still valid. Whether the Worker was
+  using it cannot be shown from here (the old secret value was never readable); if it was,
+  that key is no longer needed by the gateway, and reducing or retiring it is the owner's call
+  once its other users are known.
 
 ## 5. Going back
 
