@@ -7,6 +7,10 @@ import { loadConfig, saveConfig, status, configDir, ConfigError } from './config
 import { makeAuthorizer } from './auth.mjs';
 import { makeClient } from './client.mjs';
 import { verifyReceiptInput } from './verify-receipt.mjs';
+import { envelopeFromJson, importSigningKey } from './receipt.mjs';
+import { leaseEnvelopeFromJson, statusEnvelopeToJson, statusEnvelopeToDagCbor } from './retention.mjs';
+import { runVerifierOnce } from './verifier.mjs';
+import { makeArchiveProbe } from './archive-probe.mjs';
 import { serve } from './mcp.mjs';
 import { keygen, adminStatus, makeAdmin, AdminError } from './admin.mjs';
 import { canonicalAssetManifest } from './asset-manifest.mjs';
@@ -27,6 +31,15 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse verify-receipt <response.json|-> [--keys <file>] [--file <path> --kind block|car|drive-pack [--codec raw|dag-cbor]]
                                        check a saved receipt: signature, key validity at acceptedAt, state; with
                                        --file, also the subject, digest and size recomputed from the file
+  yataverse retention-verify-once --lease <lease.json> --keys <keys.json> --signing-key-file <jwk> --key-epoch <n>
+                        [--receipts <a.json,b.json,...>] [--inventory <cids.json>] [--sample-read true]
+                        [--archive-endpoint U --archive-bucket B [--archive-prefix P] [--archive-region R]]
+                        [--evidence-out <file>]
+                                       one run of the retention verifier: check the lease, the receipts and the
+                                       operator's archive copy, and print a signed retention status. The signing
+                                       key file must be readable by its owner only. Archive credentials come from
+                                       YATAVERSE_ARCHIVE_KEY_ID / YATAVERSE_ARCHIVE_APP_KEY. Provider proofs are not
+                                       implemented, so a lease of grade R2 or R3 is reported as degraded.
   yataverse car-get <cid> [--scope all|block] [-o file.car]  export a root as a verified CARv1
   yataverse asset-manifest <json|->    validate and canonicalize a training-asset manifest
   yataverse training-run-manifest <json|-> validate and canonicalize run provenance (unverified)
@@ -171,7 +184,7 @@ function flags(argv) {
   return out;
 }
 
-export async function main(argv, { stdout = process.stdout, stderr = process.stderr, fetchImpl } = {}) {
+export async function main(argv, { stdout = process.stdout, stderr = process.stderr, fetchImpl, now = Date.now, env = process.env } = {}) {
   const [cmd, ...rest] = argv;
   const f = flags(rest);
   const out = (x) => stdout.write(typeof x === 'string' ? x : JSON.stringify(x, null, 2) + '\n');
@@ -219,6 +232,25 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         const input = JSON.parse(readInput(f._[0]).toString('utf8'));
         const keys = f.keys ? JSON.parse(fs.readFileSync(f.keys, 'utf8')) : await makeClient(loadConfig(), fetchImpl ? { fetchImpl } : {}).receiptKeys();
         out(await verifyReceiptInput(input, keys, { file: f.file ? fs.readFileSync(f.file) : undefined, kind: f.kind, codec: f.codec }));
+        return 0;
+      }
+      case 'retention-verify-once': {
+        for (const k of ['lease', 'keys', 'signingKeyFile', 'keyEpoch']) if (!f[k]) { stderr.write(`yataverse: retention-verify-once needs --${k.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase())}\n`); return 2; }
+        const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
+        // The verifier's private key: refuse a file that anyone but its owner can read.
+        if (process.platform !== 'win32' && (fs.statSync(f.signingKeyFile).mode & 0o077) !== 0) { stderr.write('yataverse: signing-key-file-is-readable-by-others (chmod 600)\n'); return 1; }
+        const signer = await importSigningKey(fs.readFileSync(f.signingKeyFile, 'utf8'));
+        const receiptEnvs = (f.receipts ? f.receipts.split(',').filter(Boolean) : []).map((p) => {
+          const j = readJson(p); return envelopeFromJson(j && j.v === 1 && j.sig ? j : j?.receipt);
+        });
+        const probe = f.archiveEndpoint ? makeArchiveProbe({ endpoint: f.archiveEndpoint, bucket: f.archiveBucket, prefix: f.archivePrefix ?? '',
+          region: f.archiveRegion, keyId: env.YATAVERSE_ARCHIVE_KEY_ID, secret: env.YATAVERSE_ARCHIVE_APP_KEY, ...(fetchImpl ? { fetchImpl } : {}) }) : null;
+        const run = await runVerifierOnce({ leaseEnv: leaseEnvelopeFromJson(readJson(f.lease)), receiptEnvs, keys: readJson(f.keys), probe, signer,
+          keyEpoch: Number(f.keyEpoch), now: now(), inventory: f.inventory ? readJson(f.inventory) : undefined, sampleRead: f.sampleRead === 'true' });
+        if (f.evidenceOut) fs.writeFileSync(f.evidenceOut, run.evidence.bytes, { flag: 'wx' });
+        out({ summary: run.summary, status: statusEnvelopeToJson(run.status), statusCid: statusEnvelopeToDagCbor(run.status).cid,
+              evidenceCid: run.evidence.cid, evidenceRoot: '0x' + Buffer.from(run.evidence.root).toString('hex'),
+              published: false, note: 'nothing was published: the status and the evidence record exist only in this output' });
         return 0;
       }
       case 'get': case 'verify': case 'put': case 'token': case 'car-put': case 'car-get': {
