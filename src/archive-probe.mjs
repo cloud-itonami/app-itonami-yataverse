@@ -2,9 +2,13 @@
 // (docs/retention-design.md §8). It reads an object's length and Object Lock retention from a
 // HEAD response and, when asked, the object itself. It never writes, deletes or changes a lock.
 //
-// NOT YET CHECKED AGAINST BACKBLAZE B2: the header names below are the S3 API's
-// (x-amz-object-lock-mode, x-amz-object-lock-retain-until-date). Whether B2 returns them on HEAD,
-// and which application-key capability that needs, is to be confirmed when the bucket exists.
+// Checked against Backblaze B2 on 2026-11-21 (docs/retention-design.md §16, AWAI-3673): HEAD returns
+// x-amz-object-lock-mode and x-amz-object-lock-retain-until-date to a key with readFiles and
+// readFileRetentions. Two limits found there:
+// - This probe looks at the newest version of a name. A later unlocked write of the same name, or a
+//   hide marker, makes a locked older version invisible here, so the check fails (never passes wrongly).
+//   Checking the locked version by its id is still to be built.
+// - Without listFiles, B2 answers 403 instead of 404 for a missing object; head() then throws.
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 
 export class ArchiveProbeError extends Error { constructor(code) { super(code); this.code = code; } }

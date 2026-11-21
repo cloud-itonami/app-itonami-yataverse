@@ -51,15 +51,19 @@
 
 それでも種類を分けて数える理由: Object Lock は「運営者自身も消せない」という、`edge-gateway` にはない性質を持つ。これは約束として名乗ってよく、利用者が検査できる。
 
-### 3.1 B2 の 2 つの bucket
+### 3.1 B2 の bucket は 1 つ、lock はファイル単位
 
-| bucket | 用途 | Object Lock | 削除 |
-|---|---|---|---|
-| 配信用（既存の `yataverse-blocks`） | 書込みの受理、読み出し、受領証の保存 | かけない | 運営者が消せる |
-| 保持用（新設） | lease のある block と piece の保持コピー | **compliance mode**、期限は lease の `retentionUntil` | 期限まで誰も消せない |
+**改定（owner 決定 2026-11-21、[AWAI-3673](https://linear.app/kotobalabs/issue/AWAI-3673)）:** 保持用の bucket を新しく作らない。既存の `yataverse-blocks` で Object Lock を有効にし、lease のあるファイルにだけ lock をかける。当初の案（配信用と保持用の 2 つの bucket、§13 の決定 8）は、同じ bytes を二重に持つことになるので採らない。 この文書の他の節にある「保持用 bucket」は「`yataverse-blocks` のうち lock をかけたファイル」、「配信用 bucket」は「lock のないファイル」と読む。
 
-- 保持用 bucket に書く鍵は、配信用の鍵と分ける。Worker には、保持用 bucket への書込みと lock の読み取りだけを許す鍵を渡し、lock を短くする権限や削除の権限は渡さない。
-- B2 の仕様（2026-11-21 に公式文書で確認）: compliance mode の lock は誰も外せず、期限の延長だけができる。Object Lock は一度有効にすると無効にできない。期限は 1〜3,000 日。既存 bucket でも有効にできる。
+| ファイルの状態 | 意味 | 数え方 |
+|---|---|---|
+| lock なし（今あるすべてのファイル） | 入口の保存先。運営者が消せる | 数えない（`storeClass 1`） |
+| compliance の lock つき、期限は lease の `retentionUntil` 以上 | 期限まで誰も消せない | 運営者の保持コピー（`storeClass 3`） |
+
+- 「運営者も消せない」を保証するのは compliance の lock で、bucket や鍵の分離ではない。master key でも削除、期限の短縮、mode の変更、lock の解除はできなかった（§16 の実測）。
+- lock をかける権限（`writeFileRetentions`）は、入口の通常の書込みに使う鍵と分けることを推奨する。入口が侵害されても、勝手に長い lock をかけられないようにするため。
+- bucket に既定の保持期間は設定しない。設定すると、lease のない書込みにも lock がかかる。
+- B2 の仕様（2026-11-21 に公式文書で確認、§16 で実測）: compliance mode の lock は誰も外せず、期限の延長だけができる。Object Lock は一度有効にすると無効にできない。既存 bucket でも有効にでき、既存のファイルには lock がかからない。
 - **未確認:** account の閉鎖や支払いの停止が lock 中のファイルに与える影響は、公式文書に記載がなかった。運営者の約束の限界として policy に明記する（§9）。
 
 ### 3.2 保持の等級
@@ -257,7 +261,7 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
 | 5 | L1 ができるまでの challenge の乱数源 | 検証役の commitment の連鎖（外部への依存なし） | 公開の乱数 beacon（外部サービスへの依存が増える）。検証役が毎回選ぶだけ（provider と結託すると選び直せる） |
 | 6 | 移行期（R1、R2）の終わり | 3 つの独立した provider node で R3 の受入（§14 の S3）が通った時点で、新しい lease の既定を R3 にする。R1 と R2 は選べるまま残す | 期日で終える。または終えない |
 | 7 | 最初の provider node | 会社の管理する既知の 2 台（別の場所、別の回線）から始める。機器は owner が選ぶ | 最初から外部の参加者を入れる（Sybil と障害ドメインの確認が先に要る） |
-| 8 | 保持用 bucket の置き場所 | 配信用と同じ account の別 bucket から始める | 別の account・別の region（B2 の複製は region が違うと別 account が要る。account の喪失に強くなるが、運用が増える） |
+| 8 | 保持用 bucket の置き場所 | ~~配信用と同じ account の別 bucket から始める~~ → **改定（2026-11-21）: 新しい bucket を作らず、既存の `yataverse-blocks` でファイル単位の lock を使う（§3.1）** | 別の bucket、または別の account・別の region（account の喪失に強くなるが、二重の保存と運用が増える） |
 
 ## 14. 段階と受入
 
@@ -273,7 +277,7 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
 
 ## 15. この設計で確かめていないこと
 
-- B2 の Object Lock を実際に操作していない。§3.1 の仕様は公式文書の記述による。S3 互換 API での lock の header と、必要な鍵の権限の名前は S1 で確かめる。
+- ~~B2 の Object Lock を実際に操作していない。~~ 2026-11-21 に `yataverse-blocks` で確かめた（§16 の S1-2a）。
 - B2 の費用、保持用 bucket への二重書きによる書込みの遅延、Worker の実行時間の上限への影響は測っていない。
 - P1 の parameter（leaf の大きさなど）は案で、test vector がない。
 - provider node の実装は存在しない。ADR 0041 は Proposed のままである。
@@ -300,3 +304,15 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
   - **鍵の扱い:** 署名鍵は file から読む。所有者以外が読める file は使わない。保持用 bucket の資格情報は環境変数（`YATAVERSE_ARCHIVE_KEY_ID`、`YATAVERSE_ARCHIVE_APP_KEY`）から読む。どちらも出力しない。probe は HEAD と GET だけを送る。
   - **確認（2026-11-21）:** `npm test` は 135 件すべて通過（既存 126、追加 9）。検査 8 か所を 1 つずつ外すと、どれも test が失敗した。
   - **未確認・未実装:** 本物の B2 bucket に対しては一度も実行していない。HEAD の応答に lock の header（`x-amz-object-lock-mode`、`x-amz-object-lock-retain-until-date`）が含まれるか、どの鍵の権限が要るかは、bucket を作ってから確かめる。状態と根拠の公開（§6 の endpoint）、定期実行、検証役を別の主体として動かす運用は未実装で、command は結果を出力するだけである。
+- **S1-2a Object Lock の有効化と実測（[AWAI-3673](https://linear.app/kotobalabs/issue/AWAI-3673)、2026-11-21）:** owner の承認を得て、`yataverse-blocks` で Object Lock を有効にした（`b2_update_bucket` の `fileLockEnabled: true`、revision 2 → 3）。既定の保持期間は設定していない。この操作は戻せない。
+  - **有効化の前後:** 複製の設定なし、lifecycle rule なし、暗号化 SSE-B2 は変わらない。有効化の後も、yataverse.com 経由の既存 block の読み出しと、既に書いた内容の再書き込みは成功した（受領証は従来どおり `storeClass 1`、`retentionUntil` 0）。
+  - **試験ファイル:** `retention-test/bafkreifvebjgohuatxem7xjaczvxcrcr6zitxu3dohi6s6jgvbqdgaz3pa`（50 bytes）を compliance、期限 2026-11-22T06:21:50Z で置いた。期限まで消せないので、期限の後に消す。
+  - **lock の実測（master key で実行）:** その version の削除は拒否された（`bypassGovernance` を付けても同じ）。期限の短縮、governance への変更、lock の解除も拒否された。期限の延長は成功した。
+  - **version についての発見（設計に影響する）:**
+    - 同じ名前に lock なしで書き直すと、lock のない新しい version ができ、名前での参照はその新しい version を返す。lock された古い version は残る。入口は再送のたびに保存をやり直すので、lock をかけた後に同じ block が書き直されると、名前で見た lock は「なし」になる。
+    - 名前を隠す操作（S3 の version 指定なしの DELETE に当たる）は成功し、名前では見えなくなる。lock された version は残り、隠す印を消すと元に戻る。
+    - したがって、**lock の確認は名前ではなく version を指して行う必要がある。** 受領証の発行（S1-2b）で、lock をかけた version の id を記録し、検証役がその version を確認する形にする。今の検証役は名前で見るので、上の 2 つの場合に `degraded` と判定する（安全側の誤りで、`policy-satisfied` を誤って出すことはない）。
+  - **S3 互換 API の応答:** HEAD は `x-amz-object-lock-mode`（値は `COMPLIANCE`）、`x-amz-object-lock-retain-until-date`（ISO 8601）、`x-amz-version-id` を返した。lock のないファイルではこれらの lock の header がない。
+  - **鍵:** 検証役用に、この bucket だけに絞った読み取り専用の application key `yataverse-retention-verifier-ro` を作った（権限は `readFiles` と `readFileRetentions`）。この 2 つで HEAD の lock の header と GET が読めた。存在しないファイルへの HEAD は 404 ではなく 403 になる（一覧の権限がないため）。検証役はこれを確認の失敗として扱い、`degraded` と判定する。
+  - **検証役の実行（本物の B2、鍵と lease と受領証はその場かぎりの試験用）:** lease の期限が lock より前なら `policy-satisfied`（全読みの digest も一致）。lease の期限が lock より後なら `degraded`（`lock-ends-before-the-lease`）。lock のない本番の block は `degraded`（`not-locked`）。bucket にない block は `degraded`（`probe-failed:head-http-403`）。
+  - **この段階で残っているもの:** Worker が lock をかける実装と `storeClass 3` の受領証の発行（S1-2b）、version を指した確認、入口の鍵の絞り込み（今この bucket に届く application key は、全 bucket 対象でほぼ全権限の 1 つだけ。Worker がどの鍵を使っているかは未確認）。
