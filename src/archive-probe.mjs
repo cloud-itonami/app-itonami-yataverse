@@ -8,7 +8,8 @@
 // - Without a versionId the probe sees the newest version of a name. A later unlocked write of the
 //   same name, or a hide marker, makes a locked older version invisible that way, so the check fails
 //   (never passes wrongly). Pass the versionId returned by the locking write to check that version.
-// - Without listFiles, B2 answers 403 instead of 404 for a missing object; head() then throws.
+// - Without listBuckets, B2 answers 403 instead of 404 for a missing object; head() then throws
+//   instead of reporting the object as absent. (listFiles does not change that: AWAI-3754, AWAI-3769.)
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 
 export class ArchiveProbeError extends Error { constructor(code) { super(code); this.code = code; } }
