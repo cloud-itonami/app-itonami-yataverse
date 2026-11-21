@@ -7,7 +7,7 @@ import { rawCid, parseCid, normalizeCid } from './cid.mjs';
 import { loadConfig, status } from './config.mjs';
 import { makeAuthorizer } from './auth.mjs';
 import { makeClient } from './client.mjs';
-import { makeAdmin, adminStatus } from './admin.mjs';
+import { makeAdmin, adminStatus, loadKey } from './admin.mjs';
 import { canonicalAssetManifest } from './asset-manifest.mjs';
 import { assetDidRecord } from './asset-did.mjs';
 
@@ -122,7 +122,7 @@ export async function callTool(name, a, deps = {}) {
       if (name === 'yataverse_sa_rotate') return j(await admin.saRotate(a.tenant, a.id));
       if (name === 'yataverse_sa_revoke') return j(await admin.saRevoke(a.tenant, a.id));
     }
-    const authorize = makeAuthorizer(cfg, deps.auth);
+    const authorize = makeAuthorizer(cfg, { ...(cfg.authMode === 'cacao' ? { cacaoKey: loadKey() } : {}), ...deps.auth });
     const client = makeClient(cfg, { authorize, ...deps.client });
     if (name === 'yataverse_get') {
       const bytes = await client.get(a.cid, { maxBytes: GET_CAP });

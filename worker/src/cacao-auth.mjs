@@ -30,7 +30,9 @@
 //   implemented here.
 import crypto from 'node:crypto';
 import { ed25519 } from '@noble/curves/ed25519';
-import { siweMessage } from '../../src/cacao.mjs';
+import { siweMessage, blockResource, carResource } from '../../src/cacao.mjs';
+
+export { blockResource, carResource };
 
 export const NONCE_TTL_S = 120;
 export const MAX_LIFETIME_S = 300;
@@ -40,8 +42,6 @@ const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 const HEADER = /^CACAO ([A-Za-z0-9+/]{16,}={0,2})$/;
 
 export const isCacao = (authorization) => typeof authorization === 'string' && authorization.startsWith('CACAO ');
-export const blockResource = (cid) => `yataverse:put:${cid}`;
-export const carResource = (sha256Hex) => `yataverse:car:${sha256Hex}`;
 
 const configured = (env) => Boolean(env.CACAO_NONCE_SECRET && env.CACAO_AUD && env.CACAO_DOMAIN && env.CACAO_WRITER_DIDS);
 const b64url = (buf) => Buffer.from(buf).toString('base64url');

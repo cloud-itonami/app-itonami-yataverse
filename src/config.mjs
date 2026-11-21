@@ -45,6 +45,8 @@ export function loadConfig(env = process.env) {
     storage: env.YATAVERSE_STORAGE || file.storage || null,
     permissions: file.permissions || null,
     authCmd: null, saToken: null, staticAuth: null,
+    // 'cacao': sign each write with the admin key and a nonce from the service (auth.mjs).
+    authMode: env.YATAVERSE_AUTH_MODE || file.authMode || null,
   };
   if (env.YATAVERSE_AUTH_CMD) {
     try { cfg.authCmd = JSON.parse(env.YATAVERSE_AUTH_CMD); } catch { throw new ConfigError('auth-cmd-not-json'); }
@@ -64,11 +66,13 @@ export function validate(cfg) {
   if (cfg.saToken && !SA_PATTERN.test(cfg.saToken)) throw new ConfigError('sa-token-bad-shape');
   if (cfg.authCmd && !(Array.isArray(cfg.authCmd) && cfg.authCmd.length && cfg.authCmd.every((x) => typeof x === 'string')))
     throw new ConfigError('auth-cmd-not-an-argv-array');
+  if (cfg.authMode !== null && cfg.authMode !== 'cacao') throw new ConfigError('auth-mode-not-supported');
   return cfg;
 }
 
 /** Which way a write would be authorised — names only. */
 export function authSource(cfg) {
+  if (cfg.authMode === 'cacao') return 'cacao';
   if (cfg.authCmd) return 'auth-cmd';
   if (cfg.saToken && cfg.tenantId) return 'service-account';
   if (cfg.staticAuth) return 'static';
@@ -103,7 +107,7 @@ export function saveConfig({ url, readUrl, prefix, tenantId, storage, saToken },
 const loadShape = (f) => ({
   url: f.url || DEFAULT_URL, readUrl: f.readUrl || DEFAULT_READ_URL, prefix: f.prefix || DEFAULT_PREFIX,
   authnUrl: f.authnUrl || DEFAULT_AUTHN, tenantId: f.tenantId || null, storage: f.storage || null,
-  authCmd: f.authCmd || null,
+  authCmd: f.authCmd || null, authMode: f.authMode || null,
 });
 
 function writeAtomic(file, content, mode) {

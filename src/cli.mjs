@@ -21,10 +21,13 @@ import { statusName } from './verifier.mjs';
 import { runVerifierOnce } from './verifier.mjs';
 import { makeArchiveProbe } from './archive-probe.mjs';
 import { serve } from './mcp.mjs';
-import { keygen, adminStatus, makeAdmin, AdminError } from './admin.mjs';
+import { keygen, adminStatus, makeAdmin, loadKey, AdminError } from './admin.mjs';
 import { canonicalAssetManifest } from './asset-manifest.mjs';
 import { assetDidRecord } from './asset-did.mjs';
 import { canonicalTrainingRunManifest } from './training-run-manifest.mjs';
+
+/** The admin key is read only when the configured mode signs with it. */
+const cacaoDeps = (cfg) => (cfg.authMode === 'cacao' ? { cacaoKey: loadKey() } : {});
 
 const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobase)
 
@@ -105,6 +108,9 @@ Administration (Authn) — uses YOUR ed25519 key; the first sign-in creates the 
                                        'sa create' and 'sa rotate' store the one-time kb_sa_ secret (0600) as this
                                        machine's write credential; it is printed only with --print.
 
+With YATAVERSE_AUTH_MODE=cacao (or "authMode": "cacao" in config.json) every block and CAR write is signed
+with the admin key (yataverse admin keygen) over a fresh nonce from the service; the key's did:key must be
+listed as a writer there. Otherwise:
 Writes are authorised by, in order: YATAVERSE_AUTH_CMD / config authCmd (your minter, argv, no shell),
 a tenant service-account secret (~/.config/yataverse/sa-token, 0600) exchanged at Authn for a Biscuit,
 or a static value. This tool mints no credential; a service-account secret comes from a tenant admin.
@@ -413,7 +419,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
       case 'retention-publish': {
         for (const k of ['status', 'lease']) if (!f[k]) { stderr.write(`yataverse: retention-publish needs --${k}\n`); return 2; }
         const cfg = loadConfig();
-        const client = makeClient(cfg, { authorize: makeAuthorizer(cfg), ...(fetchImpl ? { fetchImpl } : {}), ...(f.keys ? { receiptKeys: JSON.parse(fs.readFileSync(f.keys, 'utf8')) } : {}) });
+        const client = makeClient(cfg, { authorize: makeAuthorizer(cfg, cacaoDeps(cfg)), ...(fetchImpl ? { fetchImpl } : {}), ...(f.keys ? { receiptKeys: JSON.parse(fs.readFileSync(f.keys, 'utf8')) } : {}) });
         const sj = JSON.parse(fs.readFileSync(f.status, 'utf8'));
         out(await publishRun(client, leaseEnvelopeFromJson(JSON.parse(fs.readFileSync(f.lease, 'utf8'))),
           statusEnvelopeFromJson(sj && sj.v === 1 && sj.sig ? sj : sj?.status), f.evidence ? fs.readFileSync(f.evidence) : null));
@@ -424,7 +430,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         const signer = await readSigningKey(f.signingKeyFile);
         const publish = f.publish === 'true';
         let client = null;
-        if (publish) { const cfg = loadConfig(); client = makeClient(cfg, { authorize: makeAuthorizer(cfg), ...(fetchImpl ? { fetchImpl } : {}), receiptKeys: JSON.parse(fs.readFileSync(f.keys, 'utf8')) }); }
+        if (publish) { const cfg = loadConfig(); client = makeClient(cfg, { authorize: makeAuthorizer(cfg, cacaoDeps(cfg)), ...(fetchImpl ? { fetchImpl } : {}), receiptKeys: JSON.parse(fs.readFileSync(f.keys, 'utf8')) }); }
         // One lease per <name>.lease.json; <name>.write.json, when present, is the leased write's response.
         const names = fs.readdirSync(f.registry).filter((n) => n.endsWith('.lease.json')).map((n) => n.slice(0, -'.lease.json'.length)).sort();
         const results = [];
@@ -450,7 +456,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
       }
       case 'get': case 'verify': case 'put': case 'token': case 'car-put': case 'car-get': {
         const cfg = loadConfig();
-        const authorize = makeAuthorizer(cfg);
+        const authorize = makeAuthorizer(cfg, cacaoDeps(cfg));
         if (cmd === 'token') { stdout.write(await authorize() + '\n'); return 0; }
         const client = makeClient(cfg, { authorize, ...(fetchImpl ? { fetchImpl } : {}),
           ...(f.keys ? { receiptKeys: JSON.parse(fs.readFileSync(f.keys, 'utf8')) } : {}) });

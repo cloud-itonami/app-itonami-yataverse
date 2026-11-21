@@ -72,6 +72,10 @@ function mint({ privateKey, did }, { aud, domain, resources = [], ttlSec = 300, 
   return { cacaoB64: Buffer.from(envelope).toString('base64'), did, iat, exp, nonce };
 }
 
+/** The one resource a write CACAO names (worker/src/cacao-auth.mjs checks the same strings). */
+export const blockResource = (cid) => `yataverse:put:${cid}`;
+export const carResource = (sha256Hex) => `yataverse:car:${sha256Hex}`;
+
 /** CACAO for a direct block write (`Authorization: CACAO <b64>`). */
 export const mintDirect = (key, opts) => mint(key, { ...opts, profile: 'direct' });
 
