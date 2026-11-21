@@ -232,8 +232,11 @@ that runs changed.
 - **With the key alone:** a write under `ipld/`, hiding the test block (`DELETE` by name),
   deleting the locked version, a read outside `ipld/`, a read in another bucket, and listing under
   `ipld/` were each answered `403`; the test block was still readable afterwards.
-- **Left in the bucket:** three objects under `ipld/zz-verifier-check/` (the block, locked until
-  2026-11-21T15:19:12Z; a policy block; an archive receipt record).
+- **Left in the bucket, then removed:** three objects under `ipld/zz-verifier-check/` (the
+  block, locked until 2026-11-21T15:19:12Z; a policy block; an archive receipt record). They were
+  deleted by version at 15:42:45Z (owner approval) and the prefix is empty. No test object from
+  the key work remains in the bucket; the two locked files under `retention-test/` from the
+  earlier lock experiments (locks until 2026-11-22T06:21:50Z and 06:32:25Z) are still there.
 - **State of the keys.** All three Yataverse keys are now limited to `yataverse-blocks` and
   `ipld/`:
 
