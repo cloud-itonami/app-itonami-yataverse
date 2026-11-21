@@ -1,7 +1,7 @@
 // A fake S3-compatible store with object versions and Object Lock, shared by the leased-write tests.
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { sha } from './worker-fixtures.mjs';
+import { sha, assertGatewayKeyIsEnough } from './worker-fixtures.mjs';
 
 /** A fake S3 with versions and Object Lock. `mode` injects faults into locking writes. */
 export function lockStore({ mode = 'ok' } = {}) {
@@ -12,6 +12,13 @@ export function lockStore({ mode = 'ok' } = {}) {
     assert.ok(cred === 'kid' || cred === 'lockkid', `unexpected credential ${cred}`);
     const k = u.pathname.replace('/bucket/', ''); const versionId = u.searchParams.get('versionId');
     const lock = h['x-amz-object-lock-mode'];
+    // The ordinary key stays within its documented permissions; only the lock key may set a
+    // retention or address a version, and it too only reads and writes single objects.
+    if (cred === 'kid') assertGatewayKeyIsEnough(u, method, h);
+    else {
+      assert.ok(['GET', 'HEAD', 'PUT'].includes(method), `the lock key does not allow ${method}`);
+      assert.deepEqual([...u.searchParams.keys()].filter((q) => q !== 'versionId'), []);
+    }
     log.push({ method, key: k, cred, versionId, lock: lock ?? null });
     const versions = objects.get(k) ?? [];
     if (method === 'PUT') {

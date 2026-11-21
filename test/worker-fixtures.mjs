@@ -32,6 +32,20 @@ export const ENV = {
 };
 export const NOW = () => new Date('2026-11-18T00:00:00Z');
 
+/**
+ * What the gateway's ordinary B2 key has to allow (docs/gateway-b2-key.md): read and write single
+ * objects under the bucket's prefix, nothing else. Every store request a Worker test makes with
+ * that key passes through here, so a new operation that needs more (delete, list, versions,
+ * retention, another path) fails the suite until the key's documented permissions are revisited.
+ */
+export function assertGatewayKeyIsEnough(u, method, headers = {}, prefix = '/bucket/ipld/') {
+  assert.ok(['GET', 'HEAD', 'PUT'].includes(method), `the gateway key does not allow ${method}`);
+  assert.ok(u.pathname.startsWith(prefix) && u.pathname.length > prefix.length, `outside the key's prefix: ${u.pathname}`);
+  assert.equal(u.search, '', `the gateway key reads objects by name only: ${u.search}`);
+  for (const h of Object.keys(headers))
+    assert.ok(!/^x-amz-(object-lock|bypass-governance|copy-source)/i.test(h), `the gateway key does not allow ${h}`);
+}
+
 /** In-memory B2 plus an optional fallback reader. `mode` injects faults. */
 export function fakeStore({ mode = 'ok', fallback = new Map() } = {}) {
   const objects = new Map(); const log = [];
@@ -40,6 +54,7 @@ export function fakeStore({ mode = 'ok', fallback = new Map() } = {}) {
     log.push({ host: u.host, method, path: u.pathname, auth: init.headers?.authorization ?? null, redirect: init.redirect });
     if (u.host === 's3.us-west-004.backblazeb2.com') {
       assert.match(init.headers.authorization, /^AWS4-HMAC-SHA256 Credential=kid\/20261118\/us-west-004\/s3\/aws4_request/);
+      assertGatewayKeyIsEnough(u, method, init.headers);
       const key = u.pathname.replace('/bucket/', '');
       if (method === 'PUT') {
         if (mode === 'put-fails') return new Response(null, { status: 500 });
