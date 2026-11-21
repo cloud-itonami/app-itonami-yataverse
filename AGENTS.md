@@ -7,6 +7,9 @@ queries. Storage APIs receive the declared content-addressed blocks or encrypted
 packs. Keep file names, private graph indexes and decryption material on the
 authorized client.
 
+Yataverse is the service; kotobase (`kotoba-lang/kotobase`) is a library it may depend on, never the reverse
+([ADR 0050](https://github.com/network-awai/network-awai-apex/blob/main/docs/adr/0050-kotobase-is-a-library-yataverse-is-the-service.md)). Do not add `kotobase.net` hosts or name a new service, host or repository "kotobase".
+
 - Reuse `src/drive-packs.mjs` for the existing bounded encrypted Drive pack
   protocol. Supply the app's canonical Kotoba operation broker and existing hash
   implementation. Keep app-specific descriptor, consent UI, WNFS and custody in
