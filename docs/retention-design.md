@@ -326,5 +326,14 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
   - **検証役:** probe と `runVerifierOnce` は version を指した確認に対応した（`versions`）。command は、書込みの応答の file から version を読む。lock の後に同じ名前へ lock なしで書き直されても、version を指せば `policy-satisfied` のままになる（test で確認）。
   - **SigV4:** query つきの request に対応した。AWS の文書の例（List Objects、Get Bucket Lifecycle）の署名と一致する。
   - **確認（2026-11-21）:** `npm test` は 140 件すべて通過（既存 135、追加 5）。検査 9 か所を 1 つずつ外すと、どれも test が失敗した。本物の B2 では、読み取り専用の鍵で、試験ファイルの version を指した HEAD と GET が成功した（version id は native API の fileId と同じ値、99 文字）。存在しない version は 403 になる。
-  - **未確認:** lock つきの保存（S3 の PutObject に lock の header を付ける）は、**本物の B2 に対して実行していない。** B2 がこの header を受け付けるか、`content-md5` が要るか、どの鍵の権限（`writeFiles` と `writeFileRetentions` の見込み）が要るかは、lock 用の鍵を発行してから確かめる。test は手元の偽の store に対するものである。
+  - ~~**未確認:** lock つきの保存は、本物の B2 に対して実行していない。~~ 2026-11-21 に確かめた（下の S1-2c）。
   - **deploy の前に要るもの（それぞれ owner の承認）:** lock 用の application key、保持用の署名鍵とその公開、検証役の鍵の公開、Worker の deploy。
+- **S1-2c lock つきの保存を本物の B2 で確認（[AWAI-3677](https://linear.app/kotobalabs/issue/AWAI-3677)、2026-11-21）:** owner の承認を得て、lock をかける application key `yataverse-retention-lock` を作った（`yataverse-blocks` だけ、権限は `writeFiles`・`writeFileRetentions`・`readFiles`・`readFileRetentions`、名前の prefix の制限なし）。merge 済みの Worker の handler（`f171f12`）を手元で動かし、lock 用の資格情報を使う呼び出しだけを本物の bucket に向けた。Worker は deploy していない。署名鍵、token、lease はその場かぎりの試験用。
+  - **結果:** lock の header（`x-amz-object-lock-mode: COMPLIANCE`、`x-amz-object-lock-retain-until-date`）と `content-md5` を付けた PutObject は 200 を返し、応答に `x-amz-version-id` があった。その version を指した HEAD は mode と期限を返し、GET の内容は CID に一致した。応答は 201 で、受領証は `storeClass 3`、`retentionUntil` は読み戻した lock の期限（lease の期限と同じ値）だった。受領証は `verifyReceipt` と `receiptCountsFor` を通った。
+  - **再送:** 同じ request id の再送は、同じ受領証と同じ version を返し、bucket への呼び出しは発生しなかった。
+  - **検証役:** 読み取り専用の鍵で、その version を指して実行し、`policy-satisfied`（全読みの digest も一致）。
+  - **native API での確認:** その version は `compliance`、期限 2026-11-22T06:32:25Z。master key での削除は拒否された。
+  - **見つかったこと: 入口の通常の鍵には `listFiles` が要る。** 一覧の権限のない鍵では、存在しない object への GET と HEAD が 404 ではなく 403 になる。Worker は 404 を「まだ無い」と読むので（受領証の記録、policy の block）、403 では書込みが 502 で止まる。最初の試行は、通常の呼び出しにも lock 用の鍵を使ったためにここで止まった（何も保存されなかった）。入口の鍵をこの bucket だけに絞るときは、`listFiles` を含める。lock 用の鍵は、lock つきの PutObject と version を指した HEAD・GET にしか使わないので、`listFiles` は要らない。
+  - **試験で使わなかった部分:** 通常の資格情報での呼び出し（受領証の記録と policy の block の読み書き）は、手元の memory で受けた。この部分は今の本番で動いている経路と同じ code である。
+  - **bucket に残っているもの:** `retention-test/` の下に、lock された試験ファイルが 2 件（50 bytes、期限 2026-11-22T06:21:50Z。51 bytes、期限 2026-11-22T06:32:25Z）。期限の後に消す。lock のない試験用の object は bucket に書いていない。
+  - **まだ無いもの:** Worker の deploy、本番の鍵の一覧への保持用の署名鍵と検証役の鍵の追加、検証役の定期実行と状態の公開、lease つきの書込みを行う CLI の command。
