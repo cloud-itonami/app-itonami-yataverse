@@ -37,7 +37,10 @@ import crypto from 'node:crypto';
 import { parseCid, verifyBlock, cidToBytes, SHA2_256 } from '../../src/cid.mjs';
 import { KIND, rootsCommitment, blockSetDigest } from '../../src/receipt.mjs';
 import { beginReceipt, finishReceipt, beginArchiveReceipt, finishArchiveReceipt, publishedKeys, requestIdOf, tokenDigest, wellKnown, sha256 } from './receipts.mjs';
-import { verifyLease, leaseEnvelopeFromDagCbor, RetentionError } from '../../src/retention.mjs';
+import {
+  verifyLease, verifyStatus, leaseEnvelopeFromDagCbor, leaseEnvelopeFromJson, statusEnvelopeFromJson, statusEnvelopeToDagCbor, RetentionError,
+} from '../../src/retention.mjs';
+import { cidFromBytes } from '../../src/cid.mjs';
 import { checkWritableBlock } from '../../src/block.mjs';
 import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
@@ -147,6 +150,10 @@ function b2(env, deps) {
   };
   return {
     archive,
+    // Retention status records published by lease verifiers (docs/retention-design.md §6).
+    getRetention: (key) => call('GET', `retention/${key}`),
+    putRetention: (key, bytes) => call('PUT', `retention/${key}`, { body: bytes, payloadHash: hex(sha256(bytes)),
+      headers: { 'content-type': 'application/json' } }),
     getArchiveReceipt: (rid) => call('GET', `receipts/archive/by-request/${rid}`),
     putArchiveReceipt: (rid, bytes) => call('PUT', `receipts/archive/by-request/${rid}`, { body: bytes, payloadHash: hex(sha256(bytes)),
       headers: { 'content-type': 'application/json' } }),
@@ -306,6 +313,84 @@ async function writeLeasedBlock(request, cid, bytes, claim, env, deps, store) {
   const receipt = await finishArchiveReceipt(begun, aclaim, archive, env, deps, store, writeLimits(env));
   if (receipt.error) return fail(...receipt.error);
   return json(201, { cid, bytes: bytes.length, verified: true, receipt: receipt.json, receiptCid: receipt.cid, archive });
+}
+
+// --- Retention status records (docs/retention-design.md §6; AWAI-3680) ---
+// The gateway does not judge a lease. It accepts a status only when the lease's own verifier
+// signed it, stores it, and hands it out unchanged; whoever reads it verifies it again.
+
+const MAX_STATUS_BODY_BYTES = 32 * 1024;
+const STATUS_HEADERS = { 'cache-control': 'public, max-age=60', 'x-content-type-options': 'nosniff' };
+
+async function readRetentionRecord(store, key) {
+  const res = await store.getRetention(key);
+  if (res.status === 404) return { absent: true };
+  if (res.status !== 200) return { error: [502, `status-read-failed-${res.status}`] };
+  const bytes = await readCapped(res, 4 * MAX_STATUS_BODY_BYTES);
+  if (!bytes) return { error: [502, 'stored-status-too-large'] };
+  try { return { record: JSON.parse(bytes.toString('utf8')), bytes }; } catch { return { error: [502, 'stored-status-unreadable'] }; }
+}
+
+/** PUT /retention/v1/status/<leaseId>: body { lease, status } (JSON envelopes). */
+async function publishStatus(request, leaseIdHex, env, deps, store) {
+  const denied = writeAuthFailure(request, env);
+  if (denied) return denied;
+  const limited = await admitWriteRequest(request, env);
+  if (limited) return fail(...limited);
+  const raw = await readCapped(request, MAX_STATUS_BODY_BYTES);
+  if (!raw) return fail(413, 'too-large');
+  let body;
+  try { body = JSON.parse(raw.toString('utf8')); } catch { return fail(400, 'body-not-json'); }
+  // 1. The lease, the status, and that this status may speak about this lease, now.
+  const keys = publishedKeys(env);
+  let lease, leaseEnv, statusEnv, status;
+  try {
+    leaseEnv = leaseEnvelopeFromJson(body?.lease);
+    lease = await verifyLease(leaseEnv, keys);
+  } catch (e) { if (e instanceof RetentionError) return fail(400, `lease-${e.code}`); throw e; }
+  if (hex(lease.leaseId) !== leaseIdHex) return fail(400, 'path-is-not-the-lease-id');
+  try {
+    statusEnv = statusEnvelopeFromJson(body?.status);
+    status = await verifyStatus(statusEnv, lease, keys, { now: deps.now().getTime() });
+  } catch (e) { if (e instanceof RetentionError) return fail(400, `status-${e.code}`); throw e; }
+  // 2. Never replace a record with an older observation of the same lease.
+  const key = `by-lease/${leaseIdHex}`;
+  const prior = await readRetentionRecord(store, key);
+  if (prior.error) return fail(...prior.error);
+  const statusCid = statusEnvelopeToDagCbor(statusEnv).cid;
+  if (!prior.absent) {
+    const before = Number(prior.record?.status?.status?.observedAt);
+    if (Number.isFinite(before) && before > status.observedAt) return fail(409, 'status-older-than-the-stored-one');
+    if (Number.isFinite(before) && before === status.observedAt) {
+      if (prior.record.statusCid === statusCid) return json(200, { leaseId: '0x' + leaseIdHex, statusCid, stored: true, repeated: true });
+      return fail(409, 'another-status-with-the-same-observation-time');
+    }
+  }
+  // 3. Store what was sent, in a canonical JSON form, and point the block's CID at it.
+  const record = { v: 1, leaseId: '0x' + leaseIdHex, statusCid, lease: body.lease, status: body.status };
+  const bytes = Buffer.from(JSON.stringify(record));
+  const put = await store.putRetention(key, bytes);
+  if (put.status !== 200) return fail(502, `status-write-failed-${put.status}`);
+  const cid = cidFromBytes(lease.subject);          // a single-block lease names its block
+  if (cid) {
+    const ptr = await readRetentionRecord(store, `by-cid/${cid}`);
+    if (ptr.error) return fail(...ptr.error);
+    // Several leases may cover one block: the pointer goes to the one that ends last.
+    const ends = Number(ptr.record?.retentionUntil);
+    if (ptr.absent || ptr.record.leaseId === record.leaseId || !(Number.isFinite(ends) && ends >= lease.retentionUntil)) {
+      const p = await store.putRetention(`by-cid/${cid}`, Buffer.from(JSON.stringify({ v: 1, leaseId: record.leaseId, retentionUntil: lease.retentionUntil })));
+      if (p.status !== 200) return fail(502, `status-pointer-write-failed-${p.status}`);
+    }
+  }
+  return json(200, { leaseId: record.leaseId, statusCid, stored: true });
+}
+
+/** GET a stored status record by lease id (hex) -> Response. Served as stored; readers verify it. */
+async function serveStatus(store, leaseIdHex, head) {
+  const r = await readRetentionRecord(store, `by-lease/${leaseIdHex}`);
+  if (r.error) return fail(...r.error);
+  if (r.absent) return fail(404, 'no-status-for-this-lease');
+  return new Response(head ? null : r.bytes, { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'content-length': String(r.bytes.length), ...STATUS_HEADERS } });
 }
 
 /**
@@ -499,6 +584,31 @@ async function handleCore(request, env, deps = {}) {
   if (url.pathname === '/health') {
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
     return json(200, { ok: true, service: 'yataverse-bytes' });
+  }
+  const pub = /^\/retention\/v1\/status\/(?:0x)?([0-9a-f]{64})$/.exec(url.pathname);
+  if (pub) {
+    if (request.method !== 'PUT') return fail(405, 'method-not-allowed', { allow: 'PUT' });
+    const store = b2(env, deps);
+    if (!store) return fail(503, 'store-not-configured');
+    try { return await publishStatus(request, pub[1], env, deps, store); } catch (e) { return storeFailure(e); }
+  }
+  const byLease = /^\/\.well-known\/yataverse-retention\/(?:0x)?([0-9a-f]{64})\.json$/.exec(url.pathname);
+  const byCid = /^\/retention\/([a-z2-7]{20,120})$/.exec(url.pathname);
+  if (byLease || byCid) {
+    if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
+    const store = b2(env, deps);
+    if (!store) return fail(503, 'store-not-configured');
+    try {
+      let id = byLease?.[1];
+      if (!id) {
+        const ptr = await readRetentionRecord(store, `by-cid/${byCid[1]}`);
+        if (ptr.error) return fail(...ptr.error);
+        const m = /^0x([0-9a-f]{64})$/.exec(String(ptr.record?.leaseId ?? ''));
+        if (ptr.absent || !m) return fail(404, 'no-status-for-this-block');
+        id = m[1];
+      }
+      return await serveStatus(store, id, request.method === 'HEAD');
+    } catch (e) { return storeFailure(e); }
   }
   if (url.pathname.startsWith('/.well-known/')) {
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });

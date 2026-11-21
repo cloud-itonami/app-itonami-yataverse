@@ -345,3 +345,14 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
   - `yataverse retention-status`: 状態の記録を lease と鍵の一覧に照らして検証し、状態、数、有効期限を表示する。有効期限を過ぎた記録は失敗にする（状態は不明）。別の lease の記録は通らない。状態の公開 endpoint はまだ無いので、照会の対象は file である。
   - **未対応:** R2 と R3 の lease の作成（piece commitment が要る）、複数 block の lease、renew、release。
   - **確認（2026-11-21）:** `npm test` は 142 件すべて通過（既存 140、追加 2）。test は keygen から状態の照会までを、試験用の Worker と偽の store で通している。検査 5 か所を 1 つずつ外すと、どれも test が失敗した。
+- **S1-5 検証役の巡回と、状態の公開・取得（[AWAI-3680](https://linear.app/kotobalabs/issue/AWAI-3680)、code と test のみ。deploy していない）:**
+  - **入口は判定しない。** 受付は `PUT /retention/v1/status/<leaseId>`（本文は lease と状態の envelope）。入口が確かめるのは、書込みの認可と制限、lease の 2 つの署名、検証役の鍵が公開されていて用途が `retention-verifier` であること、path の id が lease の id と同じこと、状態がその lease の検証役の署名であること、状態が今の時刻で有効で lease と整合することだけである。満たせば保存し、そのまま配る。検証役の鍵が公開されていない本番では、どの公開も `lease-unknown-key` で拒否される。
+  - **巻き戻しの防止:** 保存済みの記録より古い `observedAt` の状態は 409 で拒否する。同じ時刻で内容の違う状態も 409。同じ記録の再送は受け付けて何も変えない。
+  - **配布:** `GET /.well-known/yataverse-retention/<leaseId>.json` と `GET /retention/<cid>`。応答は保存した記録（lease、状態、状態の CID）そのまま。単一 block の lease では、CID から lease を引ける。同じ block に複数の lease があるときは、期限が最も先の lease を指す。複数 block の lease は CID からは引けない（lease の id で引く）。
+  - **読む側が検証する。** `client.fetchStatus` と `yataverse retention-status --lease-id | --cid` は、入口の答えを信用せず、lease の署名、検証役の鍵、状態の署名と有効期限、求めた lease または block の記録であることを確かめる。入口が数を書き換えた記録、別の block の正しい記録、期限切れの記録は拒否する。公開された状態が無いときは「不明」として失敗する。
+  - **根拠:** 根拠の記録は DAG-CBOR の block として通常の書込みで置く。状態の `evidenceRoot` はその sha256 なので、CID が決まる。`retention-status` は `evidenceCid` を表示し、`/ipfs/<evidenceCid>` で読める。
+  - **保存場所:** bucket の `<prefix>retention/by-lease/<leaseId>` と `<prefix>retention/by-cid/<cid>`。lock はかけない（古い version は残るが、名前では最新を返す）。
+  - **巡回:** `yataverse retention-verify-sweep --registry <dir> …`。directory の `<name>.lease.json` を順に検証し（`<name>.write.json` があれば、その受領証と version を使う）、`<name>.status.json` と `<name>.evidence.cbor` を書く。`--publish true` で公開する。1 件の失敗で他を止めず、失敗があれば終了 code 1 を返す。
+  - **定期実行のしかた（設置はしていない）:** 検証役の機器で、`challengePeriod` より短い間隔で `retention-verify-sweep --publish true` を呼ぶ。状態の有効期限は `challengePeriod` の 2 倍なので、1 回の失敗までは「不明」にならない。例（cron、6 時間ごと）: `0 */6 * * * YATAVERSE_ARCHIVE_KEY_ID=… YATAVERSE_ARCHIVE_APP_KEY=… yataverse retention-verify-sweep --registry /var/lib/yataverse-verifier/leases --keys /var/lib/yataverse-verifier/keys.json --signing-key-file /var/lib/yataverse-verifier/verifier.jwk --key-epoch 1 --archive-endpoint https://s3.us-west-004.backblazeb2.com --archive-bucket yataverse-blocks --archive-prefix ipld/ --sample-read true --publish true`。資格情報は、その機器の秘密の置き場所から渡す。
+  - **確認（2026-11-21）:** `npm test` は 148 件すべて通過（既存 142、追加 6）。検査 9 か所を 1 つずつ外すと、どれも test が失敗した。
+  - **未実装・未決定:** 検証役をどの機器で、入口と別の主体として動かすか（owner が決める）。巡回の登録 directory に lease を入れる手順（今は手で置く）。Worker の deploy と、検証役の鍵の公開。複数の検証役、検証役の高可用化。
