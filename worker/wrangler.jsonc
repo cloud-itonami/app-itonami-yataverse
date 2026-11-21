@@ -66,10 +66,12 @@
     // `:fresh-cacao-nonce` requirement of the durable-plane policy). The scheme is OFF until all four
     // are set: these two vars, CACAO_WRITER_DIDS (comma-separated ed25519 did:key values allowed to
     // write) and the secret CACAO_NONCE_SECRET (`wrangler secret put CACAO_NONCE_SECRET`, 32+ random
-    // bytes). CACAO_WRITER_DIDS is left empty here: turning the scheme on is a separate owner decision.
+    // bytes). Turned on 2026-11-21 (owner approval, JUN-1426): the one writer is the operator's
+    // existing admin key (`yataverse admin whoami`). A did:key is a public key; the private half stays
+    // in the operator's ~/.config/yataverse/admin.key. Add a writer by adding its did:key here.
     "CACAO_AUD": "https://yataverse.com",
     "CACAO_DOMAIN": "yataverse.com",
-    "CACAO_WRITER_DIDS": "",
+    "CACAO_WRITER_DIDS": "did:key:z6MkqmDHTL42uLLfZBL4Stmt1QtxcCs8Fx11kD1zC5BAghDk",
     // Name plane (worker/src/names.mjs, JUN-1414): comma-separated host suffixes, each starting
     // with "." (for example ".itonami.app"). A host one label under a suffix is served as a site
     // from its _dnslink TXT record. Empty: off. On since the owner approved the route above

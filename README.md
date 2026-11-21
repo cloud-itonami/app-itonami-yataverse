@@ -367,9 +367,10 @@ Authn Biscuit instead is a follow-up: the Authn service does not publish its ver
 ### Writes by CACAO
 
 A third way to authorize a write (JUN-1426), beside write tokens and ATProto service auth. It is the
-`:fresh-cacao-nonce` requirement of the durable-plane policy (root ADR-2611212100). It is **off** until
-`CACAO_NONCE_SECRET` (secret), `CACAO_AUD`, `CACAO_DOMAIN` and `CACAO_WRITER_DIDS` are all set;
-`worker/wrangler.jsonc` ships with an empty writer list, and turning it on is a separate owner decision.
+`:fresh-cacao-nonce` requirement of the durable-plane policy (root ADR-2611212100). It answers `503 cacao-not-configured`
+until `CACAO_NONCE_SECRET` (secret), `CACAO_AUD`, `CACAO_DOMAIN` and `CACAO_WRITER_DIDS` are all set.
+Turned on 2026-11-21 (owner approval): `worker/wrangler.jsonc` lists one writer, the operator's admin key
+(`yataverse admin whoami`). Add a writer by adding its `did:key` to `CACAO_WRITER_DIDS` and deploying.
 
 1. `GET /auth/nonce` returns `{nonce, expiresAt}`. The nonce is signed by the service (HMAC) and lives for
    120 seconds. Nothing is stored: the Worker uses no KV, D1 or Durable Object.
