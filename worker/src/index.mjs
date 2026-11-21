@@ -3,6 +3,8 @@
 //
 //   GET|HEAD /ipfs/<cid>  read from B2; on a B2 miss, from READ_FALLBACK_URL if set.
 //                          Bytes are served only after they hash to the CID.
+//                          A CID in READ_DENY_CIDS (read-deny.mjs, AWAI-3629) is answered with
+//                          451 before either is asked, here, in CAR exports and on name hosts.
 //   PUT /ipfs/<cid>       Authorization: Bearer <write token>. CIDv1/sha2-256 with codec raw or
 //                          dag-cbor (canonical DAG-CBOR only). The body must hash to the CID; it is stored, read back from B2
 //                          and verified again before 201 is returned.
@@ -57,6 +59,7 @@ import { isServiceAuth, verifyServiceAuth, IMPORT_CAR_LXM } from './service-auth
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 import { isCacao, verifyCacao, issueNonce, blockResource, carResource, claimedCarDigest } from './cacao-auth.mjs';
 import { isNameHost, underNameSuffix, handleName } from './names.mjs';
+import { readDenied, readDenyActive, DENY_HEADERS, READ_DENIED_HEADER } from './read-deny.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
 // Each imported block costs two store subrequests (PUT, readback GET) and each exported block
@@ -215,6 +218,20 @@ async function readBlock(cid, env, deps, store) {
   return { bytes };
 }
 
+/** The public read: a read-denied CID never reaches B2 or READ_FALLBACK_URL (AWAI-3629). */
+async function readPublicBlock(cid, env, deps, store) {
+  const denied = readDenied(cid, env);
+  if (denied) return { error: denied, denied: true };
+  return readBlock(cid, env, deps, store);
+}
+
+class DeniedRead extends Error { constructor(status, code) { super(code); this.status = status; this.code = code; } }
+
+/** 201 headers for a write: a block that is stored but read-denied says so. */
+function writeHeaders(cids, env) {
+  return cids.some((c) => readDenied(c, env)?.[0] === 451) ? { [READ_DENIED_HEADER]: 'true' } : {};
+}
+
 /**
  * One line per accepted write, so the use of each authorization scheme can be counted from the
  * Worker's logs (JUN-1429). It carries the scheme, the kind of write, the size and the first 12 hex
@@ -286,7 +303,7 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
   const receipt = await ops.finish(begun, claim);
   if (receipt.error) return fail(...receipt.error);
   logWrite(deps, scheme, 'block', claim.requester, bytes.length);
-  return json(201, { cid, bytes: bytes.length, verified: true, receipt: receipt.json, receiptCid: receipt.cid });
+  return json(201, { cid, bytes: bytes.length, verified: true, receipt: receipt.json, receiptCid: receipt.cid }, writeHeaders([cid], env));
 }
 
 export const LEASE_HEADER = 'yataverse-lease';
@@ -503,7 +520,8 @@ async function importCar(request, env, deps, store) {
   if (receipt.error) return fail(...receipt.error);
   logWrite(deps, viaServiceAuth ? 'service-auth' : viaCacao ? 'cacao' : 'token', 'car', requester, total);
   return json(201, { roots: car.roots, carVersion: car.version, blocks: blocks.size, bytes: total,
-                     external: closure.external, verified: true, receipt: receipt.json, receiptCid: receipt.cid });
+                     external: closure.external, verified: true, receipt: receipt.json, receiptCid: receipt.cid },
+              writeHeaders([...blocks.keys()], env));
 }
 
 /** GET /ipfs/<root>?format=car: a CARv1 (order=dfs, dups=n) of the root's DAG or just the root. */
@@ -514,11 +532,14 @@ async function exportCar(cid, url, env, deps, store, head) {
   let blocks;
   try {
     blocks = await collectDag(cid, scope, async (c) => {
-      const r = await readBlock(c, env, deps, store);
+      const r = await readPublicBlock(c, env, deps, store);
+      // A denied block anywhere in the DAG fails the whole export: never a CAR without it.
+      if (r.denied) throw new DeniedRead(...r.error);
       if (r.error) throw new DagError(`read-failed:${r.error[1]}`, c);
       return r.absent ? null : r.bytes;
     }, carLimits(env));
   } catch (e) {
+    if (e instanceof DeniedRead) return fail(e.status, e.code, DENY_HEADERS);
     if (!(e instanceof DagError)) throw e;
     const detail = String(e.message).split(': ')[1] ?? '';
     if (e.code === 'root-not-found') return fail(404, 'block-not-found');
@@ -615,7 +636,8 @@ export async function handle(request, env, deps = {}) {
     deps = { fetchImpl: (input, init) => fetch(input, init), now: () => new Date(), ...deps };
     const store = b2(env, deps);
     if (!store) return fail(503, 'store-not-configured');
-    try { return await handleName(request, url, env, deps, (cid) => readBlock(cid, env, deps, store)); }
+    try { return await handleName(request, url, env, deps, (cid) => readPublicBlock(cid, env, deps, store),
+      readDenyActive(env) ? (cid) => readDenied(cid, env) : null); }
     catch (e) { return storeFailure(e); }
   }
   // Any other host under a name suffix (its apex, deeper labels) is not a site and not the API.
@@ -697,6 +719,8 @@ async function handleCore(request, env, deps = {}) {
   try {
     if (request.method === 'PUT') return await writeBlock(request, cid, parsed, env, deps, store);
     if (request.method === 'GET' || request.method === 'HEAD') {
+      const denied = readDenied(cid, env);
+      if (denied) return fail(...denied, DENY_HEADERS);
       const car = wantsCar(request, url);
       if (car === null) return fail(400, 'format-not-supported');
       if (car) return await exportCar(cid, url, env, deps, store, request.method === 'HEAD');

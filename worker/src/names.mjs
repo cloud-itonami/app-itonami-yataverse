@@ -11,7 +11,7 @@
 //
 // Off unless NAME_PLANE_SUFFIXES names at least one suffix (comma-separated, each starting
 // with "."). Only a single label under a suffix is a name host.
-import { parseCid, SHA2_256 } from '../../src/cid.mjs';
+import { parseCid, SHA2_256, CODEC_DAG_PB } from '../../src/cid.mjs';
 import { resolvePath, readFile, UnixfsError } from '../../src/unixfs.mjs';
 
 export const DEFAULT_DOH_URL = 'https://cloudflare-dns.com/dns-query';
@@ -125,13 +125,24 @@ function segmentsOf(pathname) {
   return out.length > MAX_PATH_SEGMENTS ? null : out;
 }
 
+/** Walk a file's chunk tree; raw leaves are checked by CID only, intermediate nodes are loaded. */
+async function checkChunks(node, load, denied) {
+  for (const c of node.chunks ?? []) {
+    const d = denied(c.cid);
+    if (d) throw new LoadError(...d);
+    if (parseCid(c.cid)?.codec !== CODEC_DAG_PB) continue;
+    const at = await resolvePath(c.cid, [], load);
+    if (at) await checkChunks(at.node, load, denied);
+  }
+}
+
 class LoadError extends Error { constructor(status, code) { super(code); this.status = status; this.code = code; } }
 
 /**
  * Answer a request on a name host. `readBlock(cid)` is the bytes plane's verified read:
  * -> { bytes } | { absent: true } | { error: [status, code] }.
  */
-export async function handleName(request, url, env, deps, readBlock) {
+export async function handleName(request, url, env, deps, readBlock, denied = null) {
   if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
   const head = request.method === 'HEAD';
   const segments = segmentsOf(url.pathname);
@@ -156,6 +167,10 @@ export async function handleName(request, url, env, deps, readBlock) {
       at = await resolvePath(index.cid, [], load);
       name = 'index.html';
     }
+    // With a read deny list (AWAI-3629), check every chunk of the file before any answer, so a
+    // denied leaf also makes HEAD and 304 a 451, not only GET. Raw leaves are not fetched:
+    // `denied(cid)` -> null or [status, code], without a store read.
+    if (denied) await checkChunks(at.node, load, denied);
     const headers = {
       'content-type': typeOf(name), 'content-length': String(at.node.size), etag: `"${at.cid}"`,
       'cache-control': 'public, max-age=300', 'x-content-type-options': 'nosniff',

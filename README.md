@@ -358,6 +358,7 @@ KV, D1 or Durable Objects.
 | CACAO writes (`PUT /ipfs/<cid>` and `POST /ipfs/`) | **CACAO with a fresh server-issued nonce** (JUN-1426, `worker/src/cacao-auth.mjs`; off by default). See "Writes by CACAO" below. |
 | `GET /auth/nonce` | `{nonce, expiresAt}` for a CACAO write. `503 cacao-not-configured` while the scheme is off. |
 | `GET /health` | Liveness only. |
+| Read deny list | `READ_DENY_CIDS` (AWAI-3629, `worker/src/read-deny.mjs`): CIDs that are not served publicly. `451 unavailable-for-legal-reasons` with `Cache-Control: no-store` on `GET`/`HEAD /ipfs/<cid>`, CAR exports and name-host files. See "Read deny list" below. |
 | `GET` / `HEAD https://{name}{suffix}/{path}` | **Name plane** (JUN-1414, `worker/src/names.mjs`; off by default). See "Name plane" below. |
 
 The Worker never follows a redirect. Write tokens are checked against `WRITE_TOKEN_SHA256`
@@ -503,6 +504,38 @@ owner's approval and these secrets: `B2_ENDPOINT`, `B2_BUCKET`, `B2_KEY_ID`, `B2
 public half goes in `RECEIPT_PUBLIC_KEYS` in `wrangler.jsonc`). Deploy with
 `wrangler deploy --var SOURCE_COMMIT:<commit>`. After deploying, check
 `/health`, then put one block with a test token and read it back with `yataverse get`.
+
+### Read deny list
+
+`READ_DENY_CIDS` in `wrangler.jsonc` (AWAI-3629, `worker/src/read-deny.mjs`) lists CIDs that this
+gateway must not serve publicly, for example because redistributing them needs a licence we do not
+hold. It is a revocable read block, not a deletion.
+
+- **What it does.** Entries are comma-separated CIDs, compared by multihash, so the CIDv0 (`Qm…`)
+  and every CIDv1 spelling or codec of the same sha2-256 digest are one entry. A denied CID is
+  answered with `451 {"error":"unavailable-for-legal-reasons"}` and `Cache-Control: no-store` on
+  `GET`/`HEAD /ipfs/<cid>`; on `?format=car` / `Accept: application/vnd.ipld.car` when it is the
+  root **or any block in the DAG** (the whole export fails; never a CAR without it); and on a name
+  host when it is the file or any chunk of it (`GET`, `HEAD` and `304` alike). The check runs before
+  B2 or `READ_FALLBACK_URL` (`ipfs.yataverse.com`) is asked. CORS headers follow the usual rules.
+  `/awai-drive/v1/packs` is not covered (packs are named by SHA-256 of the encrypted pack).
+- **Writes are unaffected.** A `PUT` or CAR `POST` holding a denied block is accepted, stored and
+  receipted as before; B2 keeps (and is never asked to delete) the object. The `201` then carries
+  `Yataverse-Read-Denied: true` so the writer can see the bytes will not be served.
+- **Fail closed.** An entry that is not a supported CID makes the whole list invalid, and every
+  public read answers `503 read-deny-list-invalid` until it is fixed: a typo must never leave the
+  intended CID readable. Empty or unset: nothing is denied.
+- **Add.** Put the CID in `READ_DENY_CIDS` (with a comment naming the issue), add a row to
+  [docs/read-deny-log.md](docs/read-deny-log.md), merge, and deploy from the merged `main` with
+  `wrangler deploy --var SOURCE_COMMIT:<commit>`. Check `curl -sI https://yataverse.com/ipfs/<cid>`
+  gives `451` and an unrelated CID still `200`. A `200` cached at the edge before the change can
+  survive the deploy (`/ipfs/<cid>` is `immutable`); purge that URL in the zone's cache.
+- **Undo.** Remove the CID from the var and deploy again; record the removal as a new row in the log
+  (do not edit the old row). Nothing has to be restored, because B2 was never changed.
+- **Record.** Every addition or removal gets a row in `docs/read-deny-log.md`: when, whose decision,
+  which CID, why, and the evidence (memo, issue).
+- **Scope.** This only stops this gateway. Copies elsewhere (other IPFS nodes, public gateways,
+  caches) are not affected by it.
 
 ## Android and dapp SDK
 
