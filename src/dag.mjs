@@ -1,6 +1,7 @@
 // DAG traversal over the codecs the bytes plane accepts: raw blocks are leaves, dag-cbor
-// blocks link through tag 42, dag-pb (UnixFS) blocks through their PBLinks. Anything else is refused instead of being skipped, so a
-// "complete" closure is never claimed over links it could not see.
+// blocks link through tag 42, dag-pb (UnixFS) blocks through their PBLinks. Anything else is
+// refused instead of being skipped, so a "complete" closure is never claimed over links it
+// could not see.
 import { parseCid, cidFromBytes, CODEC_RAW, CODEC_DAG_CBOR, CODEC_DAG_PB } from './cid.mjs';
 import { unixfsLinks, DagPbError } from './dag-pb.mjs';
 import { decodeDagCbor, linksIn } from './dag-cbor.mjs';
