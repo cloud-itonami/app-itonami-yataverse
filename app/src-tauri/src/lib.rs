@@ -29,13 +29,13 @@ struct AndroidDrive(tauri::plugin::PluginHandle<tauri::DynRuntime>);
 struct MacosDrive(vault::DesktopDrive<keychain::KeychainKeyProvider>);
 
 #[tauri::command]
-fn awai_host_info()->serde_json::Value { serde_json::json!({"schema":"awai.shell.host.v1","driveLocal":cfg!(target_os="android") || cfg!(target_os="macos"),"sync":false}) }
+fn awai_host_info()->serde_json::Value { serde_json::json!({"schema":"awai.shell.host.v1","driveLocal":cfg!(target_os="android") || cfg!(target_os="macos"),"sync":false,"platform":std::env::consts::OS}) }
 #[tauri::command]
 async fn drive_call(_app:tauri::AppHandle, request:serde_json::Value)->Result<serde_json::Value,String>{
  if serde_json::to_vec(&request).map_err(|_|"invalid-request")?.len()>131072{return Err("request-limit".into())}
  let op=request.get("op").and_then(|v|v.as_str()).ok_or("invalid-operation")?;
- if !["list","mkdir","createText","pick","open","vaultStatus","vaultSession","vaultRecord","vaultInventory","vaultRead","vaultCommit","vaultEvict","vaultRestoreBegin","vaultRestoreWrite","vaultRestorePublish", "vaultWnfsInventory", "vaultWnfsCommit", "vaultWnfsRestoreBegin", "vaultWnfsRestoreAbort", "vaultWnfsRestoreWrite", "vaultWnfsRestorePublish"].contains(&op){return Err("unsupported-operation".into())}
- #[cfg(target_os="android")]{use tauri::Manager;return _app.state::<AndroidDrive>().0.run_mobile_plugin_async("execute",serde_json::json!({"payload":request.to_string()})).await.map_err(|e| { let message=e.to_string(); ["unsynced-data","recovery-required","restore-mismatch","sync-size-limit","file-busy","file-exists","invalid-name","invalid-path","storage-full","file-too-large","import-cancelled","source-size-changed","local-provider-required"].iter().find(|code|message.contains(**code)).unwrap_or(&"drive-operation-failed").to_string() });}
+ if !["list","mkdir","createText","pick","open","vaultStatus","vaultSession","vaultRecord","vaultInventory","vaultRead","vaultCommit","vaultEvict","vaultRestoreBegin","vaultRestoreWrite","vaultRestorePublish", "accountProof","vaultWnfsBindAccount","vaultWnfsRecipients","vaultWnfsRecipientSet","vaultWnfsInventory", "vaultWnfsCommit", "vaultWnfsRestoreBegin", "vaultWnfsRestoreAbort", "vaultWnfsRestoreWrite", "vaultWnfsRestorePublish"].contains(&op){return Err("unsupported-operation".into())}
+ #[cfg(target_os="android")]{use tauri::Manager;return _app.state::<AndroidDrive>().0.run_mobile_plugin_async("execute",serde_json::json!({"payload":request.to_string()})).await.map_err(|e| { let message=e.to_string(); ["account-broker-unavailable","account-approval-denied","account-vault-mismatch","unsynced-data","recovery-required","restore-mismatch","sync-size-limit","file-busy","file-exists","invalid-name","invalid-path","storage-full","file-too-large","import-cancelled","source-size-changed","local-provider-required"].iter().find(|code|message.contains(**code)).unwrap_or(&"drive-operation-failed").to_string() });}
  #[cfg(target_os="macos")]{use tauri::Manager;return _app.state::<MacosDrive>().0.execute(op,&request);}
  #[cfg(not(any(target_os="android",target_os="macos")))]{let _ = &_app; Err("desktop-adapter-unavailable".into())}
 }

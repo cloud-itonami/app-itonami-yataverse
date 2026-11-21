@@ -5,7 +5,7 @@ const drive = JSON.parse(await readFile(resolve(app, 'drive-wnfs-pin.json'), 'ut
 for (const [name, expected] of Object.entries(drive.files)) {
   if (hash(await readFile(resolve(app, name))) !== expected) throw Error('Drive WNFS source pin drift: ' + name);
 }
-for(const n of ['index.html','style.css','app.js','i18n.js','sync.js','sync-contract.js','wnfs-sync.js','wnfs-worker.js'])await copyFile(resolve(app,'src',n),resolve(out,n));
+for(const n of ['index.html','style.css','app.js','i18n.js','sync.js','sync-contract.js','wnfs-sync.js','wnfs-worker.js','share-controls.js','account-share.js','wnfs-account.js'])await copyFile(resolve(app,'src',n),resolve(out,n));
 for (const name of ['drive-packs.mjs', 'bounded-response.mjs']) {
   await copyFile(resolve(app, '../src', name), resolve(out, name));
 }
@@ -25,7 +25,7 @@ const tauriFile=resolve(app,'src-tauri/tauri.conf.json'),config=JSON.parse(await
 config.app.security.csp="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "+(wnfsEnabled?"worker-src 'self'; ":"")+clientRuntimeConnectSrc(descriptor,['yataverse.store'],[],'http://tauri.localhost').replace("'none'",'')+" ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'";
 await writeFile(tauriFile,JSON.stringify(config,null,2)+'\n');
 await writeFile(resolve(out,'descriptor.json'),JSON.stringify(descriptor,null,2));
-const names=['index.html','style.css','app.js','i18n.js','sync.js','sync-contract.js','drive-packs.mjs','bounded-response.mjs','sync-config.js','wnfs-sync.js','wnfs-worker.js','core.js','receipt.js','wnfs-core.js','host.js','noto-jp.woff2','runtime.js','descriptor.json'],files={};for(const n of names)files[n]=hash(await readFile(resolve(out,n)));
+const names=['index.html','style.css','app.js','i18n.js','sync.js','sync-contract.js','drive-packs.mjs','bounded-response.mjs','sync-config.js','wnfs-sync.js','wnfs-worker.js','share-controls.js','account-share.js','wnfs-account.js','core.js','receipt.js','wnfs-core.js','host.js','noto-jp.woff2','runtime.js','descriptor.json'],files={};for(const n of names)files[n]=hash(await readFile(resolve(out,n)));
 await writeFile(resolve(out,'release.json'),JSON.stringify({schema:'awai.app.artifact.v1',id:'network.awai.yataverse',version:'0.1.0',tauri:'3.0.0-alpha.6',runtimeWry:'3.0.0-alpha.6',sharedCore:{source:'core/awai/drive/domain.cljc',sha256:hash(await readFile(resolve(app,'core/awai/drive/domain.cljc')))},profile:wnfsEnabled?'WNFS PrivateForest + SHA-256 CARv1; Android device custody':'Bounded owner-store object-v2/CAR snapshot; Android device custody; explicit HTTPS sync',files},null,2));console.log('Yataverse static artifact built with pinned canonical runtime');
 
 await distributeUi(out);

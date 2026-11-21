@@ -1,6 +1,7 @@
 import { createDrivePackClient } from './drive-packs.mjs';
 import './core.js';
 import { createWnfsSync } from './wnfs-sync.js';
+import { createAccountSharing } from './account-share.js';
 import{createClientConsentHost,createClientOperationBroker}from'./runtime.js';
 import{runtimeFor}from'./sync-contract.js';import{syncOrigin,receiptKeys,wnfsEnabled}from'./sync-config.js';import{verifyDrivePackReceipt}from'./receipt.js';
 const core=window.AwaiDriveEncrypted;
@@ -20,10 +21,19 @@ function verifyReceipt(receipt, expected) {
     throw Error('storage-receipt-invalid:' + String(error?.message || error).slice(0, 80), { cause: error });
   }
 }
-const wnfs = createWnfsSync({ invoke, origin: syncOrigin, packs, verifyReceipt, sha256: core.sha256 });
+let platformRequest;
+async function supportsSharing() {
+  platformRequest ??= window.__TAURI__.core.invoke('awai_host_info').then(info => info.platform);
+  const platform = await platformRequest;
+  if (platform !== 'android' && platform !== 'macos') throw Error('unsupported-operation');
+  return platform === 'android';
+}
+const wnfs = createWnfsSync({ invoke, origin: syncOrigin, packs, verifyReceipt, sha256: core.sha256, supportsSharing });
+const accountSharing = createAccountSharing({ invoke, wnfs, sha256: core.sha256, app: 'network.awai.yataverse' });
 export const configured=Boolean(syncOrigin);
+export const sharingEnabled=async () => Boolean(syncOrigin && wnfsEnabled && await supportsSharing().catch(() => false));
 export async function sync(){const s=await session(true);try{
- if(wnfsEnabled)return await wnfs.sync(s);
+ if(wnfsEnabled)return await (await supportsSharing() ? accountSharing.sync(s) : wnfs.sync(s));
  if(s.wnfs)throw Error('recovery-required');
  const {entries}=await invoke('vaultInventory');const rows=[];
  for(const e of entries){if(e.directory)continue;const bytes=new Uint8Array(e.size);for(let at=0;at<e.size;at+=65531){const r=await invoke('vaultRead',{path:e.path,offset:at,length:Math.min(65531,e.size-at)});bytes.set(unb64(r.bytes),at);}if(await core.sha256(bytes)!==e.sha256)throw Error('source-size-changed');rows.push({path:e.path,bytes});}
@@ -44,3 +54,13 @@ export async function inspectAuthorizedSnapshot(owner, expectedBasis, extension)
  if(!wnfsEnabled)throw Error('recovery-required');
  return wnfs.inspect(owner,expectedBasis,extension);
 }
+
+async function sharing(action) {
+ if(!wnfsEnabled || !await supportsSharing())throw Error('recovery-required');
+ const owner = await session(true);
+ try {return await action(owner);} finally {owner.secret.fill(0);}
+}
+export const publicSnapshotRecipient = () => sharing(owner => accountSharing.publicRecipient(owner));
+export const grantSnapshotRecipient = recipient => sharing(owner => accountSharing.grant(owner, recipient));
+export const revokeSnapshotRecipient = id => sharing(owner => accountSharing.revoke(owner, id));
+export const restoreSharedSnapshot = (share, sender) => sharing(owner => accountSharing.restore(owner, share, sender));

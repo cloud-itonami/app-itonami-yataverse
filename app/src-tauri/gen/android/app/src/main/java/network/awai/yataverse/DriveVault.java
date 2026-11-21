@@ -42,9 +42,63 @@ public final class DriveVault {
   if(control==null||!control.has("pack")||!control.has("entries"))throw new IOException("recovery-required");
   return control;
  }
+ private String restoreOperation;
+ private String restoreShare;
+ private JSONArray restoreInventory;
+ private static boolean samePaths(JSONArray actual,JSONArray expected)throws Exception {
+  if(actual.length()!=expected.length())return false;
+  Map<String,JSONObject> byPath=new HashMap<>();
+  for(int i=0;i<expected.length();i++){
+   JSONObject row=expected.getJSONObject(i);
+   if(byPath.put(row.getString("path"),row)!=null)return false;
+  }
+  for(int i=0;i<actual.length();i++){
+   JSONObject row=actual.getJSONObject(i), other=byPath.remove(row.getString("path"));
+   if(other==null||row.getBoolean("directory")!=other.getBoolean("directory"))return false;
+   if(!row.getBoolean("directory")&&(row.getLong("size")!=other.getLong("size")||
+      !row.getString("sha256").equals(other.getString("sha256"))))return false;
+  }
+  return byPath.isEmpty();
+ }
+ private static JSONObject recipients(JSONObject control)throws JSONException {
+  if(control!=null&&control.has("wnfsRecipients"))return control.getJSONObject("wnfsRecipients");
+  return new JSONObject().put("revision",0).put("items",new JSONObject());
+ }
+ private JSONObject updateRecipient(JSONObject control,JSONObject request)throws Exception {
+  if(control==null||!control.has("record"))throw new IOException("recovery-required");
+  String id=request.getString("id");
+  if(!id.matches("kv1:[A-Za-z0-9_-]{43}"))throw new IOException("invalid-recipient");
+  JSONObject state=recipients(control), items=state.getJSONObject("items");
+  JSONObject proofs=state.optJSONObject("proofs");
+  if(proofs==null)proofs=new JSONObject();
+  if(request.has("recipient")){
+   JSONObject entry=request.getJSONObject("recipient");
+   if(entry.length()!=3||!id.equals(entry.getString("id"))||
+      !entry.getString("pub").matches("[A-Za-z0-9_-]{43}")||
+      !entry.getString("pq").matches("[A-Za-z0-9_-]{1579}"))throw new IOException("invalid-recipient");
+   if(!items.has(id)&&items.length()>=8)throw new IOException("recipient-limit");
+   items.put(id,entry);
+   JSONObject proof=request.optJSONObject("proof");
+   if(proof!=null){
+    if(proof.toString().length()>16384)throw new IOException("invalid-recipient");
+    proofs.put(id,proof);
+   }else proofs.remove(id);
+  }else{items.remove(id);proofs.remove(id);}
+  state.put("proofs",proofs);
+  state.put("revision",Math.addExact(state.getLong("revision"),1));
+  control.put("wnfsRecipients",state);
+  save(control,false);
+  return new JSONObject().put("revision",state.getLong("revision"));
+ }
+ private void requireRestore(JSONObject request)throws Exception {
+  if(restoreOperation==null||!restoreOperation.equals(request.getString("operation")))
+   throw new IOException("restore-operation-mismatch");
+ }
+ private void clearRestore(){restoreOperation=null;restoreShare=null;restoreInventory=null;}
  private File wnfsStage(){return new File(context.getCacheDir(),"drive-restore-wnfs");}
  private JSONObject commitWnfs(JSONObject control,JSONObject request)throws Exception {
   if(control==null||!control.has("record"))throw new IOException("recovery-required");
+  if(request.getLong("recipientRevision")!=recipients(control).getLong("revision"))throw new IOException("recipient-grants-changed");
   JSONArray entries=request.getJSONArray("entries");
   if(!equalInventory(inventory(WNFS_BYTES),entries))throw new IOException("unsynced-data");
   noUnpublished(cache);
@@ -67,6 +121,7 @@ public final class DriveVault {
   return new JSONObject();
  }
  private JSONObject writeWnfs(JSONObject request)throws Exception {
+  requireRestore(request);
   File stage=wnfsStage();
   if(!stage.isDirectory())throw new IOException("restore-required");
   File target=new DriveFiles(stage).resolve(request.getString("path"));
@@ -88,10 +143,11 @@ public final class DriveVault {
   }finally{Arrays.fill(bytes,(byte)0);}
   return new JSONObject();
  }
- private JSONObject publishWnfs(JSONObject control,boolean legacy)throws Exception {
+ private JSONObject publishWnfs(JSONObject request)throws Exception {
+  requireRestore(request);
   File stage=wnfsStage();
   if(!stage.isDirectory())throw new IOException("restore-required");
-  JSONArray expected=(legacy?legacyHead(control):wnfsHead(control)).getJSONArray("entries");
+  JSONArray expected=restoreInventory;
   DriveFiles files=new DriveFiles(stage);
   for(int i=0;i<expected.length();i++){
    JSONObject entry=expected.getJSONObject(i);
@@ -103,18 +159,27 @@ public final class DriveVault {
    }
   }
   JSONArray actual=new JSONArray();
-  walk(files,"",actual,new long[]{0},legacy?LEGACY_BYTES:WNFS_BYTES);
-  if(!equalInventory(actual,expected))throw new IOException("restore-mismatch");
+  walk(files,"",actual,new long[]{0},WNFS_BYTES);
+  if(!samePaths(actual,expected))throw new IOException("restore-mismatch");
   for(File dir:allDirs(stage))sync(dir);
   DriveFiles destination=new DriveFiles(cache);
   if(destination.list("").length>=DriveFiles.MAX_ENTRIES)throw new IOException("entry-limit");
-  String name="Recovered "+UUID.randomUUID();
+  String name=restoreShare==null?"Recovered "+UUID.randomUUID():"Shared "+restoreShare;
   // No overwrite and no detaching the user's original tree. Only a validated
   // staged subtree becomes visible, after one rename on the app volume.
   File target=destination.resolve(name);
-  if(Files.exists(target.toPath(),LinkOption.NOFOLLOW_LINKS))throw new IOException("file-exists");
+  if(Files.exists(target.toPath(),LinkOption.NOFOLLOW_LINKS)){
+   if(restoreShare==null||!target.isDirectory()||Files.isSymbolicLink(target.toPath()))throw new IOException("file-exists");
+   JSONArray existing=new JSONArray();
+   walk(new DriveFiles(target),"",existing,new long[]{0},WNFS_BYTES);
+   if(!samePaths(existing,expected))throw new IOException("restore-mismatch");
+   removeTree(stage);
+   clearRestore();
+   return new JSONObject().put("folder",name);
+  }
   Files.move(stage.toPath(),target.toPath(),StandardCopyOption.ATOMIC_MOVE);
   sync(cache);
+  clearRestore();
   return new JSONObject().put("folder",name);
  }
  public synchronized JSONObject execute(JSONObject q)throws Exception{String op=q.getString("op");JSONObject v=load();switch(op){
@@ -122,20 +187,41 @@ public final class DriveVault {
  case "vaultRecord":{if(v==null||v.has("record"))throw new IOException("recovery-required");String record=q.getString("record");if(record.length()>16000)throw new IOException("state-limit");v.put("record",record);save(v,false);return new JSONObject();}
  case "vaultWnfsInventory":return new JSONObject().put("entries",inventory(WNFS_BYTES));
  case "vaultWnfsCommit":return commitWnfs(v,q);
+ case "vaultWnfsBindAccount":{
+  if(v==null||!v.has("record"))throw new IOException("recovery-required");
+  String account=q.getString("account");
+  if(!account.matches("did:key:z[1-9A-HJ-NP-Za-km-z]{20,110}"))throw new IOException("account-vault-mismatch");
+  if(v.has("wnfsAccount")){
+   if(!account.equals(v.getString("wnfsAccount")))throw new IOException("account-vault-mismatch");
+  }else{
+   v.put("wnfsAccount",account);
+   save(v,false);
+  }
+  return new JSONObject();
+ }
+ case "vaultWnfsRecipients":return recipients(v);
+ case "vaultWnfsRecipientSet":return updateRecipient(v,q);
  case "vaultWnfsRestoreBegin":{
-  if(q.optBoolean("legacy"))legacyHead(v);else wnfsHead(v);
+  if(restoreOperation!=null)throw new IOException("restore-in-progress");
+  String share=q.has("share")?digestId(q.getString("share")):null;
+  JSONArray expected=share==null?(q.optBoolean("legacy")?legacyHead(v):wnfsHead(v)).getJSONArray("entries"):q.getJSONArray("entries");
+  if(expected.length()>1000||expected.toString().length()>240000)throw new IOException("state-limit");
   File stage=wnfsStage();
   if(stage.exists())removeTree(stage);
   Files.createDirectory(stage.toPath());
-  return new JSONObject();
+  restoreOperation=UUID.randomUUID().toString();
+  restoreShare=share;
+  restoreInventory=expected;
+  return new JSONObject().put("operation",restoreOperation);
  }
  case "vaultWnfsRestoreAbort":{
+  requireRestore(q);
   File stage=wnfsStage();
-  if(stage.exists())removeTree(stage);
+  try{if(stage.exists())removeTree(stage);}finally{clearRestore();}
   return new JSONObject();
  }
  case "vaultWnfsRestoreWrite":return writeWnfs(q);
- case "vaultWnfsRestorePublish":return publishWnfs(v,q.optBoolean("legacy"));
+ case "vaultWnfsRestorePublish":return publishWnfs(q);
  case "vaultStatus":{if(v!=null&&v.has("wnfs")){
   JSONObject head=wnfsHead(v);
   boolean clean;

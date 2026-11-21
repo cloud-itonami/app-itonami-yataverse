@@ -1,3 +1,4 @@
+import { mountWnfsSharing } from './share-controls.js';
 import {bind_native} from './awai-ui/index.js';
 bind_native(document.documentElement,{tonal:'.tonal,.secondary',text:'#files button'});
 import*as encryptedSync from'./sync.js';
@@ -24,7 +25,8 @@ $('entry').onsubmit=e=>{e.preventDefault();if(!core.validName($('name').value)){
 await task(async()=>{await host.initialize();await list();});
 
 const keyAcknowledged=async()=>{const s=await encryptedSync.state();if(s.root||s.synced)return true;return new Promise(done=>{const d=$('key-confirm');d.returnValue='';$('key-accept').onclick=()=>d.close('ok');$('key-back').onclick=()=>d.close('');d.onclose=()=>done(d.returnValue==='ok');d.showModal();});};
-$('sync').onclick=()=>task(async()=>{if(!(await keyAcknowledged()))return;message(t('sync.busy'));await encryptedSync.sync();await list();$('storage').textContent=t('sync.ready');message(t('sync.success'));});
+const showGrants = mountWnfsSharing($('sync').parentElement, encryptedSync, task, await encryptedSync.sharingEnabled(), list);
+$('sync').onclick=()=>task(async()=>{if(!(await keyAcknowledged()))return;message(t('sync.busy'));showGrants(await encryptedSync.sync());await list();$('storage').textContent=t('sync.ready');message(t('sync.success'));});
 $('restore').onclick=()=>task(async()=>{message(t('sync.restoring'));await encryptedSync.restore();parent='';await list();$('storage').textContent=t('sync.ready');message(t('sync.restored'));});
 $('evict').onclick=()=>{$('evict-confirm').showModal();};
 $('evict-cancel').onclick=()=>$('evict-confirm').close();
