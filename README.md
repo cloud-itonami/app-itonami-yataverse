@@ -389,11 +389,18 @@ CID the name points at. A block the store does not hold is `502 site-block-not-f
 content. A name host answers `GET` and `HEAD` only (`405` otherwise): the write, receipt, Drive and
 `/.well-known` routes of the bytes plane do not exist there, and `/ipfs/...` is an ordinary site path.
 Path parts that decode to `.`, `..`, an empty part, or contain `/`, `\` or NUL are `400 bad-path`.
+Any other host under a suffix (its apex, a deeper label) is `404 not-a-name-host`: the bytes-plane API is
+not served there either, so a wildcard route for the suffix exposes nothing but sites.
 
 It is **off** in `wrangler.jsonc` (`NAME_PLANE_SUFFIXES` is empty) and no route for such hosts is
 configured. Turning it on is a production route change: it needs the owner's approval, a suffix in
 the var, and a route for those hosts on this Worker. The site's blocks must be written to the store
 first (`POST /ipfs/` with a CAR of the UnixFS DAG). IPNS names are not resolved.
+
+`yataverse site-pack <dir> -o <outdir>` packs a directory and writes `site-001.car`, `site-002.car`, …,
+each within the import limits; `yataverse car-put` them in that order. It prints the root CID and the
+`dnslink=` value. The steps, checks and rollback are in
+[docs/name-plane-deploy-runbook.md](docs/name-plane-deploy-runbook.md).
 
 Merging does **not** deploy it. Deploying adds the `yataverse.com` custom domain and needs the
 owner's approval and these secrets: `B2_ENDPOINT`, `B2_BUCKET`, `B2_KEY_ID`, `B2_APP_KEY`,

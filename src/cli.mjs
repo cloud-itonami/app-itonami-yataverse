@@ -1,11 +1,13 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import readline from 'node:readline';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { rawCid, parseCid, normalizeCid } from './cid.mjs';
 import { loadConfig, saveConfig, status, configDir, ConfigError } from './config.mjs';
 import { makeAuthorizer } from './auth.mjs';
-import { makeClient } from './client.mjs';
+import { makeClient, YataverseError } from './client.mjs';
+import { packFiles, siteCars } from './unixfs.mjs';
 import { verifyReceiptInput } from './verify-receipt.mjs';
 import crypto from 'node:crypto';
 import { envelopeFromJson, importSigningKey, keyIdFor, ZERO32 } from './receipt.mjs';
@@ -70,6 +72,11 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
                                        YATAVERSE_ARCHIVE_KEY_ID / YATAVERSE_ARCHIVE_APP_KEY. Provider proofs are not
                                        implemented, so a lease of grade R2 or R3 is reported as degraded.
   yataverse car-get <cid> [--scope all|block] [-o file.car]  export a root as a verified CARv1
+  yataverse site-pack <dir> -o <outdir>  pack a directory as a UnixFS site (the CID \`ipfs add -r --cid-version=1\` gives)
+                                       and write site-001.car, site-002.car, ... to import in that order with car-put.
+                                       Local only: nothing is sent. Symbolic links are refused. Names starting with "."
+                                       are left out and listed (as \`ipfs add -r\` does); --hidden true includes them,
+                                       which a site needs for .well-known/.
   yataverse asset-manifest <json|->    validate and canonicalize a training-asset manifest
   yataverse training-run-manifest <json|-> validate and canonicalize run provenance (unverified)
   yataverse asset-did <cid> [--domain host]  derive the deterministic Murakumo did:web for a CID
@@ -284,6 +291,35 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
       case 'training-run-manifest': {
         const manifest = canonicalTrainingRunManifest(readInput(f._[0]).toString('utf8'));
         stdout.write(manifest);
+        return 0;
+      }
+      case 'site-pack': {
+        if (!f._[0] || !f.o) throw new YataverseError('usage', 'site-pack <dir> -o <outdir> [--hidden true]');
+        const files = new Map(); const skipped = [];
+        const walk = (dir, rel) => {
+          for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+            const p = path.join(dir, e.name); const r = rel ? `${rel}/${e.name}` : e.name;
+            // Like `ipfs add -r` without -H: names starting with "." are left out unless asked for.
+            if (e.name.startsWith('.') && f.hidden !== 'true') { skipped.push(r); continue; }
+            if (e.isSymbolicLink()) throw new YataverseError('site-has-symbolic-link', r);
+            if (e.isDirectory()) walk(p, r);
+            else if (e.isFile()) files.set(r, fs.readFileSync(p));
+            else throw new YataverseError('site-entry-not-a-file', r);
+          }
+        };
+        walk(f._[0], '');
+        if (!files.size) throw new YataverseError('site-is-empty', f._[0]);
+        const site = packFiles(files);
+        const cars = siteCars(site.blocks);
+        fs.mkdirSync(f.o, { recursive: true });
+        const written = cars.map((c, i) => {
+          const file = path.join(f.o, `site-${String(i + 1).padStart(3, '0')}.car`);
+          fs.writeFileSync(file, c.car);
+          return { file, roots: c.roots, blocks: c.blocks, bytes: c.bytes };
+        });
+        let bytes = 0; for (const b of files.values()) bytes += b.length;
+        out({ root: site.root, dnslink: `dnslink=/ipfs/${site.root}`, files: files.size, fileBytes: bytes, blocks: site.blocks.size, cars: written,
+              ...(skipped.length ? { skippedHidden: skipped } : {}) });
         return 0;
       }
       case 'status': out(status(loadConfig())); return 0;

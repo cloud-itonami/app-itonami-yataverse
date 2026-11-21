@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { TOKEN, ENV, NOW, fakeStore, dataKeys } from './worker-fixtures.mjs';
 import { handle } from '../worker/src/index.mjs';
-import { isNameHost, parseDnslink, clearNameCache } from '../worker/src/names.mjs';
+import { isNameHost, underNameSuffix, parseDnslink, clearNameCache } from '../worker/src/names.mjs';
 import { packFiles } from '../src/unixfs.mjs';
 import { encodeCarV1, parseCar, CAR_CONTENT_TYPE } from '../src/car.mjs';
 import { rawCid } from '../src/cid.mjs';
@@ -42,6 +42,11 @@ test('isNameHost: one label under a configured suffix, and nothing when the var 
   assert.equal(isNameHost('demo.itonami.app', ENV), false);
   assert.equal(isNameHost('demo.itonami.app', { NAME_PLANE_SUFFIXES: 'itonami.app' }), false);   // a suffix must start with "."
   assert.equal(isNameHost('x.example.test', { NAME_PLANE_SUFFIXES: '.itonami.app, .example.test' }), true);
+  assert.equal(underNameSuffix('itonami.app', NAME_ENV), true);
+  assert.equal(underNameSuffix('a.b.itonami.app', NAME_ENV), true);
+  assert.equal(underNameSuffix('evilitonami.app', NAME_ENV), false);
+  assert.equal(underNameSuffix('yataverse.com', NAME_ENV), false);
+  assert.equal(underNameSuffix('itonami.app', ENV), false);
 });
 
 test('a name host serves files from its DNSLink with a type, an etag and the IPFS path', async () => {
@@ -107,6 +112,21 @@ test('a name host is read-only: no bytes-plane route exists on it', async () => 
   // API paths are site paths here: /health is not the Worker's liveness answer.
   assert.equal((await handle(req('/health'), NAME_ENV, deps)).status, 404);
   assert.equal((await handle(req(`/ipfs/${SITE.root}`), NAME_ENV, deps)).status, 404);
+});
+
+test('other hosts under a name suffix get neither a site nor the bytes-plane API', async () => {
+  const { deps, dns, s } = world(); const before = dataKeys(s).length;
+  const bytes = Buffer.from('write attempt'); const cid = rawCid(bytes);
+  for (const host of ['itonami.app', 'a.b.itonami.app', '-x.itonami.app', '_dnslink.demo.itonami.app']) {
+    for (const path of ['/health', `/ipfs/${SITE.root}`, '/.well-known/did.json', '/']) {
+      const res = await handle(req(path, { host }), NAME_ENV, deps);
+      assert.equal(res.status, 404, `${host}${path}`); assert.equal(await err(res), 'not-a-name-host');
+    }
+    const put = await handle(req(`/ipfs/${cid}`, { host, method: 'PUT', body: bytes,
+      headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/vnd.ipld.raw' } }), NAME_ENV, deps);
+    assert.equal(put.status, 404);
+  }
+  assert.equal(dataKeys(s).length, before); assert.equal(dns.length, 0);
 });
 
 test('with the name plane off, the same host gets the ordinary API and no DNS lookup', async () => {
