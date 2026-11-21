@@ -67,6 +67,10 @@
     // from its _dnslink TXT record. Empty: off. On since the owner approved the route above
     // (docs/name-plane-deploy-runbook.md). To turn it off, empty this and remove the route.
     "NAME_PLANE_SUFFIXES": ".itonami.app",
+    // Blocks one served file may need. Each block read is a subrequest and the Free plan allows
+    // 50 per request; the account's Workers plan could not be read when this was turned on
+    // (2026-11-21), so this stays at 40 (about 10 MiB). On a paid plan, remove it (default 128).
+    "NAME_PLANE_MAX_FILE_BLOCKS": "40",
     // Published receipt signing keys (/.well-known/yataverse-receipt-keys.json, did:web:yataverse.com).
     // keyId = sha256(0xed01 || public key). Times are Unix milliseconds. Rotation: add a key with
     // keyEpoch + 1, set notAfter on the old one and keep it listed; revocation sets revokedAt.
