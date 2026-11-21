@@ -21,6 +21,7 @@ import {
 } from './retention.mjs';
 import { checkWritableBlock, WRITABLE_CODECS } from './block.mjs';
 import { parseCar, CarError, CAR_CONTENT_TYPE } from './car.mjs';
+import { blockResource, carResource } from './cacao.mjs';
 import { checkClosure, DagError } from './dag.mjs';
 
 export const DEFAULT_MAX_CAR_BYTES = 32 * 1024 * 1024;
@@ -113,6 +114,9 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
     return Buffer.from(m[1], 'hex');
   };
   const jsonOrNull = async (res) => { try { return await res.json(); } catch { return null; } };
+  // What the receipt's `requester` must be: SHA-256 of the writer DID for a CACAO, of the token otherwise.
+  const requesterOf = (auth) => (authorize?.requesterDid
+    ? new Uint8Array(crypto.createHash('sha256').update(authorize.requesterDid).digest()) : requesterFor(auth));
 
   /** GET with same-parent-domain redirects. -> Buffer | null (absent). Throws on any doubt. */
   async function get(cid, { maxBytes = DEFAULT_MAX_BYTES } = {}) {
@@ -147,7 +151,7 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
     const bad = checkWritableBlock(cid, bytes);
     if (bad) throw new YataverseError(bad);
     if (!authorize) throw new YataverseError('no-authorization-configured');
-    const auth = await authorize();
+    const auth = await authorize({ resource: blockResource(cid) });
     const base = new URL(cfg.url);
     if (!okScheme(base)) throw new YataverseError('write-url-not-https');
     const rid = newRequestId(requestId);
@@ -186,7 +190,7 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
     }
     const put = await putBlock(cid, bytes, { requestId, leaseHeader });
     const receipt = await checkReceipt(put.body, { kind: KIND.block, subject: cidToBytes(cid), contentDigest: new Uint8Array(parseCid(cid).digest),
-      size: bytes.length, requestId: put.requestId, requester: requesterFor(put.auth) });
+      size: bytes.length, requestId: put.requestId, requester: requesterOf(put.auth) });
     let archive;
     if (leaseChecked) {
       // The answer must be the retention promise that was asked for, not an ordinary gateway receipt.
@@ -241,7 +245,7 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
     const local = checkCarLocally(bytes);
     const rid = newRequestId(requestId);
     if (!authorize) throw new YataverseError('no-authorization-configured');
-    const auth = await authorize();
+    const auth = await authorize({ resource: carResource(crypto.createHash('sha256').update(bytes).digest('hex')) });
     const base = new URL(cfg.url);
     if (!okScheme(base)) throw new YataverseError('write-url-not-https');
     const res = await fetchImpl(new URL(cfg.prefix, base), {
@@ -254,7 +258,7 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
     let size = 0; for (const b of local.blocks.values()) size += b.length;
     const external = Array.isArray(j?.external) ? j.external.map(String) : [];
     const receipt = await checkReceipt(j, { kind: KIND.car, subject: rootsCommitment(local.roots),
-      contentDigest: blockSetDigest([...local.blocks.keys(), ...external]), size, requestId: rid, requester: requesterFor(auth) });
+      contentDigest: blockSetDigest([...local.blocks.keys(), ...external]), size, requestId: rid, requester: requesterOf(auth) });
     const seen = new Map();
     for (const r of local.roots) {
       const back = await getCar(r, { scope: 'all' });

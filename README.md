@@ -420,7 +420,20 @@ deploy. Write tokens and service auth are still accepted and do not use a nonce.
 Residual risks. There is no one-time nonce store, so a captured header can be replayed until the nonce or
 the CACAO expires; because the resource names the content, a replay can only repeat the same
 content-addressed write (it still spends rate limit). Authorization is a list of writer DIDs; a delegation
-chain rooted in a Kotoba ID is not implemented. The CLI does not mint these yet (`mintDirect` is the API).
+chain rooted in a Kotoba ID is not implemented.
+
+From the CLI and the MCP server (JUN-1428): set `YATAVERSE_AUTH_MODE=cacao`, or `"authMode": "cacao"` in
+`~/.config/yataverse/config.json`. Every block and CAR write then asks the service for a nonce and signs a
+CACAO with the admin key (`yataverse admin keygen`; its `did:key` must be in the service's
+`CACAO_WRITER_DIDS`). The receipt check expects `requester` = SHA-256 of that DID. Nothing is cached: one
+nonce, one write. Requests that are not a block or a CAR write (for example publishing a retention status)
+cannot be signed this way and fail with `cacao-needs-a-resource`. Without the setting, writes are authorized
+as before.
+
+```sh
+YATAVERSE_AUTH_MODE=cacao yataverse put file.bin
+YATAVERSE_AUTH_MODE=cacao yataverse car-put site.car
+```
 
 ### UnixFS sites (dag-pb)
 

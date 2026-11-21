@@ -2,6 +2,7 @@
 // service-account secret (exchanged at Authn for a short-lived Biscuit), static value.
 // Nothing here mints a credential: a service-account secret is issued by a tenant admin.
 import { execFileSync } from 'node:child_process';
+import { mintDirect } from './cacao.mjs';
 
 export class AuthError extends Error {
   constructor(code, detail) { super(detail ? `${code}: ${detail}` : code); this.code = code; }
@@ -22,13 +23,36 @@ export function runAuthCmd(argv, { exec = execFileSync } = {}) {
 }
 
 /**
- * -> async () => "Biscuit ..." | "CACAO ..." | static value. Throws AuthError if none is configured.
+ * -> async ({resource}?) => "Biscuit ..." | "CACAO ..." | static value. Throws AuthError if none is configured.
+ *
+ * With `cfg.authMode === 'cacao'` each call asks the service for a nonce (GET /auth/nonce) and signs
+ * a CACAO with `cacaoKey` (the admin key, a `{privateKey, did}` from cacao.mjs) that names `resource`,
+ * the one thing this request writes. The returned function then carries `requesterDid`, which the
+ * service records in the receipt. Nothing is cached: a nonce lives two minutes and names one write.
  * `allowInsecureForTests` exists for the unit tests' local fake Authn only; the CLI and
  * MCP never set it and it cannot be set from the environment.
  */
 export function makeAuthorizer(cfg, { fetchImpl = fetch, now = Date.now, exec = execFileSync,
-                                      authnHosts = DEFAULT_AUTHN_HOSTS, allowInsecureForTests = false } = {}) {
+                                      authnHosts = DEFAULT_AUTHN_HOSTS, allowInsecureForTests = false, cacaoKey = null } = {}) {
   let cache = null;
+  if (cfg.authMode === 'cacao') {
+    if (!cacaoKey?.did || !cacaoKey.privateKey) throw new AuthError('no-admin-key', 'run: yataverse admin keygen');
+    const base = new URL(cfg.url);
+    if (!(base.protocol === 'https:' || (allowInsecureForTests && base.protocol === 'http:'))) throw new AuthError('write-url-not-https');
+    const authorizeCacao = async function authorize({ resource } = {}) {
+      if (typeof resource !== 'string' || !resource) throw new AuthError('cacao-needs-a-resource', 'this request cannot be authorized by CACAO');
+      let res;
+      try { res = await fetchImpl(new URL('/auth/nonce', base), { redirect: 'manual', signal: AbortSignal.timeout(30_000), headers: { accept: 'application/json' } }); }
+      catch { throw new AuthError('nonce-unreachable'); }
+      if (res.status !== 200) throw new AuthError('nonce-refused', `HTTP ${res.status}`);
+      let j; try { j = await res.json(); } catch { throw new AuthError('nonce-bad-response'); }
+      if (typeof j?.nonce !== 'string' || !/^[\x21-\x7e]{16,256}$/.test(j.nonce)) throw new AuthError('nonce-bad-response');
+      const { cacaoB64 } = mintDirect(cacaoKey, { aud: base.origin, domain: base.host, nonce: j.nonce, resources: [resource], ttlSec: 120, now: now() });
+      return `CACAO ${cacaoB64}`;
+    };
+    authorizeCacao.requesterDid = cacaoKey.did;
+    return authorizeCacao;
+  }
   return async function authorize() {
     if (cfg.authCmd) return runAuthCmd(cfg.authCmd, { exec });
 
