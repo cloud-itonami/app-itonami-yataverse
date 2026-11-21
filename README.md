@@ -422,6 +422,16 @@ the CACAO expires; because the resource names the content, a replay can only rep
 content-addressed write (it still spends rate limit). Authorization is a list of writer DIDs; a delegation
 chain rooted in a Kotoba ID is not implemented.
 
+Which scheme writers use (JUN-1429). Since Worker version `a9f8bdfd-32f1-470d-b595-b825e104b9dc`
+(2026-11-21, merge commit `4ff2563e7dbe51ec720fc9f271f2723686cdeb6d`) every accepted block, leased block
+and CAR write logs one line:
+`{"event":"yataverse-write","scheme":"token"|"cacao"|"service-auth","kind":…,"requester":"<12 hex>","bytes":n}`.
+`requester` is the start of the receipt's requester digest; the line carries no token, DID or CID. Count them
+in the Worker's logs (Cloudflare dashboard, Workers, `yataverse-bytes`, Logs, filter on `yataverse-write`),
+or watch them live with `wrangler tail yataverse-bytes --format json`. Writes before that version were not
+logged, so earlier use cannot be measured. Measured right after the deploy: one `cacao` line and one `token`
+line for two CLI writes.
+
 From the CLI and the MCP server (JUN-1428): set `YATAVERSE_AUTH_MODE=cacao`, or `"authMode": "cacao"` in
 `~/.config/yataverse/config.json`. Every block and CAR write then asks the service for a nonce and signs a
 CACAO with the admin key (`yataverse admin keygen`; its `did:key` must be in the service's
