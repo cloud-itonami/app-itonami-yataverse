@@ -74,7 +74,9 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse car-get <cid> [--scope all|block] [-o file.car]  export a root as a verified CARv1
   yataverse site-pack <dir> -o <outdir>  pack a directory as a UnixFS site (the CID \`ipfs add -r --cid-version=1\` gives)
                                        and write site-001.car, site-002.car, ... to import in that order with car-put.
-                                       Local only: nothing is sent. Symbolic links are refused.
+                                       Local only: nothing is sent. Symbolic links are refused. Names starting with "."
+                                       are left out and listed (as \`ipfs add -r\` does); --hidden true includes them,
+                                       which a site needs for .well-known/.
   yataverse asset-manifest <json|->    validate and canonicalize a training-asset manifest
   yataverse training-run-manifest <json|-> validate and canonicalize run provenance (unverified)
   yataverse asset-did <cid> [--domain host]  derive the deterministic Murakumo did:web for a CID
@@ -292,11 +294,13 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         return 0;
       }
       case 'site-pack': {
-        if (!f._[0] || !f.o) throw new YataverseError('usage', 'site-pack <dir> -o <outdir>');
-        const files = new Map();
+        if (!f._[0] || !f.o) throw new YataverseError('usage', 'site-pack <dir> -o <outdir> [--hidden true]');
+        const files = new Map(); const skipped = [];
         const walk = (dir, rel) => {
           for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
             const p = path.join(dir, e.name); const r = rel ? `${rel}/${e.name}` : e.name;
+            // Like `ipfs add -r` without -H: names starting with "." are left out unless asked for.
+            if (e.name.startsWith('.') && f.hidden !== 'true') { skipped.push(r); continue; }
             if (e.isSymbolicLink()) throw new YataverseError('site-has-symbolic-link', r);
             if (e.isDirectory()) walk(p, r);
             else if (e.isFile()) files.set(r, fs.readFileSync(p));
@@ -314,7 +318,8 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
           return { file, roots: c.roots, blocks: c.blocks, bytes: c.bytes };
         });
         let bytes = 0; for (const b of files.values()) bytes += b.length;
-        out({ root: site.root, dnslink: `dnslink=/ipfs/${site.root}`, files: files.size, fileBytes: bytes, blocks: site.blocks.size, cars: written });
+        out({ root: site.root, dnslink: `dnslink=/ipfs/${site.root}`, files: files.size, fileBytes: bytes, blocks: site.blocks.size, cars: written,
+              ...(skipped.length ? { skippedHidden: skipped } : {}) });
         return 0;
       }
       case 'status': out(status(loadConfig())); return 0;

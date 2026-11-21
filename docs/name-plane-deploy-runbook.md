@@ -63,7 +63,9 @@ yataverse site-pack ./site -o ./site-cars        # prints root, dnslink value an
 yataverse car-put ./site-cars/site-001.car       # then 002, 003, ... in order
 ```
 
-`site-pack` is local and sends nothing. `car-put` verifies the signed receipt and reads the blocks
+`site-pack` is local and sends nothing. Like `ipfs add -r`, it leaves out names starting with `.`
+and lists them as `skippedHidden`; a site that serves `.well-known/` needs `--hidden true` (then
+remove `.git`, `.DS_Store` and the like from the directory first, because everything is included). `car-put` verifies the signed receipt and reads the blocks
 back. Keep the printed `root`. Check one block: `yataverse verify <root>`.
 
 ## 5. Turn it on

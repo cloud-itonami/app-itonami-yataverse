@@ -54,6 +54,23 @@ test('site-pack writes ordered CARs and prints the root; it sends nothing', asyn
   assert.deepEqual(parseCar(fs.readFileSync(r.cars[0].file)).roots, [r.root]);
 });
 
+test('site-pack leaves out dot names unless --hidden true, and says which', async () => {
+  const dir = tmp();
+  fs.mkdirSync(path.join(dir, '.well-known')); fs.mkdirSync(path.join(dir, '.git'));
+  fs.writeFileSync(path.join(dir, 'index.html'), 'home');
+  fs.writeFileSync(path.join(dir, '.well-known', 'did.json'), '{}');
+  fs.writeFileSync(path.join(dir, '.git', 'HEAD'), 'ref');
+  fs.writeFileSync(path.join(dir, '.DS_Store'), 'x');
+  const run = async (extra) => { const o = sink(); const e = sink(); assert.equal(await main(['site-pack', dir, '-o', tmp(), ...extra], { stdout: o.s, stderr: e.s }), 0, e.text()); return JSON.parse(o.text()); };
+  const plain = await run([]);
+  assert.equal(plain.files, 1);
+  assert.deepEqual(plain.skippedHidden.sort(), ['.DS_Store', '.git', '.well-known']);
+  assert.equal(plain.root, packFiles({ 'index.html': 'home' }).root);
+  const all = await run(['--hidden', 'true']);
+  assert.equal(all.files, 4); assert.equal(all.skippedHidden, undefined);
+  assert.equal(all.root, packFiles({ 'index.html': 'home', '.well-known/did.json': '{}', '.git/HEAD': 'ref', '.DS_Store': 'x' }).root);
+});
+
 test('site-pack refuses symbolic links, an empty directory and missing arguments', async () => {
   const run = async (args) => { const o = sink(); const e = sink(); return { code: await main(args, { stdout: o.s, stderr: e.s }), err: e.text() }; };
   const dir = tmp();
