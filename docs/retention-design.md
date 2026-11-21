@@ -291,3 +291,12 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
   - **inventory:** canonical DAG-CBOR の `{"v": 1, "blocks": [CID link, …]}`（CID binary の昇順、重複なし）の sha256 を lease の `subject` にする。
   - **確認（2026-11-21）:** `npm test` は 126 件すべて通過（既存 113、追加 13）。変更前の `main`（`0fe6f74`）の code は、`storeClass 3` の受領証を `unknown-store-class` で拒否した（一回限りの確認）。検査 7 か所を 1 つずつ外すと、どれも test が失敗した。
   - **未実装:** 保持用 bucket、`storeClass 3` の受領証の発行、検証役の process、状態の公開、CLI の command、P1 の piece commitment と challenge。EIP-712 の digest を外部の参照実装と照合した test vector は、この 2 つの型にはまだない。
+- **S1-3 検証役の最小実装（[AWAI-3671](https://linear.app/kotobalabs/issue/AWAI-3671)）:** `src/verifier.mjs`（1 回の実行: lease と受領証の検証、保持用 bucket の確認、判定、状態への署名、根拠の記録）、`src/archive-probe.mjs`（S3 互換 API の読み取りだけを行う probe）、command `yataverse retention-verify-once`。SigV4 の署名は `worker/src/sigv4.mjs` から `src/sigv4.mjs` に移し、Worker 側は再 export にした。依存は足していない。
+  - **数え方:** 運営者の保持コピーは、lease のすべての block について「lease に数えられる `storeClass 3` の受領証」と「bucket の確認の合格」が揃ったときだけ 1 と数える。確認は、存在、大きさ（受領証の `size` と一致）、lock の mode が `COMPLIANCE`、lock の期限が lease の `retentionUntil` 以上。`--sample-read true` のときは全 bytes を読んで受領証の `contentDigest` と比べる。全読みをしない場合、根拠の記録に `read: false` と残る。
+  - **provider node は数えない。** P1 の証明が未実装なので、provider の複製は常に 0 と数える。R2 と R3 の lease は、bucket の確認が通っても `degraded` になり、その理由が根拠の記録に残る。
+  - **状態:** lease の期限以降は `expired`、開始前は `degraded`、それ以外は等級の条件で `policy-satisfied` か `degraded`。`validUntil` は `observedAt` から `challengePeriod` の 2 倍で、`policy-satisfied` のときは lease の期限を超えない。
+  - **状態を出さない場合:** lease が検証を通らないとき、署名鍵が lease の `verifier` でないとき。数えられない受領証や bucket の確認の失敗では止まらず、`degraded` の状態と理由を出す。
+  - **根拠の記録:** canonical DAG-CBOR の `{v, leaseId, observedAt, receipts: [受領証の record の CID], checks: [...], notes: [...]}`。状態の `evidenceRoot` はその sha256。
+  - **鍵の扱い:** 署名鍵は file から読む。所有者以外が読める file は使わない。保持用 bucket の資格情報は環境変数（`YATAVERSE_ARCHIVE_KEY_ID`、`YATAVERSE_ARCHIVE_APP_KEY`）から読む。どちらも出力しない。probe は HEAD と GET だけを送る。
+  - **確認（2026-11-21）:** `npm test` は 135 件すべて通過（既存 126、追加 9）。検査 8 か所を 1 つずつ外すと、どれも test が失敗した。
+  - **未確認・未実装:** 本物の B2 bucket に対しては一度も実行していない。HEAD の応答に lock の header（`x-amz-object-lock-mode`、`x-amz-object-lock-retain-until-date`）が含まれるか、どの鍵の権限が要るかは、bucket を作ってから確かめる。状態と根拠の公開（§6 の endpoint）、定期実行、検証役を別の主体として動かす運用は未実装で、command は結果を出力するだけである。
