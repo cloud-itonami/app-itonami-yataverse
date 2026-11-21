@@ -1,7 +1,8 @@
 // DAG traversal over the codecs the bytes plane accepts: raw blocks are leaves, dag-cbor
-// blocks link through tag 42. Anything else is refused instead of being skipped, so a
+// blocks link through tag 42, dag-pb (UnixFS) blocks through their PBLinks. Anything else is refused instead of being skipped, so a
 // "complete" closure is never claimed over links it could not see.
-import { parseCid, cidFromBytes, CODEC_RAW, CODEC_DAG_CBOR } from './cid.mjs';
+import { parseCid, cidFromBytes, CODEC_RAW, CODEC_DAG_CBOR, CODEC_DAG_PB } from './cid.mjs';
+import { unixfsLinks, DagPbError } from './dag-pb.mjs';
 import { decodeDagCbor, linksIn } from './dag-cbor.mjs';
 
 export class DagError extends Error { constructor(code, detail) { super(detail ? `${code}: ${detail}` : code); this.code = code; } }
@@ -11,12 +12,16 @@ export function linksOf(cid, bytes) {
   const p = parseCid(cid);
   if (!p) throw new DagError('bad-cid', cid);
   if (p.codec === CODEC_RAW) return [];
+  if (p.codec === CODEC_DAG_PB) {
+    try { return unixfsLinks(bytes); }
+    catch (e) { if (e instanceof DagPbError) throw new DagError('block-not-unixfs', `${cid} ${e.code}`); throw e; }
+  }
   if (p.codec !== CODEC_DAG_CBOR) throw new DagError('codec-not-traversable', cid);
   return linksIn(decodeDagCbor(bytes).value).map((b) => {
     const c = cidFromBytes(b);
     if (!c) throw new DagError('link-not-cidv1', cid);
     const lp = parseCid(c);
-    if (lp.codec !== CODEC_RAW && lp.codec !== CODEC_DAG_CBOR) throw new DagError('link-codec-not-traversable', c);
+    if (lp.codec !== CODEC_RAW && lp.codec !== CODEC_DAG_CBOR && lp.codec !== CODEC_DAG_PB) throw new DagError('link-codec-not-traversable', c);
     return c;
   });
 }

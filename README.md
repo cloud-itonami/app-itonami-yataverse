@@ -3,7 +3,7 @@
 CLI and MCP server for the **yataverse** bytes plane (the bytes plane was formerly called kotobase; kotobase now names the datom/graph plane, root ADR-2610101900): content-addressed
 blocks, **verified on every read and after every write**. Zero dependencies, Node 18+.
 
-New uploads use CIDv1/raw/sha2-256. Reads also accept legacy CIDv0 dag-pb blocks and other supported
+New uploads use CIDv1/raw/sha2-256 (dag-cbor, and dag-pb for UnixFS sites, are also accepted). Reads also accept legacy CIDv0 dag-pb blocks and other supported
 CIDv1 sha2-256 blocks, including multi-byte codec IDs in the Multiformats unsigned-varint format.
 `yataverse` requests the raw block representation and refuses any response whose bytes do not match
 the CID's multihash.
@@ -331,9 +331,9 @@ KV, D1 or Durable Objects.
 
 | Request | Behaviour |
 |---|---|
-| `PUT /ipfs/<cid>` | `Authorization: Bearer <write token>`, `Content-Type: application/vnd.ipld.raw`. CIDv1/sha2-256 with codec raw or dag-cbor (canonical DAG-CBOR only), at most `MAX_BLOCK_BYTES`. The body must hash to the CID; it is stored at `B2_PREFIX + cid`, read back from B2 and verified again before `201`. |
+| `PUT /ipfs/<cid>` | `Authorization: Bearer <write token>`, `Content-Type: application/vnd.ipld.raw`. CIDv1/sha2-256 with codec raw, dag-cbor (canonical DAG-CBOR only) or dag-pb (a plain UnixFS node only, see "UnixFS sites" below), at most `MAX_BLOCK_BYTES`. The body must hash to the CID; it is stored at `B2_PREFIX + cid`, read back from B2 and verified again before `201`. |
 | `GET` / `HEAD /ipfs/<cid>` | Served from B2 after verification. On a B2 miss, `READ_FALLBACK_URL` (the self-hosted Reader at `ipfs.yataverse.com`) is tried and its bytes are verified the same way. |
-| `GET /ipfs/<cid>?format=car` (or `Accept: application/vnd.ipld.car`) | CARv1 with `order=dfs; dups=n`. `dag-scope=all` (default) follows DAG-CBOR links down to raw leaves; `dag-scope=block` returns the root alone. Every block is verified first; a missing block or an untraversable codec is an error, never a truncated CAR. |
+| `GET /ipfs/<cid>?format=car` (or `Accept: application/vnd.ipld.car`) | CARv1 with `order=dfs; dups=n`. `dag-scope=all` (default) follows DAG-CBOR and UnixFS (dag-pb) links down to raw leaves; `dag-scope=block` returns the root alone. Every block is verified first; a missing block or an untraversable codec is an error, never a truncated CAR. |
 | `POST /ipfs/` | `Authorization: Bearer <write token>`, `Content-Type: application/vnd.ipld.car`, a CARv1 or CARv2 (`.awai`) body. Before anything is stored: canonical DAG-CBOR header, every block passes the write rules, every root is in the CAR, the closure is complete (in the CAR or already stored) and no block is unreachable. Then each block is stored and read back. Limits: `MAX_CAR_BLOCKS` (256), `MAX_CAR_BYTES` (32 MiB). |
 | Per-person writes (`POST /ipfs/` only) | **ATProto service auth** (AWAI-3274, owner decision 2026-11-18, `worker/src/service-auth.mjs`): `Authorization: Bearer <JWT>` with header `alg: ES256K`, `aud` = `SERVICE_AUTH_AUD` (`did:web:yataverse.com`), `lxm` = `com.yataverse.importCar`, `iat`/`exp` with a lifetime of at most 300 s. The issuer must be a `did:plc` (resolved at `PLC_DIRECTORY_URL`) or `did:web` whose `#atproto_pds` is in `SERVICE_AUTH_PDS` (`https://pds.aozora.app`) and whose `#atproto` secp256k1 key signed the JWT (low-S; verified with `@noble/curves` 1.9.7). That PDS must also report the repo active (`com.atproto.sync.getRepoStatus`), because anyone can publish a DID document naming it. `SERVICE_AUTH_DENY_DIDS` revokes a person; removing `SERVICE_AUTH_AUD` turns the scheme off (`503`). The request is counted by the rate limiter before any lookup. The receipt's `requester` is the SHA-256 of the DID. Neither the app nor the Worker holds a secret. Residual risks: no `jti` replay store (no KV/D1/DO), so a token can be reused for the same method until it expires; DID documents and repo status are cached for 60 s per isolate. Block `PUT` still needs a write token. |
 | PDS-attested writes (`POST /ipfs/` only) | AWAI-3370, owner decision 2026-11-18. A PDS that never holds its members' repo keys, as Aozora's does not, signs `{iss: <PDS did:web>, sub: <member DID>, aud, lxm, iat, exp}` with its own service key. The Worker accepts it only when `iss` is pinned in `SERVICE_AUTH_PDS_KEYS` (`<did:web>=<secp256k1 Multikey>`) and that PDS's origin is in `SERVICE_AUTH_PDS`. The same `aud`, `lxm` and lifetime rules apply. The member (`sub`: `did:plc`, `did:web` or `did:key`) must be reported active by that PDS, and `SERVICE_AUTH_DENY_DIDS` applies to the member. The receipt's `requester` is the SHA-256 of `sub`. A token whose `sub` differs from its `iss` from any other issuer is refused. Empty by default: no PDS is pinned until its key is provisioned. |
@@ -344,10 +344,56 @@ KV, D1 or Durable Objects.
 | Receipts | **Every successful write returns a signed storage receipt** (AWAI-3305; design [docs/storage-receipt-design.md](docs/storage-receipt-design.md)): `receipt` is a `YataverseStorageReceipt` v1 (EIP-712 typed data, Ed25519 over the EIP-712 digest), `receiptCid` its canonical DAG-CBOR record, stored at `ipld/receipts/by-request/<requestId>`. It claims only that this gateway stored and read back the bytes (`state` 1 `local-durable-readback`, `storeClass` 1 `edge-gateway`, `retentionUntil` 0); it is not retention or independent-replica evidence. Optional header `Yataverse-Request-Id: <64 hex>` (default: the content digest). A repeat gets the same receipt; a different write under the same id is `409 request-id-conflict` and is not stored. `requester` is the SHA-256 of the write token, 0 for Drive. Without a signing key that is published and valid now, writes are `503` and nothing is stored. Drive packs get the receipt in the same JSON; Drive does not check it yet. |
 | `GET /.well-known/…` | `yataverse-receipt-keys.json` (signing keys: `keyId`, `keyEpoch`, public JWK, `notBefore`/`notAfter`/`revokedAt` in Unix ms), `did.json` (`did:web:yataverse.com`), `yataverse-policy/<revision>.json` and `current.json` (the limits and store a receipt's `policyRevision` names; every revision is also a dag-cbor block at `/ipfs/<cid>`). |
 | `GET /health` | Liveness only. |
+| `GET` / `HEAD https://{name}{suffix}/{path}` | **Name plane** (JUN-1414, `worker/src/names.mjs`; off by default). See "Name plane" below. |
 
 The Worker never follows a redirect. Write tokens are checked against `WRITE_TOKEN_SHA256`
 (comma-separated SHA-256 hex digests), so the Worker holds no token in clear. Verifying the
 Authn Biscuit instead is a follow-up: the Authn service does not publish its verification key.
+
+### UnixFS sites (dag-pb)
+
+Owner decision 2026-11-21 (JUN-1414): the store accepts dag-pb blocks when they are plain UnixFS,
+so a site keeps the CID an IPFS node gives it. Accepted (`src/dag-pb.mjs`): a Directory with named
+links sorted by name, a File with unnamed chunk links whose sizes add up (or inline data), and the
+legacy Raw leaf. Links must be CIDv1/sha2-256 with codec raw or dag-pb. Refused, with
+`not-accepted-unixfs:<reason>`: HAMT-sharded directories, symlinks, metadata nodes, the optional
+mode/mtime fields, CIDv0 links, and any block that is not in canonical form (decoding and encoding
+it again must give the same bytes). CAR import and export follow UnixFS links like DAG-CBOR links.
+
+`packFiles` in `src/unixfs.mjs` packs a file tree with Kubo's defaults for CIDv1 (raw leaves,
+262144-byte chunks, one level of at most 174 chunks, so files up to about 45 MiB). One local
+comparison against `ipfs add -r --cid-version=1 -n` matched for every file and directory:
+[docs/unixfs-kubo-comparison-2026-11-21.md](docs/unixfs-kubo-comparison-2026-11-21.md). That is
+evidence for those inputs and that Kubo version, not a guarantee for all inputs.
+
+### Name plane
+
+A host that is one label under a suffix in `NAME_PLANE_SUFFIXES` (for example `tsukuru.itonami.app`
+with `.itonami.app`) is served as a site:
+
+1. The Worker reads the TXT record `_dnslink.{host}` over DNS-over-HTTPS (`NAME_PLANE_DOH_URL`,
+   default `https://cloudflare-dns.com/dns-query`). It must hold exactly one
+   `dnslink=/ipfs/<CIDv1>[/path]`. No record is `404 name-not-published`, several are
+   `502 dnslink-ambiguous`, an `/ipns/` target is `501 dnslink-ipns-not-supported`. A clear answer
+   is cached for 60 s per isolate; a DNS failure is not cached.
+2. It walks the UnixFS directory from that CID. A directory without a trailing slash is a `301` to
+   the slash; with one, its `index.html` is served, or `404 no-index`. There is no directory listing
+   and no single-page-app fallback.
+3. The file is returned with a content type from its extension, `ETag: "<file CID>"` (so
+   `If-None-Match` gives `304`), `Cache-Control: public, max-age=300`, `X-Content-Type-Options: nosniff`
+   and `X-Ipfs-Path`. Limits: `NAME_PLANE_MAX_FILE_BLOCKS` (128) and `NAME_PLANE_MAX_FILE_BYTES`
+   (32 MiB); a larger file is `413`.
+
+Every block goes through the same verified read as `/ipfs/<cid>`, so the bytes served hash to the
+CID the name points at. A block the store does not hold is `502 site-block-not-found`, never partial
+content. A name host answers `GET` and `HEAD` only (`405` otherwise): the write, receipt, Drive and
+`/.well-known` routes of the bytes plane do not exist there, and `/ipfs/...` is an ordinary site path.
+Path parts that decode to `.`, `..`, an empty part, or contain `/`, `\` or NUL are `400 bad-path`.
+
+It is **off** in `wrangler.jsonc` (`NAME_PLANE_SUFFIXES` is empty) and no route for such hosts is
+configured. Turning it on is a production route change: it needs the owner's approval, a suffix in
+the var, and a route for those hosts on this Worker. The site's blocks must be written to the store
+first (`POST /ipfs/` with a CAR of the UnixFS DAG). IPNS names are not resolved.
 
 Merging does **not** deploy it. Deploying adds the `yataverse.com` custom domain and needs the
 owner's approval and these secrets: `B2_ENDPOINT`, `B2_BUCKET`, `B2_KEY_ID`, `B2_APP_KEY`,

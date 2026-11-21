@@ -21,6 +21,10 @@
 //   PUT|GET|HEAD|OPTIONS /awai-drive/v1/packs/<sha256>
 //                          Awai Drive encrypted snapshot packs (see drive-packs.mjs).
 //   GET /health           liveness, no configuration values.
+//   GET|HEAD https://{name}{suffix}/{path}
+//                          the name plane (names.mjs): a host one label under a suffix in
+//                          NAME_PLANE_SUFFIXES is served as a site from its DNSLink. Read-only;
+//                          none of the routes above exist on such a host. Off when the var is empty.
 //   GET /.well-known/yataverse-receipt-keys.json, /.well-known/did.json,
 //       /.well-known/yataverse-policy/<revision>.json (and current.json)
 //                          the receipt signing keys (did:web:yataverse.com) and the write policy.
@@ -48,6 +52,7 @@ import { handleDrivePack, DRIVE_PACK_PATH } from './drive-packs.mjs';
 import { admitWriteRequest, admitWriteBytes } from './write-limits.mjs';
 import { isServiceAuth, verifyServiceAuth, IMPORT_CAR_LXM } from './service-auth.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
+import { isNameHost, handleName } from './names.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
 // Each imported block costs two store subrequests (PUT, readback GET) and each exported block
@@ -566,6 +571,14 @@ function ipfsPreflight(request, env, methods) {
 
 export async function handle(request, env, deps = {}) {
   const url = new URL(request.url);
+  // A name host is a published site, not the bytes-plane API: decide before any other route.
+  if (isNameHost(url.hostname, env)) {
+    deps = { fetchImpl: (input, init) => fetch(input, init), now: () => new Date(), ...deps };
+    const store = b2(env, deps);
+    if (!store) return fail(503, 'store-not-configured');
+    try { return await handleName(request, url, env, deps, (cid) => readBlock(cid, env, deps, store)); }
+    catch (e) { return storeFailure(e); }
+  }
   if (url.pathname === '/ipfs' || url.pathname.startsWith('/ipfs/')) {
     const methods = (url.pathname === '/ipfs' || url.pathname === '/ipfs/') ? 'POST' : 'GET, HEAD';
     if (request.method === 'OPTIONS') return ipfsPreflight(request, env, methods);
