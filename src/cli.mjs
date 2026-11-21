@@ -14,7 +14,7 @@ import {
   leaseFromTerms, signLeaseAsRequester, signLeaseAsVerifier, leaseProposalToJson, leaseProposalFromJson, verifyLeaseProposal,
   verifyLease, verifyStatus, gradeSatisfied, GRADE, STATUS,
 } from './retention.mjs';
-import { cidToBytes } from './cid.mjs';
+import { cidToBytes, cidFromBytes } from './cid.mjs';
 import { statusName } from './verifier.mjs';
 import { runVerifierOnce } from './verifier.mjs';
 import { makeArchiveProbe } from './archive-probe.mjs';
@@ -47,9 +47,19 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
                                        as the verifier the proposal names: check it and add the second signature
   yataverse put <file> --lease <lease.json>   write under that lease: the answer must be a retention receipt
                                        (store class operator-archive) for the lease, or the command fails
+  yataverse retention-status --lease-id <0x id> | --cid <cid>   [--keys <keys.json>]
   yataverse retention-status --status <status.json> --lease <lease.json> --keys <keys.json>
-                                       check a retention status record against its lease and the published keys;
-                                       a record past its validUntil is refused (the state is then unknown)
+                                       fetch the published status of a lease or block (or read a saved one) and
+                                       check it against its lease and the published keys; a record past its
+                                       validUntil is refused (the state is then unknown)
+  yataverse retention-publish --status <status.json> --lease <lease.json> [--evidence <evidence.cbor>]
+                                       publish a verifier-signed status (and its evidence record) to the host
+  yataverse retention-verify-sweep --registry <dir> --keys <keys.json> --signing-key-file <jwk> --key-epoch <n>
+                        [--archive-endpoint U --archive-bucket B ...] [--sample-read true] [--publish true]
+                                       run the verifier over every <name>.lease.json in the directory (with
+                                       <name>.write.json when present), write <name>.status.json and
+                                       <name>.evidence.cbor, and publish them when asked. Meant to be run on a
+                                       schedule by the verifier, at most one challenge period apart.
   yataverse retention-verify-once --lease <lease.json> --keys <keys.json> --signing-key-file <jwk> --key-epoch <n>
                         [--receipts <a.json,b.json,...>] [--inventory <cids.json>] [--sample-read true]
                         [--archive-endpoint U --archive-bucket B [--archive-prefix P] [--archive-region R]]
@@ -197,6 +207,36 @@ async function readSigningKey(file) {
   return importSigningKey(fs.readFileSync(file, 'utf8'));
 }
 
+/** One verifier run from files (shared by retention-verify-once and retention-verify-sweep). */
+async function verifyOnce({ f, signer, leaseFile, receiptFiles, env, fetchImpl, now }) {
+  const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
+  // A receipt file is a bare envelope or a write response; a locking write's response also
+  // names the version it locked, which the verifier then checks instead of the newest one.
+  const versions = {};
+  const receiptEnvs = receiptFiles.map((p) => {
+    const j = readJson(p);
+    if (typeof j?.cid === 'string' && typeof j?.archive?.versionId === 'string') versions[j.cid] = j.archive.versionId;
+    return envelopeFromJson(j && j.v === 1 && j.sig ? j : j?.receipt);
+  });
+  const probe = f.archiveEndpoint ? makeArchiveProbe({ endpoint: f.archiveEndpoint, bucket: f.archiveBucket, prefix: f.archivePrefix ?? '',
+    region: f.archiveRegion, keyId: env.YATAVERSE_ARCHIVE_KEY_ID, secret: env.YATAVERSE_ARCHIVE_APP_KEY, ...(fetchImpl ? { fetchImpl } : {}) }) : null;
+  return runVerifierOnce({ leaseEnv: leaseEnvelopeFromJson(readJson(leaseFile)), receiptEnvs, keys: readJson(f.keys), probe, signer,
+    keyEpoch: Number(f.keyEpoch), now: now(), inventory: f.inventory ? readJson(f.inventory) : undefined, sampleRead: f.sampleRead === 'true', versions });
+}
+const verifyOutput = (run) => ({ summary: run.summary, status: statusEnvelopeToJson(run.status), statusCid: statusEnvelopeToDagCbor(run.status).cid,
+  evidenceCid: run.evidence.cid, evidenceRoot: '0x' + Buffer.from(run.evidence.root).toString('hex') });
+
+/** Publish the evidence record (as an ordinary dag-cbor block) and then the status that commits to it. */
+async function publishRun(client, leaseEnv, statusEnv, evidenceBytes) {
+  let evidence = null;
+  if (evidenceBytes) {
+    const digest = createHash('sha256').update(evidenceBytes).digest();
+    if (!digest.equals(Buffer.from(statusEnv.status.evidenceRoot))) { const e = new Error('evidence-does-not-match-the-status'); e.code = 'evidence-does-not-match-the-status'; throw e; }
+    evidence = (await client.putBytes(evidenceBytes, { codec: 'dag-cbor' })).cid;
+  }
+  return { ...(await client.publishStatus(leaseEnv, statusEnv)), evidenceCid: evidence };
+}
+
 function flags(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -301,40 +341,76 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         return 0;
       }
       case 'retention-status': {
-        for (const k of ['status', 'lease', 'keys']) if (!f[k]) { stderr.write(`yataverse: retention-status needs --${k}\n`); return 2; }
-        const keys = JSON.parse(fs.readFileSync(f.keys, 'utf8'));
-        const lease = await verifyLease(leaseEnvelopeFromJson(JSON.parse(fs.readFileSync(f.lease, 'utf8'))), keys);
-        const sj = JSON.parse(fs.readFileSync(f.status, 'utf8'));
-        const s = await verifyStatus(statusEnvelopeFromJson(sj && sj.v === 1 && sj.sig ? sj : sj?.status), lease, keys, { now: now() });
+        // Either a saved record checked against a saved lease and key set, or the published record
+        // of a lease or block, fetched from the host and verified here.
+        let lease, s, source;
+        if (f.leaseId || f.cid) {
+          const client = makeClient(loadConfig(), { ...(fetchImpl ? { fetchImpl } : {}), ...(f.keys ? { receiptKeys: JSON.parse(fs.readFileSync(f.keys, 'utf8')) } : {}) });
+          const got = await client.fetchStatus({ ...(f.leaseId ? { leaseId: f.leaseId } : { cid: f.cid }), now: now() });
+          if (!got) { stderr.write('yataverse: no published status (the state is unknown)\n'); return 1; }
+          ({ lease, status: s } = got); source = 'published';
+        } else {
+          for (const k of ['status', 'lease', 'keys']) if (!f[k]) { stderr.write(`yataverse: retention-status needs --lease-id, --cid, or --status with --lease and --keys\n`); return 2; }
+          const keys = JSON.parse(fs.readFileSync(f.keys, 'utf8'));
+          lease = await verifyLease(leaseEnvelopeFromJson(JSON.parse(fs.readFileSync(f.lease, 'utf8'))), keys);
+          const sj = JSON.parse(fs.readFileSync(f.status, 'utf8'));
+          s = await verifyStatus(statusEnvelopeFromJson(sj && sj.v === 1 && sj.sig ? sj : sj?.status), lease, keys, { now: now() });
+          source = 'file';
+        }
         const hex0x = (b) => '0x' + Buffer.from(b).toString('hex');
-        out({ verified: true, status: statusName(s.status), satisfied: s.status === STATUS.policySatisfied, grade: `R${s.grade}`,
+        out({ verified: true, source, status: statusName(s.status), satisfied: s.status === STATUS.policySatisfied, grade: `R${s.grade}`,
               operatorCopies: s.operatorCopies, providerReplicas: s.providerReplicas, countsMeetTheGrade: gradeSatisfied(lease, s),
               observedAt: new Date(s.observedAt).toISOString(), validUntil: new Date(s.validUntil).toISOString(),
-              leaseId: hex0x(s.leaseId), leaseEnds: new Date(lease.retentionUntil).toISOString(), evidenceRoot: hex0x(s.evidenceRoot), verifier: hex0x(s.keyId),
+              leaseId: hex0x(s.leaseId), leaseEnds: new Date(lease.retentionUntil).toISOString(), evidenceRoot: hex0x(s.evidenceRoot),
+              evidenceCid: cidFromBytes(Uint8Array.of(0x01, 0x71, 0x12, 0x20, ...s.evidenceRoot)), verifier: hex0x(s.keyId),
               claims: 'the lease verifier observed these counts at observedAt; trust it until validUntil, after which the state is unknown' });
         return 0;
       }
       case 'retention-verify-once': {
         for (const k of ['lease', 'keys', 'signingKeyFile', 'keyEpoch']) if (!f[k]) { stderr.write(`yataverse: retention-verify-once needs --${k.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase())}\n`); return 2; }
-        const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
         const signer = await readSigningKey(f.signingKeyFile);
-        // A receipt file is a bare envelope or a write response; a locking write's response also
-        // names the version it locked, which the verifier then checks instead of the newest one.
-        const versions = {};
-        const receiptEnvs = (f.receipts ? f.receipts.split(',').filter(Boolean) : []).map((p) => {
-          const j = readJson(p);
-          if (typeof j?.cid === 'string' && typeof j?.archive?.versionId === 'string') versions[j.cid] = j.archive.versionId;
-          return envelopeFromJson(j && j.v === 1 && j.sig ? j : j?.receipt);
-        });
-        const probe = f.archiveEndpoint ? makeArchiveProbe({ endpoint: f.archiveEndpoint, bucket: f.archiveBucket, prefix: f.archivePrefix ?? '',
-          region: f.archiveRegion, keyId: env.YATAVERSE_ARCHIVE_KEY_ID, secret: env.YATAVERSE_ARCHIVE_APP_KEY, ...(fetchImpl ? { fetchImpl } : {}) }) : null;
-        const run = await runVerifierOnce({ leaseEnv: leaseEnvelopeFromJson(readJson(f.lease)), receiptEnvs, keys: readJson(f.keys), probe, signer,
-          keyEpoch: Number(f.keyEpoch), now: now(), inventory: f.inventory ? readJson(f.inventory) : undefined, sampleRead: f.sampleRead === 'true', versions });
+        const run = await verifyOnce({ f, signer, leaseFile: f.lease, receiptFiles: f.receipts ? f.receipts.split(',').filter(Boolean) : [], env, fetchImpl, now });
         if (f.evidenceOut) fs.writeFileSync(f.evidenceOut, run.evidence.bytes, { flag: 'wx' });
-        out({ summary: run.summary, status: statusEnvelopeToJson(run.status), statusCid: statusEnvelopeToDagCbor(run.status).cid,
-              evidenceCid: run.evidence.cid, evidenceRoot: '0x' + Buffer.from(run.evidence.root).toString('hex'),
-              published: false, note: 'nothing was published: the status and the evidence record exist only in this output' });
+        out({ ...verifyOutput(run), published: false, note: 'nothing was published: the status and the evidence record exist only in this output' });
         return 0;
+      }
+      case 'retention-publish': {
+        for (const k of ['status', 'lease']) if (!f[k]) { stderr.write(`yataverse: retention-publish needs --${k}\n`); return 2; }
+        const cfg = loadConfig();
+        const client = makeClient(cfg, { authorize: makeAuthorizer(cfg), ...(fetchImpl ? { fetchImpl } : {}), ...(f.keys ? { receiptKeys: JSON.parse(fs.readFileSync(f.keys, 'utf8')) } : {}) });
+        const sj = JSON.parse(fs.readFileSync(f.status, 'utf8'));
+        out(await publishRun(client, leaseEnvelopeFromJson(JSON.parse(fs.readFileSync(f.lease, 'utf8'))),
+          statusEnvelopeFromJson(sj && sj.v === 1 && sj.sig ? sj : sj?.status), f.evidence ? fs.readFileSync(f.evidence) : null));
+        return 0;
+      }
+      case 'retention-verify-sweep': {
+        for (const k of ['registry', 'keys', 'signingKeyFile', 'keyEpoch']) if (!f[k]) { stderr.write(`yataverse: retention-verify-sweep needs --${k.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase())}\n`); return 2; }
+        const signer = await readSigningKey(f.signingKeyFile);
+        const publish = f.publish === 'true';
+        let client = null;
+        if (publish) { const cfg = loadConfig(); client = makeClient(cfg, { authorize: makeAuthorizer(cfg), ...(fetchImpl ? { fetchImpl } : {}), receiptKeys: JSON.parse(fs.readFileSync(f.keys, 'utf8')) }); }
+        // One lease per <name>.lease.json; <name>.write.json, when present, is the leased write's response.
+        const names = fs.readdirSync(f.registry).filter((n) => n.endsWith('.lease.json')).map((n) => n.slice(0, -'.lease.json'.length)).sort();
+        const results = [];
+        for (const name of names) {
+          const at = (ext) => `${f.registry}/${name}.${ext}`;
+          try {
+            const run = await verifyOnce({ f, signer, leaseFile: at('lease.json'), receiptFiles: fs.existsSync(at('write.json')) ? [at('write.json')] : [], env, fetchImpl, now });
+            // Results replace the previous run's: the newest observation is the one that matters.
+            fs.writeFileSync(at('status.json'), JSON.stringify(verifyOutput(run), null, 2) + '\n');
+            fs.writeFileSync(at('evidence.cbor'), run.evidence.bytes);
+            const r = { name, status: run.summary.status, leaseId: '0x' + Buffer.from(run.status.status.leaseId).toString('hex'), published: false };
+            if (client) {
+              try { await publishRun(client, leaseEnvelopeFromJson(JSON.parse(fs.readFileSync(at('lease.json'), 'utf8'))), run.status, run.evidence.bytes); r.published = true; }
+              catch (e) { r.publishError = String(e.code ?? e.message).slice(0, 120); }
+            }
+            results.push(r);
+          } catch (e) { results.push({ name, error: String(e.code ?? e.message).slice(0, 120) }); }   // one lease failing does not stop the others
+        }
+        const count = (st) => results.filter((r) => r.status === st).length;
+        const failed = results.filter((r) => r.error || r.publishError).length;
+        out({ observedAt: new Date(now()).toISOString(), leases: names.length, policySatisfied: count('policy-satisfied'), degraded: count('degraded'), expired: count('expired'), failed, results });
+        return failed ? 1 : 0;
       }
       case 'get': case 'verify': case 'put': case 'token': case 'car-put': case 'car-get': {
         const cfg = loadConfig();

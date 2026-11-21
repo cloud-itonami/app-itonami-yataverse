@@ -15,7 +15,10 @@
 import crypto from 'node:crypto';
 import { cidFor, verifyBlock, isCidShape, cidToBytes, parseCid } from './cid.mjs';
 import { verifyReceipt, envelopeFromJson, envelopeToDagCbor, rootsCommitment, blockSetDigest, requesterFor, KIND, STORE_CLASS, ReceiptError } from './receipt.mjs';
-import { verifyLease, leaseEnvelopeToDagCbor, receiptCountsFor, RetentionError } from './retention.mjs';
+import {
+  verifyLease, verifyStatus, leaseEnvelopeToDagCbor, leaseEnvelopeFromJson, leaseEnvelopeToJson, statusEnvelopeFromJson, statusEnvelopeToJson,
+  statusEnvelopeToDagCbor, receiptCountsFor, RetentionError,
+} from './retention.mjs';
 import { checkWritableBlock, WRITABLE_CODECS } from './block.mjs';
 import { parseCar, CarError, CAR_CONTENT_TYPE } from './car.mjs';
 import { checkClosure, DagError } from './dag.mjs';
@@ -265,5 +268,62 @@ export function makeClient(cfg, { fetchImpl = fetch, authorize, allowInsecureFor
     return { roots: local.roots, blocks: local.blocks.size, external: j?.external ?? [], verified: true, ...receipt };
   }
 
-  return { get, putBlock, putBytes, verifyRemote, getCar, putCar, receiptKeys, checkReceipt };
+  // --- Retention status records (docs/retention-design.md §6) ---
+
+  /** Publish a verifier-signed status for its lease. The host checks it; it does not judge the lease. */
+  async function publishStatus(leaseEnv, statusEnv) {
+    if (!authorize) throw new YataverseError('no-authorization-configured');
+    const base = new URL(cfg.url);
+    if (!okScheme(base)) throw new YataverseError('write-url-not-https');
+    const leaseId = Buffer.from(leaseEnv.lease.leaseId).toString('hex');
+    const res = await fetchImpl(new URL(`/retention/v1/status/${leaseId}`, base), { method: 'PUT', redirect: 'manual', signal: timeout(),
+      headers: { authorization: await authorize(), 'content-type': 'application/json' },
+      body: JSON.stringify({ lease: leaseEnvelopeToJson(leaseEnv), status: statusEnvelopeToJson(statusEnv) }) });
+    const j = await jsonOrNull(res);
+    if (res.status !== 200) {
+      const code = typeof j?.error === 'string' && /^[a-z0-9-]{1,80}$/.test(j.error) ? j.error : `http-${res.status}`;
+      throw new YataverseError(`publish-status-${code}`, `HTTP ${res.status}`);
+    }
+    const local = statusEnvelopeToDagCbor(statusEnv).cid;
+    if (j?.statusCid !== local) throw new YataverseError('publish-status-cid-mismatch');
+    return { leaseId: '0x' + leaseId, statusCid: local, stored: true, ...(j.repeated ? { repeated: true } : {}) };
+  }
+
+  /**
+   * Fetch the published status of a lease ({ leaseId: 64 hex }) or of a block ({ cid }) and verify
+   * it here: the lease's signatures, the verifier key, and the status against the lease and `now`.
+   * What the host says is not trusted. -> { lease, status, leaseEnv, statusEnv } or null when absent.
+   */
+  async function fetchStatus({ leaseId, cid, now }) {
+    const base = new URL(cfg.readUrl ?? cfg.url);
+    if (!okScheme(base)) throw new YataverseError('read-url-not-https');
+    let pathname;
+    if (leaseId !== undefined) {
+      const m = /^(?:0x)?([0-9a-f]{64})$/.exec(String(leaseId).toLowerCase());
+      if (!m) throw new YataverseError('bad-lease-id');
+      pathname = `/.well-known/yataverse-retention/${m[1]}.json`;
+    } else {
+      if (!isCidShape(cid)) throw new YataverseError('bad-cid');
+      pathname = `/retention/${cid}`;
+    }
+    const res = await fetchImpl(new URL(pathname, base), { redirect: 'manual', signal: timeout(), headers: { accept: 'application/json' } });
+    if (res.status === 404) return null;
+    if (res.status !== 200) throw new YataverseError('status-fetch-failed', `HTTP ${res.status}`);
+    const j = await jsonOrNull(res);
+    let leaseEnv, statusEnv, lease, status;
+    try {
+      leaseEnv = leaseEnvelopeFromJson(j?.lease); statusEnv = statusEnvelopeFromJson(j?.status);
+      lease = await verifyLease(leaseEnv, await receiptKeys());
+      status = await verifyStatus(statusEnv, lease, await receiptKeys(), { now });
+    } catch (e) { if (e instanceof RetentionError) throw new YataverseError(`status-${e.code}`); throw e; }
+    // The record must be the one that was asked for.
+    if (leaseId !== undefined && Buffer.from(lease.leaseId).toString('hex') !== String(leaseId).toLowerCase().replace(/^0x/, '')) throw new YataverseError('status-is-for-another-lease');
+    if (cid !== undefined) {
+      const want = cidToBytes(cid);
+      if (lease.subject.length !== want.length || !lease.subject.every((x, i) => x === want[i])) throw new YataverseError('status-is-for-another-block');
+    }
+    return { lease, status, leaseEnv, statusEnv };
+  }
+
+  return { get, putBlock, putBytes, verifyRemote, getCar, putCar, receiptKeys, checkReceipt, publishStatus, fetchStatus };
 }
