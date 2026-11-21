@@ -234,8 +234,8 @@ test('the archive probe reads length and lock from HEAD, and only reads', async 
                                          [`/archive/keep/${rawCid(Buffer.from('plain'))}`, { bytes: Buffer.from('plain') }]]));
   try {
     const probe = makeArchiveProbe({ endpoint: srv.endpoint, bucket: 'archive', prefix: 'keep/', keyId: 'test-key-id', secret: 'test-secret', region: 'us-west-004' });
-    assert.deepEqual(await probe.head(CID), { size: BLOCK.length, lockMode: 'COMPLIANCE', retainUntil: until });
-    assert.deepEqual(await probe.head(rawCid(Buffer.from('plain'))), { size: 5, lockMode: '', retainUntil: null });
+    assert.deepEqual(await probe.head(CID), { size: BLOCK.length, lockMode: 'COMPLIANCE', retainUntil: until, versionId: '' });
+    assert.deepEqual(await probe.head(rawCid(Buffer.from('plain'))), { size: 5, lockMode: '', retainUntil: null, versionId: '' });
     assert.equal(await probe.head(rawCid(Buffer.from('absent'))), null);
     assert.equal(Buffer.from(await probe.read(CID)).toString(), BLOCK.toString());
     await assert.rejects(probe.head('boom'), /bad-cid/);

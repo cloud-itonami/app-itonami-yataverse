@@ -42,12 +42,15 @@ export function blocksOf(lease, inventory) {
 /**
  * Check one block in the operator's archive (design §8). `probe.head(cid)` answers
  * null | { size, lockMode, retainUntil (Unix ms or null) }; `probe.read(cid)` the full bytes.
- * -> { ok, reason, size, lockMode, retainUntil, read }. Never throws for a failing store.
+ * With `versionId` (the version the locking write returned) that exact version is checked; without
+ * it the newest version of the name is, which a later unlocked write or a hide marker can mask.
+ * -> { ok, reason, size, lockMode, retainUntil, read, version }. Never throws for a failing store.
  */
-export async function checkArchiveCopy(probe, cid, receipt, lease, { sampleRead = false } = {}) {
-  const out = { ok: false, reason: '', size: 0, lockMode: '', retainUntil: 0, read: false };
+export async function checkArchiveCopy(probe, cid, receipt, lease, { sampleRead = false, versionId } = {}) {
+  const out = { ok: false, reason: '', size: 0, lockMode: '', retainUntil: 0, read: false, version: versionId ?? '' };
+  const at = versionId === undefined ? {} : { versionId };
   let head;
-  try { head = await probe.head(cid); } catch (e) { out.reason = `probe-failed:${String(e?.code ?? e?.message ?? e).slice(0, 80)}`; return out; }
+  try { head = await probe.head(cid, at); } catch (e) { out.reason = `probe-failed:${String(e?.code ?? e?.message ?? e).slice(0, 80)}`; return out; }
   if (!head) { out.reason = 'object-missing'; return out; }
   out.size = Number.isSafeInteger(head.size) ? head.size : 0;
   out.lockMode = typeof head.lockMode === 'string' ? head.lockMode : '';
@@ -59,7 +62,7 @@ export async function checkArchiveCopy(probe, cid, receipt, lease, { sampleRead 
   if (!(out.retainUntil >= lease.retentionUntil)) { out.reason = 'lock-ends-before-the-lease'; return out; }
   if (sampleRead) {
     let bytes;
-    try { bytes = await probe.read(cid); } catch (e) { out.reason = `read-failed:${String(e?.code ?? e?.message ?? e).slice(0, 80)}`; return out; }
+    try { bytes = await probe.read(cid, at); } catch (e) { out.reason = `read-failed:${String(e?.code ?? e?.message ?? e).slice(0, 80)}`; return out; }
     if (!(bytes instanceof Uint8Array) || bytes.length !== receipt.size || !sameBytes(sha256(bytes), receipt.contentDigest)) { out.reason = 'content-mismatch'; return out; }
     out.read = true;
   }
@@ -78,11 +81,12 @@ export async function checkArchiveCopy(probe, cid, receipt, lease, { sampleRead 
  *   signer       the verifier's signing key (importSigningKey); must be the lease's verifier
  *   keyEpoch     the verifier key's published epoch
  *   now          Unix ms
+ *   versions     { [cid]: versionId } from the locking writes' responses (optional)
  *
  * -> { status (signed envelope), evidence: { bytes, cid, root }, summary }.
  * Throws when the lease is not valid or the signer is not its verifier: then no status exists.
  */
-export async function runVerifierOnce({ leaseEnv, receiptEnvs = [], keys, probe = null, signer, keyEpoch, now, inventory, sampleRead = false }) {
+export async function runVerifierOnce({ leaseEnv, receiptEnvs = [], keys, probe = null, signer, keyEpoch, now, inventory, sampleRead = false, versions = {} }) {
   if (!Number.isSafeInteger(now)) bad('now-required');
   if (!Number.isSafeInteger(keyEpoch)) bad('key-epoch-required');
   let lease;
@@ -119,9 +123,10 @@ export async function runVerifierOnce({ leaseEnv, receiptEnvs = [], keys, probe 
   for (const cid of blocks) {
     const r = archiveByBlock.get(cid);
     let c;
-    if (!r) c = { ok: false, reason: 'no-operator-archive-receipt', size: 0, lockMode: '', retainUntil: 0, read: false };
-    else if (!probe) c = { ok: false, reason: 'no-archive-probe', size: 0, lockMode: '', retainUntil: 0, read: false };
-    else c = await checkArchiveCopy(probe, cid, r, lease, { sampleRead });
+    const blank = { ok: false, size: 0, lockMode: '', retainUntil: 0, read: false, version: versions[cid] ?? '' };
+    if (!r) c = { ...blank, reason: 'no-operator-archive-receipt' };
+    else if (!probe) c = { ...blank, reason: 'no-archive-probe' };
+    else c = await checkArchiveCopy(probe, cid, r, lease, { sampleRead, versionId: versions[cid] });
     if (c.ok) archivedBytes += r.size; else archiveOk = false;
     checks.push({ block: { cid: cidToBytes(cid) }, class: 'operator-archive', ...c });
   }
@@ -148,7 +153,7 @@ export async function runVerifierOnce({ leaseEnv, receiptEnvs = [], keys, probe 
     status: env,
     evidence: { bytes: evidenceBytes, cid: cidFor(evidenceBytes, CODEC_DAG_CBOR), root },
     summary: { status: statusName(status), grade: lease.grade, ...counts, blocks: blocks.length,
-               checks: checks.map((c, i) => ({ block: blocks[i], ok: c.ok, reason: c.reason, read: c.read })), notes },
+               checks: checks.map((c, i) => ({ block: blocks[i], ok: c.ok, reason: c.reason, read: c.read, version: c.version })), notes },
   };
 }
 

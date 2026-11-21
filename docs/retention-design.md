@@ -316,3 +316,15 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
   - **鍵:** 検証役用に、この bucket だけに絞った読み取り専用の application key `yataverse-retention-verifier-ro` を作った（権限は `readFiles` と `readFileRetentions`）。この 2 つで HEAD の lock の header と GET が読めた。存在しないファイルへの HEAD は 404 ではなく 403 になる（一覧の権限がないため）。検証役はこれを確認の失敗として扱い、`degraded` と判定する。
   - **検証役の実行（本物の B2、鍵と lease と受領証はその場かぎりの試験用）:** lease の期限が lock より前なら `policy-satisfied`（全読みの digest も一致）。lease の期限が lock より後なら `degraded`（`lock-ends-before-the-lease`）。lock のない本番の block は `degraded`（`not-locked`）。bucket にない block は `degraded`（`probe-failed:head-http-403`）。
   - **この段階で残っているもの:** Worker が lock をかける実装と `storeClass 3` の受領証の発行（S1-2b）、version を指した確認、入口の鍵の絞り込み（今この bucket に届く application key は、全 bucket 対象でほぼ全権限の 1 つだけ。Worker がどの鍵を使っているかは未確認）。
+- **S1-2b lease つきの書込み（[AWAI-3675](https://linear.app/kotobalabs/issue/AWAI-3675)、code と test のみ。deploy していない）:** `PUT /ipfs/<cid>` に header `Yataverse-Lease`（lease の envelope の DAG-CBOR を base64url にしたもの）を付けると、Worker は block を compliance の lock つきで保存し、`storeClass 3` の受領証を返す。
+  - **拒否の順序:** 保存の前に、設定の有無、lease の署名と検証役の鍵、`subject`（その CID であること。複数 block の lease は未対応）、`size`、開始と期限、lock の長さの上限を確かめる。どれかに当たれば何も保存しない。compliance の lock は誰にも消せないので、拒否できる検査はすべて保存の前に置いた。
+  - **lock の長さの上限:** 既定 90 日（`ARCHIVE_MAX_LOCK_DAYS` で変更）。§9 の「期限を短くして renew する」の実装。
+  - **資格情報と鍵の分離:** lock つきの保存と version 指定の読み戻しは `B2_LOCK_KEY_ID` / `B2_LOCK_APP_KEY` で行う。入口の通常の書込みの鍵は lock の権限を持たなくてよい。受領証は `ARCHIVE_RECEIPT_SIGNING_KEY`（入口の署名鍵と別、公開する一覧で `use` が `operator-archive-receipt`）で署名する。どちらかが無ければ 503 `archive-not-configured` で、lock なしの保存に黙って切り替えない。今の本番にはどちらも無いので、deploy してもこの経路は閉じたままになる。
+  - **保存の後の確認:** 保存の応答が返した version を指して、大きさ、mode、lock の期限（lease の期限以上）、内容（CID に一致）を読み戻す。1 つでも合わなければ受領証を出さない。その場合、lock された version は期限まで残る（消せない）。
+  - **受領証の `retentionUntil`:** 要求された期限ではなく、store から読み戻した lock の期限。
+  - **version の記録:** 応答に `archive: { versionId, lockMode, retainUntil }` を載せ、受領証と一緒に `receipts/archive/by-request/<requestId>` に保存する。同じ request の再送は、保存をやり直さずに同じ受領証と version を返す。version id は受領証の署名の対象ではない（v1 の型に field がない）。検証役は、その version を store で確認するので、誤った id は確認の失敗になる。
+  - **検証役:** probe と `runVerifierOnce` は version を指した確認に対応した（`versions`）。command は、書込みの応答の file から version を読む。lock の後に同じ名前へ lock なしで書き直されても、version を指せば `policy-satisfied` のままになる（test で確認）。
+  - **SigV4:** query つきの request に対応した。AWS の文書の例（List Objects、Get Bucket Lifecycle）の署名と一致する。
+  - **確認（2026-11-21）:** `npm test` は 140 件すべて通過（既存 135、追加 5）。検査 9 か所を 1 つずつ外すと、どれも test が失敗した。本物の B2 では、読み取り専用の鍵で、試験ファイルの version を指した HEAD と GET が成功した（version id は native API の fileId と同じ値、99 文字）。存在しない version は 403 になる。
+  - **未確認:** lock つきの保存（S3 の PutObject に lock の header を付ける）は、**本物の B2 に対して実行していない。** B2 がこの header を受け付けるか、`content-md5` が要るか、どの鍵の権限（`writeFiles` と `writeFileRetentions` の見込み）が要るかは、lock 用の鍵を発行してから確かめる。test は手元の偽の store に対するものである。
+  - **deploy の前に要るもの（それぞれ owner の承認）:** lock 用の application key、保持用の署名鍵とその公開、検証役の鍵の公開、Worker の deploy。
