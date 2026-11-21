@@ -215,6 +215,17 @@ async function readBlock(cid, env, deps, store) {
   return { bytes };
 }
 
+/**
+ * One line per accepted write, so the use of each authorization scheme can be counted from the
+ * Worker's logs (JUN-1429). It carries the scheme, the kind of write, the size and the first 12 hex
+ * characters of the receipt's `requester` (a SHA-256 of the token or of the writer DID). It never
+ * carries a token, a DID, a CID or any part of the body.
+ */
+function logWrite(deps, scheme, kind, requester, bytes) {
+  const line = JSON.stringify({ event: 'yataverse-write', scheme, kind, requester: hex(requester).slice(0, 12), bytes });
+  (deps.log ?? console.log)(line);
+}
+
 const contentType = (request) => (request.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
 
 function writeAuthFailure(request, env) {
@@ -265,7 +276,8 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
                   requestId: rid.requestId, requester: writerDid ? sha256(writerDid) : tokenDigest(authorization) };
   // A write that carries a lease asks for a retention promise: it is locked or refused, never
   // stored as an ordinary block instead.
-  if (request.headers.has(LEASE_HEADER)) return await writeLeasedBlock(request, cid, bytes, claim, env, deps, store);
+  const scheme = writerDid ? 'cacao' : 'token';
+  if (request.headers.has(LEASE_HEADER)) return await writeLeasedBlock(request, cid, bytes, claim, env, deps, store, scheme);
   const ops = receiptOps(env, deps, store);
   const begun = await ops.begin(claim);
   if (begun.error) return fail(...begun.error);
@@ -273,6 +285,7 @@ async function writeBlock(request, cid, parsed, env, deps, store) {
   if (err) return fail(...err);
   const receipt = await ops.finish(begun, claim);
   if (receipt.error) return fail(...receipt.error);
+  logWrite(deps, scheme, 'block', claim.requester, bytes.length);
   return json(201, { cid, bytes: bytes.length, verified: true, receipt: receipt.json, receiptCid: receipt.cid });
 }
 
@@ -288,7 +301,7 @@ const LEASE_START_SKEW_MS = 5 * 60 * 1000;
  * (docs/retention-design.md §3.1, §5). A compliance lock cannot be removed by anyone, so every
  * check that can refuse the request runs before anything is stored.
  */
-async function writeLeasedBlock(request, cid, bytes, claim, env, deps, store) {
+async function writeLeasedBlock(request, cid, bytes, claim, env, deps, store, scheme) {
   if (!store.archive) return fail(503, 'archive-not-configured');
   // 1. The lease: both signatures, a published verifier, and terms that fit this block.
   const raw = request.headers.get(LEASE_HEADER) ?? '';
@@ -330,6 +343,7 @@ async function writeLeasedBlock(request, cid, bytes, claim, env, deps, store) {
   const archive = { versionId, lockMode: 'COMPLIANCE', retainUntil };
   const receipt = await finishArchiveReceipt(begun, aclaim, archive, env, deps, store, writeLimits(env));
   if (receipt.error) return fail(...receipt.error);
+  logWrite(deps, scheme, 'leased-block', claim.requester, bytes.length);
   return json(201, { cid, bytes: bytes.length, verified: true, receipt: receipt.json, receiptCid: receipt.cid, archive });
 }
 
@@ -487,6 +501,7 @@ async function importCar(request, env, deps, store) {
   }
   const receipt = await ops.finish(begun, claim);
   if (receipt.error) return fail(...receipt.error);
+  logWrite(deps, viaServiceAuth ? 'service-auth' : viaCacao ? 'cacao' : 'token', 'car', requester, total);
   return json(201, { roots: car.roots, carVersion: car.version, blocks: blocks.size, bytes: total,
                      external: closure.external, verified: true, receipt: receipt.json, receiptCid: receipt.cid });
 }
