@@ -101,8 +101,8 @@ with mode 0600 and never printed.
    (one version id) and from the next step.
 4. **Check production right after:** `/health` 200; `GET` of a known stored block 200; a raw block
    write returns a verified receipt and reads back; `GET /.well-known/yataverse-receipt-keys.json` 200.
-5. **Afterwards**, as separate decisions: whether to give the lock key the same `ipld/` prefix;
-   whether `260913` can be retired or reduced once its other users are known.
+5. **Afterwards**, as separate decisions: the lock key's prefix (*done, section 4c*); whether
+   `260913` can be retired or reduced once its other users are known.
 
 ## 4a. Steps 1 and 2 as carried out, 2026-11-21
 
@@ -141,8 +141,9 @@ Owner approval 2026-11-21 for creating the key and checking it from a workstatio
   | `DELETE` by name (no version id) | **204**: a hide marker was added; the name then answered 404, the version stayed and was still readable by id |
   | B2 native: list keys, create a key | 401, 401 |
 
-- **Left in the bucket:** nine entries under `ipld/zz-key-check/` (eight small unlocked uploads
-  and one hide marker). The narrow key cannot remove them.
+- **Left in the bucket, then removed:** nine entries under `ipld/zz-key-check/` (eight small
+  unlocked uploads and one hide marker; the narrow key cannot remove them). They were deleted by
+  version with an account-level credential on 2026-11-21 (owner approval); the prefix is empty.
 - **Not checked:** CAR import, Drive packs, service-auth writes, status publication and leased
   writes with this key (they use the same three request kinds, which the test suite pins, but
   they were not run against the real bucket); behaviour under load.
@@ -179,6 +180,33 @@ Owner approval 2026-11-21 for replacing the Worker's secrets.
   using it cannot be shown from here (the old secret value was never readable); if it was,
   that key is no longer needed by the gateway, and reducing or retiring it is the owner's call
   once its other users are known.
+
+## 4c. The lock key limited to `ipld/`, 2026-11-21T15:03Z to 15:10Z
+
+Owner instruction: give the lock key the same prefix. Tracking: AWAI-3760. B2 keys cannot be
+edited, so the key was created again and the old one deleted. The Worker had no lock key
+(`B2_LOCK_KEY_ID` is not among its secrets), so nothing in production changed.
+
+- **Key.** `yataverse-retention-lock` (id ending `00003c`): bucket `yataverse-blocks`, prefix
+  `ipld/`, `readFiles` `writeFiles` `readFileRetentions` `writeFileRetentions`, no expiry. It
+  replaces the key ending `000036` (same permissions, no prefix), which was deleted. The secret
+  is in `~/.config/yataverse/archive-lock-key.json` (mode 0600) on the workstation used.
+  It has no `listBuckets`: the Worker only uses it for a locking write and for reads of the
+  version that write returned, never to find out whether something exists.
+- **A leased write with both narrow keys** (handler from `main`, run locally,
+  `B2_PREFIX=ipld/zz-lock-check/`, throwaway signing keys, a five-minute lease): `201`, lock
+  `COMPLIANCE` until the lease end, a storeClass 3 receipt that verifies and counts for the lease
+  as operator archive. Store calls: GET archive receipt 404 (gateway key), PUT block with lock
+  200, HEAD and GET of that version 200 (lock key), HEAD policy block 404, PUT policy block 200,
+  PUT archive receipt 200 (gateway key). This is the first run of that path with no call kept in
+  memory.
+- **With the lock key alone:** a locked write outside `ipld/`, a plain write outside `ipld/`, a
+  read outside `ipld/`, a read in another bucket, listing under `ipld/`, and deleting the locked
+  version were each answered `403`.
+- **Left in the bucket:** three objects under `ipld/zz-lock-check/` (the block, locked until
+  2026-11-21T15:08:45Z; a policy block; an archive receipt record).
+- **Follow-on.** With the prefix, the lock key cannot write under `retention-test/`, where the
+  earlier lock experiments ran; later checks use a name under `ipld/`.
 
 ## 5. Going back
 
