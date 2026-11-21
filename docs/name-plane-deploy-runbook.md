@@ -106,6 +106,29 @@ Owner approval 2026-11-21 for the route and the suffix. Tracking: JUN-1425 (pare
   itself is covered by `test/worker-names.test.mjs` only.
 - **To publish the first site:** section 4, then steps 5 and 6 of section 5, then section 6.
 
+## 2c. First site: `tsukuru`, blocks written 2026-11-21 (DNS record not changed yet)
+
+Owner instruction 2026-11-21: publish `tsukuru` first. Tracking: JUN-1427.
+
+- **The existing record cannot be served.** `_dnslink.tsukuru.itonami.app` names
+  `bafkreiau4wb3mxom2pqtl3aqpvtxqb4hfxr3cv5mfgygvcrseq57wbmrue`. That block was not found
+  anywhere: not in the store, not at five public gateways (answers 429, 521, 522, 403, none
+  verified), and no blob in the history of `network-awai/app-itonami-tsukuru` (299 blobs) hashes
+  to it. What it held is unknown.
+- **Source used instead.** `public/sites/app/tsukuru/` of `network-awai/app-itonami-tsukuru` at
+  `7e10dd9bc242126fbf302be585c889789aba9cea` (`git archive`): `index.html` (2823 bytes, sha256
+  `b8d15e9d…5cd367`) and `mk1-enclosure-sandwich.usda` (1897 bytes, sha256 `24040fa0…ec1a48`).
+- **Packed and written.** `yataverse site-pack` gave root
+  `bafybeieevppwzv7b3ifwkvovqlcauibsd5aphnu6koxj37uirs7bce76ai`, 3 blocks, one CAR of 5024 bytes.
+  `yataverse car-put` at 14:13Z: `verified: true`, `receiptVerified: true`, receipt
+  `bafyreihvjkyvedfrlcnula54sygynp6y6xvxmhb5ymkq57kbuhzdl7hwoe`. `GET https://yataverse.com/ipfs/<root>`
+  answers 200 (131 bytes). The root was not compared with `ipfs add` this time (no local IPFS
+  repository); the packer was compared on 2026-11-21 in `docs/unixfs-kubo-comparison-2026-11-21.md`.
+- **Still to do.** Change the TXT record `_dnslink.tsukuru.itonami.app` to
+  `dnslink=/ipfs/bafybeieevppwzv7b3ifwkvovqlcauibsd5aphnu6koxj37uirs7bce76ai` in the Cloudflare
+  dashboard (replace the old value; exactly one record), then run section 6. Until then
+  `https://tsukuru.itonami.app/` answers 504 after about 15 s.
+
 ## 3. Before deploying
 
 1. Owner approval for the route `*.itonami.app/*` and the suffix `.itonami.app`. (Shipping the
