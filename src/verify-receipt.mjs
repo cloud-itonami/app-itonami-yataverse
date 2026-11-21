@@ -6,12 +6,19 @@ import crypto from 'node:crypto';
 import { cidFor, cidToBytes, CODEC_RAW } from './cid.mjs';
 import { WRITABLE_CODECS } from './block.mjs';
 import { parseCar, CarError } from './car.mjs';
-import { verifyReceipt, envelopeFromJson, envelopeToDagCbor, rootsCommitment, blockSetDigest, KIND, ReceiptError } from './receipt.mjs';
+import { verifyReceipt, envelopeFromJson, envelopeToDagCbor, rootsCommitment, blockSetDigest, KIND, STORE_CLASS, ReceiptError } from './receipt.mjs';
 
 export class VerifyReceiptError extends Error { constructor(code, detail) { super(detail ? `${code}: ${detail}` : code); this.code = code; } }
 const sha256 = (b) => new Uint8Array(crypto.createHash('sha256').update(b).digest());
 const KIND_NAMES = { block: KIND.block, car: KIND.car, 'drive-pack': KIND.drivePack };
 const nameOf = (k) => Object.entries(KIND_NAMES).find(([, v]) => v === k)?.[0] ?? `unknown-${k}`;
+const STORE_CLASS_NAMES = { [STORE_CLASS.edgeGateway]: 'edge-gateway', [STORE_CLASS.providerNode]: 'provider-node', [STORE_CLASS.operatorArchive]: 'operator-archive' };
+// What a verified receipt of each store class says, in words (docs/retention-design.md §3, §5).
+const CLAIMS = {
+  [STORE_CLASS.edgeGateway]: 'this gateway stored and read back these bytes at acceptedAt; not retention or independent replicas',
+  [STORE_CLASS.providerNode]: 'this provider node stored these bytes and promises to keep them until retentionUntil; a promise by the signer, to be checked by the lease verifier',
+  [STORE_CLASS.operatorArchive]: 'the operator stored these bytes under a lock until retentionUntil; the operator\'s own copy, not an independent replica',
+};
 
 /** The values a receipt must carry for `file`, written as `kind`. */
 export function expectedFor(file, kind, { codec = 'raw', external = [] } = {}) {
@@ -60,8 +67,9 @@ export async function verifyReceiptInput(input, keys, { file, kind, codec } = {}
   return {
     verified: true, checked, receiptCid: cid, kind: nameOf(r.kind), size: r.size,
     contentDigest: hex(r.contentDigest), requestId: hex(r.requestId), requester: hex(r.requester),
-    acceptedAt: new Date(r.acceptedAt).toISOString(), state: 'local-durable-readback', storeClass: r.storeClass === 1 ? 'edge-gateway' : 'provider-node',
+    acceptedAt: new Date(r.acceptedAt).toISOString(), state: 'local-durable-readback', storeClass: STORE_CLASS_NAMES[r.storeClass],
+    ...(r.storeClass === STORE_CLASS.edgeGateway ? {} : { leaseId: hex(r.leaseId), retentionUntil: new Date(r.retentionUntil).toISOString() }),
     policyRevision: hex(r.policyRevision), keyId: hex(r.keyId), keyEpoch: r.keyEpoch, signer: keys?.signer ?? null,
-    claims: 'this gateway stored and read back these bytes at acceptedAt; not retention or independent replicas',
+    claims: CLAIMS[r.storeClass],
   };
 }

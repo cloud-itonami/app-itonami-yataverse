@@ -278,3 +278,16 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
 - P1 の parameter（leaf の大きさなど）は案で、test vector がない。
 - provider node の実装は存在しない。ADR 0041 は Proposed のままである。
 - account の閉鎖や支払いの停止が lock 中の object に与える影響は不明。
+
+## 16. 実装の記録
+
+- **S1-1 型と検証（[AWAI-3670](https://linear.app/kotobalabs/issue/AWAI-3670)）:** `src/retention.mjs`（lease、状態、inventory、受領証を lease に数える判定）と、`src/receipt.mjs` の `storeClass 3` の規則。依存は足していない。store、bucket、network は使わない。Worker と CLI の command は変えていない。
+  - **鍵の用途:** 公開する鍵の一覧の各 entry に `use`（文字列の配列）を足した。値は `gateway-receipt`、`provider-receipt`、`operator-archive-receipt`、`retention-verifier`。`use` のない entry は `gateway-receipt` だけとして扱う。今の鍵の一覧には `use` がないので、今の入口の鍵は保持の約束にも検証役にも使えない（fail closed）。
+  - **受領証の規則（§5 の具体化）:** 入口（storeClass 1）は `retentionUntil` が 0 でなければ拒否する。storeClass 2 と 3 は `leaseId` が 0 でなく、`retentionUntil` が `acceptedAt` より後であること。storeClass 2 は `pieceCommitment` が必須、storeClass 3 は 0 であること。どの store class の受領証も `policy-satisfied` を名乗れない。
+  - **lease の署名:** `requester` は要求者の Ed25519 公開鍵の keyId（受領証の `keyId` と同じ計算）。要求者の公開鍵は envelope に入れて運び、keyId が `requester` と一致することを確かめる。検証役の鍵は公開された一覧から引き、`retention-verifier` の用途を持ち、lease の `notBefore` の時点で有効であることを確かめる。lease は署名した時刻を持たないので、鍵の有効性は `notBefore` で判定する。
+  - **`leaseId`:** `leaseId` を 0 にした struct の `hashStruct`。署名の対象は、`leaseId` を入れた struct の EIP-712 digest。他人の `leaseId` を持つ lease は署名も検証もしない。
+  - **等級と条件:** R1 は `providerReplicas` 0 かつ `pieceCommitment` 0。R2 は `providerReplicas` 1 以上、R3 は 3 以上で、どちらも `pieceCommitment` が必須。
+  - **状態の検証:** 状態の署名者は lease の `verifier` と同じ鍵であること。`validUntil − observedAt` は `challengePeriod` の 2 倍まで。読む側の時刻が `validUntil` 以降なら `status-stale` で拒否する（状態は不明）。`observedAt` は読む側の時刻より 5 分を超えて先であってはならない。`policy-satisfied` は、状態が持つ数が等級の条件を満たし、`observedAt` が lease の期間内のときだけ通す。provider node の数と運営者保持の数は合算しない。
+  - **inventory:** canonical DAG-CBOR の `{"v": 1, "blocks": [CID link, …]}`（CID binary の昇順、重複なし）の sha256 を lease の `subject` にする。
+  - **確認（2026-11-21）:** `npm test` は 126 件すべて通過（既存 113、追加 13）。変更前の `main`（`0fe6f74`）の code は、`storeClass 3` の受領証を `unknown-store-class` で拒否した（一回限りの確認）。検査 7 か所を 1 つずつ外すと、どれも test が失敗した。
+  - **未実装:** 保持用 bucket、`storeClass 3` の受領証の発行、検証役の process、状態の公開、CLI の command、P1 の piece commitment と challenge。EIP-712 の digest を外部の参照実装と照合した test vector は、この 2 つの型にはまだない。

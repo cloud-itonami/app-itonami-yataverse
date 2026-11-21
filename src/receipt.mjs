@@ -24,7 +24,16 @@ export const RECEIPT_TYPE_STRING = typeString(RECEIPT_TYPE, RECEIPT_FIELDS);
 export const SIGNER_DID = 'did:web:yataverse.com';
 export const KIND = Object.freeze({ block: 1, car: 2, drivePack: 3 });
 export const STATE = Object.freeze({ localDurableReadback: 1, localDurable: 2, policySatisfied: 10 });
-export const STORE_CLASS = Object.freeze({ edgeGateway: 1, providerNode: 2 });
+// 3 = operator-archive (docs/retention-design.md §3): a B2 bucket with Object Lock, counted as the
+// operator's own copy and never as an independent replica.
+export const STORE_CLASS = Object.freeze({ edgeGateway: 1, providerNode: 2, operatorArchive: 3 });
+// What a published key may sign. A key entry without `use` is a gateway receipt key only, so the
+// existing key set cannot vouch for a retention promise or act as a verifier.
+export const KEY_USE = Object.freeze({ gatewayReceipt: 'gateway-receipt', providerReceipt: 'provider-receipt',
+  operatorArchiveReceipt: 'operator-archive-receipt', retentionVerifier: 'retention-verifier' });
+const USE_FOR_STORE_CLASS = Object.freeze({ 1: KEY_USE.gatewayReceipt, 2: KEY_USE.providerReceipt, 3: KEY_USE.operatorArchiveReceipt });
+/** The uses a published key entry allows. */
+export const keyUses = (entry) => (Array.isArray(entry?.use) ? entry.use.filter((u) => typeof u === 'string') : [KEY_USE.gatewayReceipt]);
 const UINT_BITS = Object.fromEntries(RECEIPT_FIELDS.filter(([, t]) => t.startsWith('uint')).map(([n, t]) => [n, Number(t.slice(4))]));
 const ZERO32 = new Uint8Array(32);
 const MAX_SUBJECT_BYTES = 128;
@@ -166,6 +175,18 @@ export async function verifyReceipt(env, keys, expect = {}) {
   if (r.state !== STATE.localDurableReadback) bad('unknown-state');
   if (!Object.values(STORE_CLASS).includes(r.storeClass)) bad('unknown-store-class');
   if (!Object.values(KIND).includes(r.kind)) bad('unknown-kind');
+  // 5. What each store class may promise (docs/retention-design.md §5), and which key may say it.
+  if (!keyUses(entry).includes(USE_FOR_STORE_CLASS[r.storeClass])) bad('key-not-allowed-for-store-class');
+  const zero = (b) => b.every((x) => x === 0);
+  if (r.storeClass === STORE_CLASS.edgeGateway) {
+    // The gateway accepts and reads back; it does not promise retention.
+    if (r.retentionUntil !== 0) bad('gateway-claims-retention');
+  } else {
+    if (zero(r.leaseId)) bad('retention-receipt-without-lease');
+    if (!(r.retentionUntil > r.acceptedAt)) bad('retention-does-not-follow-accepted-at');
+    if (r.storeClass === STORE_CLASS.providerNode && zero(r.pieceCommitment)) bad('provider-receipt-without-piece-commitment');
+    if (r.storeClass === STORE_CLASS.operatorArchive && !zero(r.pieceCommitment)) bad('operator-archive-with-piece-commitment');
+  }
   return r;
 }
 
