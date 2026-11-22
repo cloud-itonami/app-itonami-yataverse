@@ -46,7 +46,7 @@ test('a read-only origin can read a block from a page, GET and HEAD', async () =
     assert.equal(h.headers.get('access-control-allow-origin'), origin);
     const p = await handle(preflight(origin, `/ipfs/${cid}`, 'GET'), RENV, deps(s));
     assert.equal(p.status, 204);
-    assert.equal(p.headers.get('access-control-allow-headers'), 'accept');
+    assert.equal(p.headers.get('access-control-allow-headers'), 'accept, range, if-range');
   }
 });
 
