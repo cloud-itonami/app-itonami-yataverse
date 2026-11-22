@@ -79,3 +79,51 @@ test('an unlisted origin still gets no CORS header on reads', async () => {
     assert.equal((await handle(preflight(origin, `/ipfs/${cid}`, 'GET'), RENV, deps(s))).status, 403);
   }
 });
+
+// The production list (worker/wrangler.jsonc): the market web viewers on cloud-itonami Pages read
+// snapshots; the shared Pages origin gains nothing on writes, and the deny list still holds.
+test('production read origins: cloud-itonami Pages reads GET/HEAD only; writes 403, denied CIDs 451', async () => {
+  const fs = await import('node:fs');
+  const text = fs.readFileSync(new URL('../worker/wrangler.jsonc', import.meta.url), 'utf8');
+  const prod = /"IPFS_READ_ORIGINS":\s*"([^"]*)"/.exec(text)[1];
+  const denied = /"READ_DENY_CIDS":\s*"([^"]*)"/.exec(text)[1];
+  const PAGES = 'https://cloud-itonami.github.io';
+  assert.deepEqual(ipfsReadOrigins({ IPFS_READ_ORIGINS: prod }), ['http://tauri.localhost', 'tauri://localhost', PAGES]);
+  const PENV = { ...ENV, IPFS_READ_ORIGINS: prod, READ_DENY_CIDS: `${denied}, ${rawCid(Buffer.from('denied stand-in'))}` };
+  const s = await stored();
+  for (const method of ['GET', 'HEAD']) {
+    const r = await handle(req(PAGES, { method }), PENV, deps(s));
+    assert.equal(r.status, 200, method);
+    assert.equal(r.headers.get('access-control-allow-origin'), PAGES, method);
+    assert.equal(r.headers.get('access-control-allow-methods'), 'GET, HEAD');
+    assert.equal(r.headers.get('access-control-allow-credentials'), null);
+  }
+  assert.equal((await handle(preflight(PAGES, `/ipfs/${cid}`, 'GET'), PENV, deps(s))).status, 204);
+  // Writes from the shared Pages origin are refused before anything is stored.
+  const other = Buffer.from('a write from pages');
+  const put = await handle(req(PAGES, { method: 'PUT', body: other,
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/vnd.ipld.raw' } }, `/ipfs/${rawCid(other)}`), PENV, deps(s));
+  assert.equal(put.status, 403);
+  assert.equal((await put.json()).error, 'origin-not-allowed');
+  const car = encodeCarV1([rawCid(other)], [{ cid: rawCid(other), bytes: other }]);
+  const post = await handle(req(PAGES, { method: 'POST', body: car,
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/vnd.ipld.car' } }, '/ipfs'), PENV, deps(s));
+  assert.equal(post.status, 403);
+  assert.equal((await post.json()).error, 'origin-not-allowed');
+  assert.ok(!s.log.some((x) => x.method === 'PUT'), 'nothing was stored');
+  // A denied CID (the production entry and a stored stand-in) stays 451 for this origin.
+  const bad = Buffer.from('denied stand-in');
+  s.objects.set(`ipld/${rawCid(bad)}`, bad);
+  for (const c of [denied, rawCid(bad)]) for (const method of ['GET', 'HEAD']) {
+    const r = await handle(req(PAGES, { method }, `/ipfs/${c}`), PENV, deps(s));
+    assert.equal(r.status, 451, `${method} ${c}`);
+  }
+  // Negative controls: the removed origin, look-alikes and other Pages owners get no CORS header.
+  for (const origin of ['https://network-awai.github.io', 'https://evil.github.io', 'https://cloud-itonami.github.io.evil.example',
+    'http://cloud-itonami.github.io']) {
+    const r = await handle(req(origin), PENV, deps(s));
+    assert.equal(r.status, 200, 'reads stay public');
+    assert.equal(r.headers.get('access-control-allow-origin'), null, origin);
+    assert.equal((await handle(preflight(origin, `/ipfs/${cid}`, 'GET'), PENV, deps(s))).status, 403, origin);
+  }
+});
