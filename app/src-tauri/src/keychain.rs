@@ -6,6 +6,11 @@
 //! crypto, and never written anywhere else. Tests use the separate
 //! [`crate::vault::KEYCHAIN_TEST_SERVICE`] and delete every item they
 //! create; production code never enumerates the Keychain.
+//!
+//! Every query names `kSecAttrSynchronizable = false` explicitly, so the key
+//! is never an iCloud Keychain item (Legal condition L1, KOTOBA-159). Items
+//! written before this change have no synchronizable attribute, which the
+//! Keychain treats as false, so the same query still finds them.
 
 #[cfg(target_os = "macos")]
 mod provider {
@@ -14,6 +19,13 @@ mod provider {
     /// Keychain-backed [`VaultKeyProvider`].
     pub struct KeychainKeyProvider {
         service: String,
+    }
+
+    /// The query for this app's key: one generic password, never synchronized.
+    pub(super) fn options(service: &str) -> security_framework::passwords::PasswordOptions {
+        let mut options = security_framework::passwords::PasswordOptions::new_generic_password(service, ALIAS);
+        options.set_access_synchronized(Some(false));
+        options
     }
 
     impl KeychainKeyProvider {
@@ -31,9 +43,9 @@ mod provider {
         }
 
         fn get(&self) -> Result<Option<[u8; 32]>, String> {
-            use security_framework::passwords::get_generic_password;
+            use security_framework::passwords::generic_password;
             use zeroize::Zeroizing;
-            match get_generic_password(&self.service, ALIAS) {
+            match generic_password(options(&self.service)) {
                 Ok(secret) => {
                     // Wipe the Keychain copy on the way out: key material
                     // only travels in the fixed-size return array.
@@ -68,9 +80,9 @@ mod provider {
         }
 
         fn store_key(&self, key: &[u8; 32]) -> Result<(), String> {
-            use security_framework::passwords::set_generic_password;
+            use security_framework::passwords::set_generic_password_options;
             // Fixed codes only: OS errors never surface key material.
-            set_generic_password(&self.service, ALIAS, key)
+            set_generic_password_options(key, options(&self.service))
                 .map_err(|_| "drive-operation-failed".to_string())
         }
     }
@@ -78,8 +90,8 @@ mod provider {
     /// Delete one test item. Test-only; production code never deletes keys.
     #[cfg(test)]
     pub fn delete_item(service: &str) -> Result<(), String> {
-        use security_framework::passwords::delete_generic_password;
-        match delete_generic_password(service, ALIAS) {
+        use security_framework::passwords::delete_generic_password_options;
+        match delete_generic_password_options(options(service)) {
             Ok(()) => Ok(()),
             Err(e) => {
                 if e.code() == -25300 { // errSecItemNotFound
@@ -136,5 +148,32 @@ mod tests {
         let _ = delete_item(&unique);
         assert_eq!(provider.load_key().expect("load after delete"), None);
         assert!(!provider.key_exists().expect("exists after delete"));
+    }
+
+    /// A key stored before the explicit `kSecAttrSynchronizable = false` (no attribute, which the
+    /// Keychain reads as false) is still found, so existing installs keep their data (KOTOBA-159).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn key_stored_without_the_synchronizable_attribute_is_still_found() {
+        use super::provider::{KeychainKeyProvider, delete_item};
+        use crate::vault::{ALIAS, KEYCHAIN_TEST_SERVICE, VaultKeyProvider};
+        use security_framework::passwords::set_generic_password;
+
+        let unique = format!("{}-legacy-{}", KEYCHAIN_TEST_SERVICE, std::process::id());
+        struct Guard(String);
+        impl Drop for Guard {
+            fn drop(&mut self) { let _ = delete_item(&self.0); }
+        }
+        let _guard = Guard(unique.clone());
+        let _ = delete_item(&unique);
+
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("rng");
+        set_generic_password(&unique, ALIAS, &key).expect("legacy store");
+        let provider = KeychainKeyProvider::with_service(&unique);
+        assert_eq!(provider.load_key().expect("load").expect("present"), key);
+        key.fill(0);
+        delete_item(&unique).expect("delete through the new query");
+        assert_eq!(provider.load_key().expect("load after delete"), None);
     }
 }
