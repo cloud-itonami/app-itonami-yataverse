@@ -344,8 +344,8 @@ KV, D1 or Durable Objects.
 | Request | Behaviour |
 |---|---|
 | `PUT /ipfs/<cid>` | `Authorization: Bearer <write token>`, `Content-Type: application/vnd.ipld.raw`. CIDv1/sha2-256 with codec raw, dag-cbor (canonical DAG-CBOR only) or dag-pb (a plain UnixFS node only, see "UnixFS sites" below), at most `MAX_BLOCK_BYTES`. The body must hash to the CID; it is stored at `B2_PREFIX + cid`, read back from B2 and verified again before `201`. |
-| `GET` / `HEAD /ipfs/<cid>` | Served from B2 after verification. On a B2 miss, `READ_FALLBACK_URL` (the self-hosted Reader at `ipfs.yataverse.com`) is tried and its bytes are verified the same way. |
-| `GET /ipfs/<cid>?format=car` (or `Accept: application/vnd.ipld.car`) | CARv1 with `order=dfs; dups=n`. `dag-scope=all` (default) follows DAG-CBOR and UnixFS (dag-pb) links down to raw leaves; `dag-scope=block` returns the root alone. Every block is verified first; a missing block or an untraversable codec is an error, never a truncated CAR. |
+| `GET` / `HEAD /ipfs/<cid>` | Served from B2 after verification. On a B2 miss, `READ_FALLBACK_URL` (the self-hosted Reader at `ipfs.yataverse.com`) is tried and its bytes are verified the same way. `Yataverse-Read-Source: store` or `fallback` says which copy answered. A CIDv0 (`Qm…`) is also looked up under its CIDv1 dag-pb key. **Range** (AWAI-3833): one `Range: bytes=a-b`, `bytes=a-` or `bytes=-n` on `GET` is answered with `206` and `Content-Range: bytes a-b/size`; a range that starts at or past the end is `416` with `Content-Range: bytes */size`. A multi-range, another unit or a malformed header is ignored (`200`, whole block). `If-Range` must equal the strong `ETag` `"<cid>"`, otherwise the whole block is sent. `HEAD` ignores `Range`. The whole block is still verified against the CID before any part is sent. Responses carry `Accept-Ranges: bytes`. |
+| `GET /ipfs/<cid>?format=car` (or `Accept: application/vnd.ipld.car`) | CARv1 with `order=dfs; dups=n`. `Range` and `If-Range` are ignored (`Accept-Ranges: none`): the whole CAR is sent. `dag-scope=all` (default) follows DAG-CBOR and UnixFS (dag-pb) links down to raw leaves; `dag-scope=block` returns the root alone. Every block is verified first; a missing block or an untraversable codec is an error, never a truncated CAR. |
 | `POST /ipfs/` | `Authorization: Bearer <write token>`, `Content-Type: application/vnd.ipld.car`, a CARv1 or CARv2 (`.awai`) body. Before anything is stored: canonical DAG-CBOR header, every block passes the write rules, every root is in the CAR, the closure is complete (in the CAR or already stored) and no block is unreachable. Then each block is stored and read back. Limits: `MAX_CAR_BLOCKS` (256), `MAX_CAR_BYTES` (32 MiB). |
 | Per-person writes (`POST /ipfs/` only) | **ATProto service auth** (AWAI-3274, owner decision 2026-11-18, `worker/src/service-auth.mjs`): `Authorization: Bearer <JWT>` with header `alg: ES256K`, `aud` = `SERVICE_AUTH_AUD` (`did:web:yataverse.com`), `lxm` = `com.yataverse.importCar`, `iat`/`exp` with a lifetime of at most 300 s. The issuer must be a `did:plc` (resolved at `PLC_DIRECTORY_URL`) or `did:web` whose `#atproto_pds` is in `SERVICE_AUTH_PDS` (`https://pds.aozora.app`) and whose `#atproto` secp256k1 key signed the JWT (low-S; verified with `@noble/curves` 1.9.7). That PDS must also report the repo active (`com.atproto.sync.getRepoStatus`), because anyone can publish a DID document naming it. `SERVICE_AUTH_DENY_DIDS` revokes a person; removing `SERVICE_AUTH_AUD` turns the scheme off (`503`). The request is counted by the rate limiter before any lookup. The receipt's `requester` is the SHA-256 of the DID. Neither the app nor the Worker holds a secret. Residual risks: no `jti` replay store (no KV/D1/DO), so a token can be reused for the same method until it expires; DID documents and repo status are cached for 60 s per isolate. Block `PUT` still needs a write token. |
 | PDS-attested writes (`POST /ipfs/` only) | AWAI-3370, owner decision 2026-11-18. A PDS that never holds its members' repo keys, as Aozora's does not, signs `{iss: <PDS did:web>, sub: <member DID>, aud, lxm, iat, exp}` with its own service key. The Worker accepts it only when `iss` is pinned in `SERVICE_AUTH_PDS_KEYS` (`<did:web>=<secp256k1 Multikey>`) and that PDS's origin is in `SERVICE_AUTH_PDS`. The same `aud`, `lxm` and lifetime rules apply. The member (`sub`: `did:plc`, `did:web` or `did:key`) must be reported active by that PDS, and `SERVICE_AUTH_DENY_DIDS` applies to the member. The receipt's `requester` is the SHA-256 of `sub`. A token whose `sub` differs from its `iss` from any other issuer is refused. Empty by default: no PDS is pinned until its key is provisioned. |
@@ -445,6 +445,46 @@ as before.
 YATAVERSE_AUTH_MODE=cacao yataverse put file.bin
 YATAVERSE_AUTH_MODE=cacao yataverse car-put site.car
 ```
+
+### Fallback-only blocks (xavier)
+
+`READ_FALLBACK_URL` (`https://ipfs.yataverse.com`, xavier) has been unreachable since 2026-11-06, so
+a block that only xavier holds is `504 read-fallback-unreachable`. Inventory of the CIDs referenced
+in the owned repositories, DNSLink records and Linear, probed on 2026-11-22
+([docs/fallback-only-inventory-2026-11-22.md](docs/fallback-only-inventory-2026-11-22.md); the list
+of fallback-only CIDs is [docs/fallback-only-cids-2026-11-22.txt](docs/fallback-only-cids-2026-11-22.txt)):
+
+| Result on 2026-11-22 | CIDs |
+|---|---:|
+| In B2 (`200`) | 211 |
+| Waiting for xavier (`504`, or `502 read-fallback-*`) | 1136 |
+| Denied (`451`) | 1 |
+| Other | 0 |
+| Total probed | 1348 |
+
+Of the 12 DNSLink `/ipfs/` roots under `itonami.app`, 11 are waiting for xavier, so those sites
+answer `504`. Only `tsukuru.itonami.app` is in B2.
+
+These counts cover referenced CIDs only. What xavier holds in total cannot be counted while it is
+offline. The copy procedure for when it is back (`scripts/migrate-fallback.mjs`), what the write
+rule cannot take, and how to remove `READ_FALLBACK_URL` afterwards are in
+[docs/fallback-migration.md](docs/fallback-migration.md). Removing the fallback is a separate
+decision and has not been done.
+
+### No UnixFS rendering on yataverse.com, and no subdomain gateway
+
+`/ipfs/<cid>` on `yataverse.com` always answers with the block itself
+(`application/vnd.ipld.raw`, `Content-Disposition: attachment`, `nosniff`) or a CAR. It does not
+decode UnixFS into files or render HTML, and it will not. A page rendered from a user's DAG on the
+`yataverse.com` origin would share that origin with the bytes-plane API, the receipt keys under
+`/.well-known/` and the CORS answers to the Nagare WebView. A script in such a page could act as
+`yataverse.com` (stored XSS on the API origin). Sites are served on separate hosts by the name
+plane (`{name}.itonami.app`, see "Name plane" below), where no API route exists.
+
+For the same reason there is no subdomain gateway: `{cid}.ipfs.yataverse.com` is not used, and the
+Worker has no route for it. (The DNS for those names is a separate request that Dev has made to the owner.) The client
+still follows a `301` to a per-CID subdomain from other gateways inside the read host's parent
+domain (see "Reads and writes").
 
 ### UnixFS sites (dag-pb)
 
@@ -557,6 +597,7 @@ for WNFS, Kotobase and the host capability boundary.
 ```sh
 npm test        # CLI: CID vectors, redirect policy, Authn exchange/caching, sign-in CACAO verified by a fake Authn, admin flow, config permissions, MCP
                 # Worker: write/read/verify against a fake B2, fallback verification, SigV4 vector from the AWS docs
+                # Range / If-Range on /ipfs/<cid> (test/worker-range.test.mjs); scripts/migrate-fallback.mjs (test/migrate-fallback.test.mjs)
 ```
 
 Apache-2.0.
