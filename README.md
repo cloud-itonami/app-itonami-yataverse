@@ -11,7 +11,7 @@ the CID's multihash.
 ## Position: a service that uses the kotobase library
 
 Yataverse is a **service**: it stores, serves and delivers content-addressed blocks behind `yataverse.com`,
-authenticates writes, issues storage receipts and (off by default) serves named sites. **kotobase is a library**
+authenticates writes, issues storage receipts and serves named sites (on for `.itonami.app` since 2026-11-21). **kotobase is a library**
 (datoms, signed commit DAG, queries; `kotoba-lang/kotobase`) with no host of its own. The dependency runs one way,
 from this service to that library. New hosts, services and repositories use the Yataverse name, not kotobase
 ([ADR 0050](https://github.com/network-awai/network-awai-apex/blob/main/docs/adr/0050-kotobase-is-a-library-yataverse-is-the-service.md), owner decision 2026-11-21).
@@ -359,7 +359,7 @@ KV, D1 or Durable Objects.
 | `GET /auth/nonce` | `{nonce, expiresAt}` for a CACAO write. `503 cacao-not-configured` while the scheme is off. |
 | `GET /health` | Liveness only. |
 | Read deny list | `READ_DENY_CIDS` (AWAI-3629, `worker/src/read-deny.mjs`): CIDs that are not served publicly. `451 unavailable-for-legal-reasons` with `Cache-Control: no-store` on `GET`/`HEAD /ipfs/<cid>`, CAR exports and name-host files. See "Read deny list" below. |
-| `GET` / `HEAD https://{name}{suffix}/{path}` | **Name plane** (JUN-1414, `worker/src/names.mjs`; off by default). See "Name plane" below. |
+| `GET` / `HEAD https://{name}{suffix}/{path}` | **Name plane** (JUN-1414, `worker/src/names.mjs`; on for `.itonami.app` since 2026-11-21). See "Name plane" below. |
 
 The Worker never follows a redirect. Write tokens are checked against `WRITE_TOKEN_SHA256`
 (comma-separated SHA-256 hex digests), so the Worker holds no token in clear. Verifying the
@@ -528,10 +528,14 @@ Path parts that decode to `.`, `..`, an empty part, or contain `/`, `\` or NUL a
 Any other host under a suffix (its apex, a deeper label) is `404 not-a-name-host`: the bytes-plane API is
 not served there either, so a wildcard route for the suffix exposes nothing but sites.
 
-It is **off** in `wrangler.jsonc` (`NAME_PLANE_SUFFIXES` is empty) and no route for such hosts is
-configured. Turning it on is a production route change: it needs the owner's approval, a suffix in
-the var, and a route for those hosts on this Worker. The site's blocks must be written to the store
-first (`POST /ipfs/` with a CAR of the UnixFS DAG). IPNS names are not resolved.
+It is **on** for `.itonami.app` since 2026-11-21 (owner approval, JUN-1425, parent JUN-1414):
+`wrangler.jsonc` sets `NAME_PLANE_SUFFIXES` to `.itonami.app` and routes `*.itonami.app/*` (zone
+`itonami.app`) to this Worker. A host with its own DNS-only record never reaches the Worker. In the
+code the var defaults to empty, which turns the name plane off. Adding another suffix, or turning
+it off (empty the var and remove the route), is a production route change and needs the owner's
+approval. A site's blocks must be written to the store first (`POST /ipfs/` with a CAR of the
+UnixFS DAG). IPNS names are not resolved. The deploy record is in
+[docs/name-plane-deploy-runbook.md](docs/name-plane-deploy-runbook.md) (section 2b).
 
 `yataverse site-pack <dir> -o <outdir>` packs a directory and writes `site-001.car`, `site-002.car`, …,
 each within the import limits; `yataverse car-put` them in that order. It prints the root CID and the
