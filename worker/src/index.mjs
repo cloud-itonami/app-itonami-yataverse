@@ -3,6 +3,8 @@
 //
 //   GET|HEAD /ipfs/<cid>  read from B2; on a B2 miss, from READ_FALLBACK_URL if set.
 //                          Bytes are served only after they hash to the CID.
+//                          A single `Range: bytes=...` is answered with 206 and Content-Range
+//                          (416 when unsatisfiable); If-Range must equal the ETag "<cid>".
 //                          A CID in READ_DENY_CIDS (read-deny.mjs, AWAI-3629) is answered with
 //                          451 before either is asked, here, in CAR exports and on name hosts.
 //   PUT /ipfs/<cid>       Authorization: Bearer <write token>. CIDv1/sha2-256 with codec raw or
@@ -49,7 +51,7 @@ import { beginReceipt, finishReceipt, beginArchiveReceipt, finishArchiveReceipt,
 import {
   verifyLease, verifyStatus, leaseEnvelopeFromDagCbor, leaseEnvelopeFromJson, statusEnvelopeFromJson, statusEnvelopeToDagCbor, RetentionError,
 } from '../../src/retention.mjs';
-import { cidFromBytes } from '../../src/cid.mjs';
+import { cidFromBytes, base32 } from '../../src/cid.mjs';
 import { checkWritableBlock } from '../../src/block.mjs';
 import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
@@ -184,22 +186,82 @@ function b2(env, deps) {
   };
 }
 
-function serveBlock(cid, bytes, head) {
-  return new Response(head ? null : bytes, { status: 200, headers: {
-    'content-type': RAW, 'content-length': String(bytes.length),
-    'cache-control': 'public, max-age=31536000, immutable', etag: `"${cid}"`,
-    'x-content-type-options': 'nosniff', 'content-disposition': `attachment; filename="${cid}.bin"`,
-  } });
+const BLOCK_HEADERS = (cid, source) => ({
+  ...(source ? { [READ_SOURCE_HEADER]: source } : {}),
+  'content-type': RAW, 'cache-control': 'public, max-age=31536000, immutable', etag: `"${cid}"`,
+  'accept-ranges': 'bytes', 'x-content-type-options': 'nosniff', 'content-disposition': `attachment; filename="${cid}.bin"`,
+});
+
+/**
+ * The Range of a GET for one block of `length` bytes (RFC 9110 §14). -> null (serve the whole
+ * block), {start, end} (inclusive, 206) or {unsatisfiable: true} (416).
+ * Only a single `bytes=` range is honoured; a multi-range, another unit or a malformed header
+ * is ignored and the whole block is served, as §14.2 allows. If-Range must be the block's
+ * strong ETag ("<cid>"); a date or another tag means the whole block (no Last-Modified is sent).
+ */
+export function blockRange(request, cid, length) {
+  const range = request.headers.get('range');
+  if (range === null) return null;
+  const ifRange = request.headers.get('if-range');
+  if (ifRange !== null && ifRange.trim() !== `"${cid}"`) return null;
+  const m = /^bytes=(\d{0,15})-(\d{0,15})$/.exec(range.trim());
+  if (!m || (m[1] === '' && m[2] === '')) return null;
+  let start, end;
+  if (m[1] === '') {                          // bytes=-N: the last N bytes
+    const n = Number(m[2]);
+    if (n === 0 || length === 0) return { unsatisfiable: true };
+    start = Math.max(0, length - n); end = length - 1;
+  } else {
+    start = Number(m[1]);
+    if (m[2] !== '' && Number(m[2]) < start) return null; // invalid range-spec: ignore the header
+    if (start >= length) return { unsatisfiable: true };
+    end = m[2] === '' ? length - 1 : Math.min(Number(m[2]), length - 1);
+  }
+  return { start, end };
+}
+
+// Yataverse-Read-Source: `store` (B2) or `fallback` (READ_FALLBACK_URL). It lets an operator
+// check that a block has a copy in B2 before READ_FALLBACK_URL is removed
+// (scripts/migrate-fallback.mjs, docs/fallback-migration.md). It is not a trust signal: the
+// bytes are verified against the CID either way.
+export const READ_SOURCE_HEADER = 'yataverse-read-source';
+
+function serveBlock(cid, bytes, head, request, source) {
+  // Range applies to GET only (RFC 9110 §14.2); HEAD answers for the whole block.
+  const r = head || !request ? null : blockRange(request, cid, bytes.length);
+  if (r?.unsatisfiable) return new Response(null, { status: 416, headers: {
+    ...BLOCK_HEADERS(cid, source), 'content-range': `bytes */${bytes.length}`, 'content-length': '0' } });
+  if (r) {
+    const part = bytes.subarray(r.start, r.end + 1);
+    return new Response(part, { status: 206, headers: {
+      ...BLOCK_HEADERS(cid, source), 'content-length': String(part.length), 'content-range': `bytes ${r.start}-${r.end}/${bytes.length}` } });
+  }
+  return new Response(head ? null : bytes, { status: 200, headers: { ...BLOCK_HEADERS(cid, source), 'content-length': String(bytes.length) } });
+}
+
+/**
+ * B2 object keys tried for a CID. A CIDv0 (Qm..., implicit dag-pb) names the same bytes as the
+ * CIDv1 dag-pb CID with its multihash; writes accept only CIDv1, so a CIDv0 block copied in
+ * (scripts/migrate-fallback.mjs) is stored under the CIDv1 key. Its own key is tried first.
+ */
+export function storeKeys(cid) {
+  const p = parseCid(cid);
+  if (!p || p.version !== 0) return [cid];
+  return [cid, 'b' + base32(Buffer.concat([Buffer.from([0x01, 0x70, 0x12, 0x20]), Buffer.from(p.digest)]))];
 }
 
 async function readBlock(cid, env, deps, store) {
   const cap = maxBytes(env);
-  const res = await store.get(cid);
+  let res;
+  for (const key of storeKeys(cid)) {
+    res = await store.get(key);
+    if (res.status !== 404) break;
+  }
   if (res.status === 200) {
     const bytes = await readCapped(res, cap);
     if (!bytes) return { error: [502, 'stored-block-too-large'] };
     if (!verifyBlock(cid, bytes)) return { error: [502, 'stored-block-does-not-hash-to-cid'] };
-    return { bytes };
+    return { bytes, source: 'store' };
   }
   if (res.status !== 404) return { error: [502, `store-read-failed-${res.status}`] };
   if (!env.READ_FALLBACK_URL) return { absent: true };
@@ -215,7 +277,7 @@ async function readBlock(cid, env, deps, store) {
   const bytes = await readCapped(r, cap);
   if (!bytes) return { error: [502, 'read-fallback-too-large'] };
   if (!verifyBlock(cid, bytes)) return { error: [502, 'read-fallback-does-not-hash-to-cid'] };
-  return { bytes };
+  return { bytes, source: 'fallback' };
 }
 
 /** The public read: a read-denied CID never reaches B2 or READ_FALLBACK_URL (AWAI-3629). */
@@ -551,6 +613,8 @@ async function exportCar(cid, url, env, deps, store, head) {
   return new Response(head ? null : car, { status: 200, headers: {
     'content-type': `${CAR_CONTENT_TYPE}; version=1; order=dfs; dups=n`, 'content-length': String(car.length),
     'cache-control': 'public, max-age=31536000, immutable', etag: `"${cid}.car.${scope}"`, vary: 'accept',
+    // A CAR export is built per request; Range and If-Range are ignored and the whole CAR is sent.
+    'accept-ranges': 'none',
     'x-content-type-options': 'nosniff', 'content-disposition': `attachment; filename="${cid}.car"`,
   } });
 }
@@ -597,8 +661,8 @@ function ipfsCors(request, env, methods) {
   if (!origin || !(ipfsAllowedOrigins(env).includes(origin) || readOnly)) return h;
   h['access-control-allow-origin'] = origin;
   h['access-control-allow-methods'] = methods;
-  h['access-control-allow-headers'] = methods.includes('POST') ? 'authorization, content-type, yataverse-request-id' : 'accept';
-  h['access-control-expose-headers'] = 'content-length, etag';
+  h['access-control-allow-headers'] = methods.includes('POST') ? 'authorization, content-type, yataverse-request-id' : 'accept, range, if-range';
+  h['access-control-expose-headers'] = 'content-length, etag, content-range, accept-ranges, yataverse-read-source';
   h['access-control-max-age'] = '600';
   return h;
 }
@@ -727,7 +791,7 @@ async function handleCore(request, env, deps = {}) {
       const r = await readBlock(cid, env, deps, store);
       if (r.error) return fail(...r.error);
       if (r.absent) return fail(404, 'block-not-found');
-      return serveBlock(cid, r.bytes, request.method === 'HEAD');
+      return serveBlock(cid, r.bytes, request.method === 'HEAD', request, r.source);
     }
   } catch (e) { return storeFailure(e); }
   return fail(405, 'method-not-allowed', { allow: 'GET, HEAD, PUT, OPTIONS' });
