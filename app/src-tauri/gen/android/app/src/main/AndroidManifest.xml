@@ -5,7 +5,12 @@
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- No OS backup of this app's data (Legal L1, KOTOBA-159): files stay on this device and are
+         restored only from the encrypted copy on yataverse.com. allowBackup covers Android 11 and
+         older; on Android 12 and newer dataExtractionRules also excludes device-to-device transfer. -->
     <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"

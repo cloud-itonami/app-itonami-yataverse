@@ -62,6 +62,13 @@ Tracking: [AWAI-3130](https://linear.app/kotobalabs/issue/AWAI-3130) (parent), [
 - **Size:** encrypted snapshots are limited to 8 MiB / 1000 entries. Larger local files stay on the device.
 - **Recovery:** there is no key recovery yet (AwaiFS owner enrollment). Uninstalling the app or clearing
   its data makes saved data unreadable.
+- **No OS backup (from 2026-11-22, KOTOBA-159):** the app's data is excluded from Google backup and from
+  device-to-device transfer (`android:allowBackup="false"` and `res/xml/data_extraction_rules.xml`). The macOS
+  Keychain key is never an iCloud Keychain item (`kSecAttrSynchronizable = false`). So after a reinstall or on
+  a new phone, local files do **not** come back from Google backup. Before this change, the working copy
+  (`drive-local-v1`, not encrypted) could be restored that way. The only other copy is the encrypted one on
+  yataverse.com, and it opens only with the key on the original device (see Recovery). This is Legal's
+  condition that device-local data does not leave the device through OS backup.
 - **No proof of retention yet.** yataverse.com currently stores packs in Backblaze B2. Proof-of-storage
   providers come later (ADR 0041, project milestone M2).
 
