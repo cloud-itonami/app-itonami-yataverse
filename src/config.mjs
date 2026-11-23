@@ -51,9 +51,16 @@ export function loadConfig(env = process.env) {
   if (env.YATAVERSE_AUTH_CMD) {
     try { cfg.authCmd = JSON.parse(env.YATAVERSE_AUTH_CMD); } catch { throw new ConfigError('auth-cmd-not-json'); }
   } else if (file.authCmd) cfg.authCmd = file.authCmd;
-  cfg.saToken = env.YATAVERSE_SA_TOKEN || readSecretFile(path.join(dir, 'sa-token'));
-  cfg.staticAuth = env.YATAVERSE_AUTH || readSecretFile(path.join(dir, 'auth'));
+  // Credentials from the environment are opt-in (see YATAVERSE_ALLOW_BEARER): by default
+  // the tool never reads a token out of env. A token stored by `config init` (file) is
+  // still honoured: keeping it is the operator's explicit act of writing it there.
+  const envTokenAllowed = env.YATAVERSE_ALLOW_BEARER === '1';
+  cfg.saToken = (envTokenAllowed && env.YATAVERSE_SA_TOKEN) || readSecretFile(path.join(dir, 'sa-token'));
+  cfg.staticAuth = (envTokenAllowed && env.YATAVERSE_AUTH) || readSecretFile(path.join(dir, 'auth'));
   validate(cfg);
+  // CACAO is the default write path: when the operator's ed25519 admin key exists, writes
+  // are signed with it (the plane's allow-list decides whether that key may write).
+  if (!cfg.authMode && fs.existsSync(path.join(dir, 'admin.key'))) cfg.authMode = 'cacao';
   return cfg;
 }
 

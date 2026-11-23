@@ -80,6 +80,15 @@ test('each refusal names its reason and stores nothing', async () => {
   assert.equal(dataKeys(s).length, 0);
 });
 
+test('a CACAO naming two resources is refused: the capability is exactly one write', async () => {
+  const s = fakeStore(); const bytes = Buffer.from('two resources'); const cid = rawCid(bytes);
+  const deps = { fetchImpl: s.fetchImpl, now: NOW };
+  const two = cacao(WRITER, await nonce(s), [blockResource(cid), blockResource(rawCid(Buffer.from('another')))]);
+  const res = await handle(put(cid, bytes, two), CENV, deps);
+  assert.equal(res.status, 403); assert.equal(await code(res), 'cacao-resource-does-not-match-this-write');
+  assert.equal(dataKeys(s).length, 0);
+});
+
 test('time limits: an expired CACAO and an expired nonce are refused; the boundary second still works', async () => {
   const s = fakeStore(); const bytes = Buffer.from('time'); const cid = rawCid(bytes);
   const n = await nonce(s);
