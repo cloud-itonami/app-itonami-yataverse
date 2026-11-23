@@ -83,7 +83,7 @@
     // in the operator's ~/.config/yataverse/admin.key. Add a writer by adding its did:key here.
     "CACAO_AUD": "https://yataverse.com",
     "CACAO_DOMAIN": "yataverse.com",
-    "CACAO_WRITER_DIDS": "did:key:z6MkqmDHTL42uLLfZBL4Stmt1QtxcCs8Fx11kD1zC5BAghDk",
+    "CACAO_WRITER_DIDS": "did:key:z6MkqmDHTL42uLLfZBL4Stmt1QtxcCs8Fx11kD1zC5BAghDk,did:key:z6Mkj9ZavdNeKgaAmF1YybuPjkoobt6mSzguutc6F7vVohCL",
     // Name plane (worker/src/names.mjs, JUN-1414): comma-separated host suffixes, each starting
     // with "." (for example ".itonami.app"). A host one label under a suffix is served as a site
     // from its _dnslink TXT record. Empty: off. On since the owner approved the route above
