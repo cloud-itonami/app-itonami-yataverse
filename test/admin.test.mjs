@@ -25,6 +25,18 @@ test('keygen makes a 0600 key, prints only the did, and refuses to overwrite', (
   assert.ok(!JSON.stringify(adminStatus(env)).match(/[0-9a-f]{64}/));
 });
 
+test('an admin key readable by others is refused instead of loaded', () => {
+  const { dir, env } = tmp();
+  try {
+    const f = path.join(dir, 'admin.key');
+    fs.writeFileSync(f, Buffer.alloc(32, 7).toString('hex') + '\n', { mode: 0o644 });
+    fs.chmodSync(f, 0o644);
+    assert.throws(() => loadKey(env), (e) => e.code === 'secret-file-permissions');
+    fs.chmodSync(f, 0o600);
+    assert.match(loadKey(env).did, /^did:key:z/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('did:key derivation and base58 are standard', () => {
   assert.equal(base58btc(Buffer.from('hello world')), 'StV1DL6CwTryKyV');
   assert.equal(base58btc(Buffer.from([0, 0, 1])), '112');
