@@ -14,7 +14,8 @@ import { lockStore } from './lock-store.mjs';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yv-retention-cli-'));
 process.env.YATAVERSE_CONFIG_DIR = dir;                    // never read the operator's real config
-process.env.YATAVERSE_AUTH = `Bearer ${TOKEN}`;
+process.env.YATAVERSE_AUTH = `Bearer ${TOKEN}`;       // this harness writes with a bearer token
+process.env.YATAVERSE_ALLOW_BEARER = '1';
 process.env.YATAVERSE_URL = 'https://yataverse.com'; process.env.YATAVERSE_READ_URL = 'https://yataverse.com';
 const T = Date.parse('2026-11-18T00:00:00Z'), DAY = 86_400_000;
 const p = (name) => path.join(dir, name);

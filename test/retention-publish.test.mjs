@@ -186,7 +186,7 @@ test('the reader refuses a record the host altered, a stale one, and one for som
 test('retention-verify-sweep runs every lease, keeps going past a broken one, and publishes what it found', async () => {
   const { s, state, fetchImpl, client } = setup();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yv-sweep-'));
-  process.env.YATAVERSE_CONFIG_DIR = dir; process.env.YATAVERSE_AUTH = `Bearer ${TOKEN}`;
+  process.env.YATAVERSE_CONFIG_DIR = dir; process.env.YATAVERSE_AUTH = `Bearer ${TOKEN}`; process.env.YATAVERSE_ALLOW_BEARER = '1';
   process.env.YATAVERSE_URL = 'https://yataverse.com'; process.env.YATAVERSE_READ_URL = 'https://yataverse.com';
   const p = (n) => path.join(dir, n);
   try {

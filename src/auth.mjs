@@ -35,7 +35,9 @@ export function runAuthCmd(argv, { exec = execFileSync } = {}) {
 export function makeAuthorizer(cfg, { fetchImpl = fetch, now = Date.now, exec = execFileSync,
                                       authnHosts = DEFAULT_AUTHN_HOSTS, allowInsecureForTests = false, cacaoKey = null } = {}) {
   let cache = null;
-  if (cfg.authMode === 'cacao') {
+  // CACAO is the default writer whenever the operator's key is available, not only when
+  // authMode says so. An explicit cacao mode without a key still fails loudly here.
+  if (cfg.authMode === 'cacao' || (cacaoKey?.did && cacaoKey?.privateKey)) {
     if (!cacaoKey?.did || !cacaoKey.privateKey) throw new AuthError('no-admin-key', 'run: yataverse admin keygen');
     const base = new URL(cfg.url);
     if (!(base.protocol === 'https:' || (allowInsecureForTests && base.protocol === 'http:'))) throw new AuthError('write-url-not-https');

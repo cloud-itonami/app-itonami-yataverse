@@ -30,6 +30,8 @@ test('a secret file readable by group/other is refused', () => {
 
 test('configuration is validated', () => {
   const { env } = tmpEnv();
+  // Token values on the environment count only with YATAVERSE_ALLOW_BEARER=1 (opt-in).
+  const gated = { ...env, YATAVERSE_ALLOW_BEARER: '1' };
   for (const [k, v, code] of [['YATAVERSE_URL', 'http://x.example', 'url-not-https-origin'],
                               ['YATAVERSE_URL', 'https://x.example/path', 'url-not-https-origin'],
                               ['YATAVERSE_PREFIX', '/../', 'prefix-invalid'],
@@ -37,7 +39,7 @@ test('configuration is validated', () => {
                               ['YATAVERSE_SA_TOKEN', 'nope', 'sa-token-bad-shape'],
                               ['YATAVERSE_AUTH_CMD', 'rm -rf /', 'auth-cmd-not-json'],
                               ['YATAVERSE_AUTH_CMD', '"a string"', 'auth-cmd-not-an-argv-array']])
-    assert.throws(() => loadConfig({ ...env, [k]: v }), (e) => e.code === code, `${k}=${v}`);
+    assert.throws(() => loadConfig({ ...gated, [k]: v }), (e) => e.code === code, `${k}=${v}`);
 });
 
 const capture = () => { let out = '', err = ''; return { stdout: { write: (x) => { out += x; } }, stderr: { write: (x) => { err += x; } }, get out() { return out; }, get err() { return err; } }; };

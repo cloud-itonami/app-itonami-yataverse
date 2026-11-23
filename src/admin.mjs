@@ -10,6 +10,7 @@
 // of the tenant is refused by Authn, not by this file.
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { keyFromSeed, newSeed, mintSession } from './cacao.mjs';
 import { configDir } from './config.mjs';
 import { DEFAULT_AUTHN_HOSTS } from './auth.mjs';
@@ -52,11 +53,24 @@ export function keygen(env = process.env) {
   return { did: keyFromSeed(seed).did };
 }
 
-export function loadKey(env = process.env) {
+export function loadKey(env = process.env, { exec = execFileSync } = {}) {
   const s = readSecret(files(env).key);
-  if (!s) return null;
-  if (!/^[0-9a-f]{64}$/.test(s)) throw new AdminError('admin-key-malformed');
-  return keyFromSeed(s);
+  if (s) {
+    if (!/^[0-9a-f]{64}$/.test(s)) throw new AdminError('admin-key-malformed');
+    return keyFromSeed(s);
+  }
+  // The signing key may live in the OS keychain instead of the file above. That lookup is
+  // opt-in (YATAVERSE_USE_KEYCHAIN=1) so a locked keychain can never prompt for it. The
+  // value is validated as a 64-hex seed and never printed, logged or returned.
+  if (env.YATAVERSE_USE_KEYCHAIN === '1' && process.platform === 'darwin') {
+    try {
+      const out = exec('security', ['find-generic-password', '-s', 'yataverse-admin-key',
+        '-a', env.YATAVERSE_KEYCHAIN_ACCOUNT || process.env.USER || 'organizer', '-w'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      if (/^[0-9a-f]{64}$/.test(out)) return keyFromSeed(out);
+    } catch { /* no item, a locked keychain, or no `security` binary: no key */ }
+  }
+  return null;
 }
 
 export function adminStatus(env = process.env) {

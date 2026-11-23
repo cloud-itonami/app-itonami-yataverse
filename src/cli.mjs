@@ -110,10 +110,14 @@ Administration (Authn) — uses YOUR ed25519 key; the first sign-in creates the 
 
 With YATAVERSE_AUTH_MODE=cacao (or "authMode": "cacao" in config.json) every block and CAR write is signed
 with the admin key (yataverse admin keygen) over a fresh nonce from the service; the key's did:key must be
-listed as a writer there. Otherwise:
+listed as a writer there. CACAO signed with the operator's key is the default write path whenever that
+key exists, and the did:key is derived as did:key:z + base58btc(0xed01 ‖ ed25519 public key) (src/cacao.mjs
+keyFromSeed). The key may live in the OS keychain instead of admin.key (YATAVERSE_USE_KEYCHAIN=1, service
+yataverse-admin-key). ATProto service-auth writes are not implemented on the client. Otherwise:
 Writes are authorised by, in order: YATAVERSE_AUTH_CMD / config authCmd (your minter, argv, no shell),
 a tenant service-account secret (~/.config/yataverse/sa-token, 0600) exchanged at Authn for a Biscuit,
-or a static value. This tool mints no credential; a service-account secret comes from a tenant admin.
+or a static value. Token values in the environment (YATAVERSE_SA_TOKEN / YATAVERSE_AUTH) are read only
+when --allow-bearer-token (or YATAVERSE_ALLOW_BEARER=1) is given. This tool mints no credential; a service-account secret comes from a tenant admin.
 `;
 
 const readInput = (arg) => (arg === '-' || arg === undefined) ? fs.readFileSync(0) : fs.readFileSync(arg);
@@ -256,6 +260,7 @@ function flags(argv) {
     const a = argv[i];
     if (a === '-o') out.o = argv[++i];
     else if (a === '--sa-token-stdin') out.saTokenStdin = true
+    else if (a === '--allow-bearer-token' || a === '--allow-bearer') out.allowBearerToken = true
     else if (a === '--print') out.print = true
     else if (a === '--yes') out.yes = true;
     else if (a.startsWith('--')) out[a.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = argv[++i];
@@ -267,6 +272,10 @@ function flags(argv) {
 export async function main(argv, { stdout = process.stdout, stderr = process.stderr, fetchImpl, now = Date.now, env = process.env } = {}) {
   const [cmd, ...rest] = argv;
   const f = flags(rest);
+  // Token credentials out of the environment are opt-in, never the default: only with
+  // --allow-bearer-token (or YATAVERSE_ALLOW_BEARER=1) are YATAVERSE_SA_TOKEN and
+  // YATAVERSE_AUTH read. CACAO signed with the operator key is the default write mode.
+  if (f.allowBearerToken) process.env.YATAVERSE_ALLOW_BEARER = '1';
   const out = (x) => stdout.write(typeof x === 'string' ? x : JSON.stringify(x, null, 2) + '\n');
   try {
     switch (cmd) {

@@ -270,17 +270,35 @@ deterministic derivation. They do not upload a manifest or prove an asset claim.
 
 ## Authorisation
 
-Writes need an `Authorization` value. In order:
+Writes are signed with the operator's key by default (**CACAO**): with an admin key present
+(`yataverse admin keygen`, file `~/.config/yataverse/admin.key` 0600 — or the OS keychain when
+`YATAVERSE_USE_KEYCHAIN=1`, service `yataverse-admin-key`), each block/CAR write fetches
+`GET /auth/nonce` and carries `Authorization: CACAO <base64>` (CBOR envelope).
+The key's did:key is derived as
+`did:key:z` + base58btc(0xed01 ‖ ed25519 public key) (`src/cacao.mjs` `keyFromSeed`), and only
+writes whose key the plane lists in `CACAO_WRITER_DIDS` are accepted. The plane is the
+`yataverse-bytes` Worker on cloud-kotoba; blocks are stored in Backblaze B2 there, so nothing
+but the Worker needs B2 credentials. **ATProto service-auth writes are not implemented on the
+client** (the Worker accepts them for CAR imports; this tool offers no provider for them).
+
+Otherwise, in order:
 
 1. **Your minter command** — `YATAVERSE_AUTH_CMD='["/path/to/mint","--aud","..."]'` (or `authCmd` in the
    config). Run as an argv array, **no shell**; stdout is the value. Runs before every write.
 2. **A tenant service-account secret** (`kb_sa_...`, issued by a **tenant admin**) with `tenantId`
    (`t_...`) and optionally `storage`: exchanged at `https://auth.kotoba.cloud/v1/biscuit/token` for a
    15-minute Biscuit, cached until 60 s before expiry. The secret is only ever sent to an allow-listed
-   Authn host over https.
+   Authn host over https. (The `yataverse-bytes` Worker itself accepts Bearer / CACAO / ATProto —
+   Biscuit verification there is a follow-up, see the Worker section.)
 3. **A static value** (`~/.config/yataverse/auth`, 0600), for a gateway that accepts one.
 
-This tool **mints no credential**. A self-signed CACAO is refused by the plane (probed 2026-09-29),
+Token values in the **environment** (`YATAVERSE_SA_TOKEN` / `YATAVERSE_AUTH`) are **never read by
+default**: they count only with `--allow-bearer-token` (or `YATAVERSE_ALLOW_BEARER=1`).
+
+Without any authorisation a write is refused before anything is sent
+(`yataverse: no-authorization-configured`, exit 1).
+
+This tool **mints no credential of its own**. A self-signed CACAO is refused by the plane (probed 2026-09-29),
 and Authn issues a Biscuit only to a tenant member — so the secret has to come from a tenant admin.
 
 Config lives in `~/.config/yataverse` (`$YATAVERSE_CONFIG_DIR`): `config.json` (non-secret) and
