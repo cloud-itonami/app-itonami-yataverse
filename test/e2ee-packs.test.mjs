@@ -197,12 +197,12 @@ test('statement replay and expiry are rejected', async () => {
   assert.equal(exp.status, 401); assert.equal((await exp.json()).error, 'statement-expired');
 });
 
-test('status endpoint reveals epoch only; unknown owner gets the same shape', async () => {
+test('status endpoint reveals epoch + incarnation; unknown owner gets the same shape', async () => {
   const { s, r } = await setup();
   const st = await handle(new Request(`https://yataverse.com/awai-drive/v1/e2ee-registry/status/${OWNER}`), envFor(), deps(s, r));
-  assert.equal(st.status, 200); assert.deepEqual(await st.json(), { epoch: 0 });
+  assert.equal(st.status, 200); assert.deepEqual(await st.json(), { epoch: 0, incarnation: 0 });
   const un = await handle(new Request(`https://yataverse.com/awai-drive/v1/e2ee-registry/status/${'f'.repeat(64)}`), envFor(), deps(s, r));
-  assert.deepEqual(await un.json(), { epoch: 0 });
+  assert.deepEqual(await un.json(), { epoch: 0, incarnation: 0 });
 });
 
 test('head publish + device-CACAO head read; stranger gets 404', async () => {

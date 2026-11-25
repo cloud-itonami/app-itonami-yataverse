@@ -190,7 +190,7 @@ test('attack 2b (HTTP): batch revoke via signed statement, epoch advances at eff
   assert.equal(res.status, 200);
   regNow += RECOVERY_WAIT_MS;
   const st = await handle(new Request(`https://yataverse.com/awai-drive/v1/e2ee-registry/status/${OWNER}`), envFor(), deps(s, r));
-  assert.deepEqual(await st.json(), { epoch: 1 }, 'status must settle before reporting the epoch');
+  assert.deepEqual(await st.json(), { epoch: 1, incarnation: 0 }, 'status must settle before reporting the epoch');
   assert.equal(await r.ownerOfDevice(DEVICE.did), null, 'pre-batch terminal is revoked at effect time');
 });
 

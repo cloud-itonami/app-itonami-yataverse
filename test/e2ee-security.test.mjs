@@ -150,7 +150,7 @@ test('control 9: one device maps to one owner (index enforced)', async () => {
     approverDid: other.registration.did, kind: 'seed' }), /device-registered-elsewhere/);
 });
 
-test('control 10: head name binds to owner; status reveals epoch only', async () => {
+test('control 10: head name binds to owner; status reveals epoch + incarnation', async () => {
   regNow = T0;
   const s = fakeStore(); const r = registry();
   await r.applyRegistration({ owner: OWNER, deviceDid: DEVICE.did, approverDid: DERIVED.registration.did, kind: 'seed' });
@@ -159,9 +159,9 @@ test('control 10: head name binds to owner; status reveals epoch only', async ()
     headNameHex: '9'.repeat(64) }), /head-name-mismatch/);
   const st = await handle(new Request(`https://yataverse.com/awai-drive/v1/e2ee-registry/status/${OWNER}`), envFor(), deps(s, r));
   assert.equal(st.status, 200);
-  assert.deepEqual(await st.json(), { epoch: 0 });
+  assert.deepEqual(await st.json(), { epoch: 0, incarnation: 0 });
   const stUnknown = await handle(new Request(`https://yataverse.com/awai-drive/v1/e2ee-registry/status/${'f'.repeat(64)}`), envFor(), deps(s, r));
-  assert.deepEqual(await stUnknown.json(), { epoch: 0 });
+  assert.deepEqual(await stUnknown.json(), { epoch: 0, incarnation: 0 });
 });
 
 test('control 12/13: non-allowlisted owner denied; rate limit fires before signature check', async () => {
