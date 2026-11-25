@@ -79,6 +79,7 @@ export const carResource = (sha256Hex) => `yataverse:car:${sha256Hex}`;
 export const e2eeGetResource = (sha256Hex) => `yataverse:e2ee:get:${sha256Hex}`;
 export const e2eePutResource = (sha256Hex) => `yataverse:e2ee:put:${sha256Hex}`;
 export const e2eeHeadResource = (headNameHex, seq) => `yataverse:e2ee:head:${headNameHex}:${seq}`;
+export const e2eeHeadReadResource = (headNameHex) => `yataverse:e2ee:head:${headNameHex}:read`;
 
 /** CACAO for a direct block write (`Authorization: CACAO <b64>`). */
 export const mintDirect = (key, opts) => mint(key, { ...opts, profile: 'direct' });

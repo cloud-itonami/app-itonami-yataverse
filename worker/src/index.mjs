@@ -27,10 +27,14 @@
 //   PUT|GET|HEAD|OPTIONS /awai-drive/v1/e2ee-packs/<sha256>
 //                          Owner-scoped E2EE packs (see e2ee-packs.mjs): CACAO +
 //                          owner registry only, bytes bound before the record.
-//   POST /awai-drive/v1/e2ee-registry/register|cancel|revoke|batch-revoke
+//   POST /awai-drive/v1/e2ee-registry/register|cancel|revoke|batch-revoke|release
 //                          Device registration against the owner registry.
+//   GET  /awai-drive/v1/e2ee-registry/status/<owner>
+//                          {epoch} only (statement signing epoch).
 //   POST /awai-drive/v1/e2ee-heads/<headNameHex>
 //                          Head sequence publish; the registry is the order authority.
+//   GET  /awai-drive/v1/e2ee-heads/<headNameHex>
+//                          Head read for a live registered device (CACAO).
 //   GET /health           liveness, no configuration values.
 //   GET|HEAD https://{name}{suffix}/{path}
 //                          the name plane (names.mjs): a host one label under a suffix in
@@ -63,7 +67,7 @@ import { checkWritableBlock } from '../../src/block.mjs';
 import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
 import { handleDrivePack, DRIVE_PACK_PATH } from './drive-packs.mjs';
-import { handleE2eePack, handleE2eeRegistry, handleE2eeHead, E2EE_PACK_PATH, E2EE_REGISTRY_PREFIX, E2EE_HEAD_PATH } from './e2ee-packs.mjs';
+import { handleE2eePack, handleE2eeRegistry, handleE2eeHead, handleE2eeStatus, E2EE_PACK_PATH, E2EE_REGISTRY_PREFIX, E2EE_STATUS_PATH, E2EE_HEAD_PATH } from './e2ee-packs.mjs';
 import { admitWriteRequest, admitWriteBytes } from './write-limits.mjs';
 import { isServiceAuth, verifyServiceAuth, IMPORT_CAR_LXM } from './service-auth.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
@@ -772,11 +776,13 @@ async function handleCore(request, env, deps = {}) {
   }
   const e2eePack = E2EE_PACK_PATH.exec(url.pathname);
   const e2eeHead = E2EE_HEAD_PATH.exec(url.pathname);
-  if (e2eePack || e2eeHead || url.pathname.startsWith(E2EE_REGISTRY_PREFIX)) {
+  const e2eeStatus = E2EE_STATUS_PATH.exec(url.pathname);
+  if (e2eePack || e2eeHead || e2eeStatus || url.pathname.startsWith(E2EE_REGISTRY_PREFIX)) {
     try {
       const store = b2(env, deps);
       const shared = { readCapped, admitWriteRequest, admitWriteBytes, registry: deps.e2eeRegistry ?? null };
       if (e2eePack) return await handleE2eePack(request, e2eePack[1], env, store, { ...shared, ...deps });
+      if (e2eeStatus) return await handleE2eeStatus(request, e2eeStatus[1], env, { ...shared, ...deps });
       if (e2eeHead) return await handleE2eeHead(request, e2eeHead[1], env, { ...shared, ...deps });
       const action = url.pathname.slice(E2EE_REGISTRY_PREFIX.length);
       return await handleE2eeRegistry(request, action, env, store, { ...shared, readCapped });

@@ -1,29 +1,48 @@
 // Owner registration table for owner-scoped E2EE packs (design §3).
 //
-// One table per owner pseudonym, single writer, monotone revocation. The
-// production shape is one Durable Object instance per owner (SQLite storage);
-// this module implements the same interface in memory so the HTTP layer and
-// its tests run with fake storage only. No Durable Object is created here
-// and no binding is wired in wrangler.jsonc (pending approval):
-// with no registry configured the HTTP layer answers 503, never open.
+// One table per owner pseudonym, single writer, monotone revocation, plus one
+// global device->owner index. The production shape is one Durable Object
+// instance per owner plus a single DeviceIndexDO; this module implements the
+// same interface in memory so the HTTP layer and its tests run with fake
+// storage only. No Durable Object is created here and no binding is wired in
+// wrangler.jsonc (pending approval): with no registry configured the HTTP
+// layer answers 503, never open.
 //
-// Rules implemented here (design §0, §3–§5):
+// Rules implemented here (design §0, §3–§5, fix design §§1–5):
 // - A pack record is created only after bytes + readback verify (the HTTP
-//   layer enforces the order; this table only records).
+//   layer enforces the order; this table only records). Per-owner pack
+//   count/byte caps bound capacity before any owner allowlist is consulted.
 // - revokedAt is set once and never cleared; epoch only increases.
-// - Registration wait: 3 days (provisional) while a non-revoked device
-//   remains for the owner; the wait always ends.
-// - Cancel: a registered, non-revoked device may cancel a pending registration
-//   once per owner; a second application is not cancellable. A later
-//   seed-signed registration supersedes a cancellation (seed wins).
-// - Batch revoke (epoch advance) carries the same wait as registration.
-//   Single-device revoke by a registered device is immediate.
-// - Head ordering: the table allocates headSeq atomically; publish requires
-//   the allocated sequence (stale sequences rejected, same-hash retry ok).
+// - Registration wait (3 days, provisional) applies ONLY to seed (recovery)
+//   registrations and batch revoke. Existing-device additions are admitted
+//   immediately (approver signature + device consent already authenticate),
+//   and are frozen while a batch revoke is pending.
+// - Cancel: a registered, non-revoked device may cancel a pending seed
+//   registration once per owner per epoch; the budget resets on epoch
+//   advance and on admission of a seed registration. The seed ultimately
+//   wins: a new seed application supersedes a pending one for the same device.
+// - Batch revoke (epoch advance) carries the same wait, is applied BEFORE
+//   pending admissions in _settle, and exempts seed-registered devices
+//   (only existing-device terminals are revoked). Existing-device additions
+//   are frozen while a batch revoke is pending, so a stolen terminal cannot
+//   survive one by adding its own device.
+// - Head ordering: the table is the ordering authority; publish requires the
+//   next sequence and binds the head name at first publish.
 // - Every GET reads the table at request time: revocation takes effect for
 //   the next request, not after a cache window.
+// - Signed statements are single-use: consumeStatement rejects replays,
+//   expired statements and epoch-stale statements.
 
 export const RECOVERY_WAIT_MS = 3 * 24 * 60 * 60 * 1000;
+export const MAX_PENDING_PER_LANE = 3;
+export const MAX_APPLICATIONS_PER_LANE_PER_HOUR = 10;
+export const MAX_BATCH_REVOKES_PER_DAY = 1;
+export const MAX_HEAD_PUBLISHES_PER_HOUR = 100;
+export const MAX_PACKS_PER_OWNER = 128;
+export const MAX_PACK_BYTES_PER_OWNER = 512 * 1024 * 1024;
+
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
 
 export class RegistryError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -36,11 +55,13 @@ const DID_RE = /^did:key:z[1-9A-HJ-NP-Za-km-z]{40,60}$/;
 function checkOwner(owner) { if (!OWNER_RE.test(String(owner ?? ''))) throw new RegistryError('bad-owner'); }
 function checkSha(sha) { if (!SHA_RE.test(String(sha ?? ''))) throw new RegistryError('bad-sha256'); }
 function checkDid(did) { if (!DID_RE.test(String(did ?? ''))) throw new RegistryError('bad-device-did'); }
+const within = (arr, now, window) => arr.filter((t) => t > now - window);
 
 export class MemoryRegistry {
   constructor({ now = () => Date.now() } = {}) {
     this.now = now;
     this.owners = new Map();
+    this.deviceIndex = new Map(); // deviceDid -> owner (global DeviceIndexDO shape)
   }
 
   _rec(owner) {
@@ -48,32 +69,45 @@ export class MemoryRegistry {
     let r = this.owners.get(owner);
     if (!r) {
       r = { owner, devices: new Map(), packs: new Map(), pending: [], batchRevokes: [],
-            headSeq: 0, headSha: null, epoch: 0, registrationDid: null, cancelsUsed: 0, nextId: 1 };
+            headSeq: 0, headSha: null, headName: null, epoch: 0, registrationDid: null,
+            cancelsUsed: 0, nextId: 1, usedStatements: new Map(),
+            appTimes: { seed: [], existing: [] }, batchTimes: [], headTimes: [] };
       this.owners.set(owner, r);
     }
     return r;
   }
 
+  /** Read-only lookup: never creates an owner record. */
+  _get(owner) { checkOwner(owner); return this.owners.get(owner) ?? null; }
+
   _liveDevices(r) { return [...r.devices.values()].filter((d) => !d.revokedAt); }
 
-  /** Promote pendings whose wait has elapsed; apply effective batch revokes. */
+  /** Batch revokes first, then admissions; sweep single-use statements and cap windows. */
   _settle(r, now) {
+    for (const b of r.batchRevokes) {
+      if (!b.appliedAt && b.effectiveAt <= now) {
+        b.appliedAt = now;
+        r.epoch += 1;
+        r.cancelsUsed = 0;
+        // Seed-registered devices are exempt; only existing-device terminals die.
+        for (const d of r.devices.values()) if (!d.revokedAt && d.kind !== 'seed') d.revokedAt = now;
+      }
+    }
     for (const p of r.pending) {
-      if (!p.cancelledAt && p.admitAt <= now) {
+      if (!p.cancelledAt && !p.admittedAt && p.admitAt <= now) {
         p.admittedAt = now;
         if (!r.devices.has(p.deviceDid)) {
           r.devices.set(p.deviceDid, { did: p.deviceDid, approvedBy: p.approverDid, kind: p.kind,
                                        approvedAt: now, revokedAt: 0 });
         }
+        if (p.kind === 'seed') r.cancelsUsed = 0;
       }
     }
-    for (const b of r.batchRevokes) {
-      if (!b.appliedAt && b.effectiveAt <= now) {
-        b.appliedAt = now;
-        r.epoch += 1;
-        for (const d of r.devices.values()) if (!d.revokedAt && d.did !== b.exemptDid) d.revokedAt = now;
-      }
-    }
+    for (const [h, exp] of r.usedStatements) if (exp <= now) r.usedStatements.delete(h);
+    r.appTimes.seed = within(r.appTimes.seed, now, HOUR);
+    r.appTimes.existing = within(r.appTimes.existing, now, HOUR);
+    r.batchTimes = within(r.batchTimes, now, DAY);
+    r.headTimes = within(r.headTimes, now, HOUR);
   }
 
   _isLive(r, did) {
@@ -82,31 +116,75 @@ export class MemoryRegistry {
     return d && !d.revokedAt ? d : null;
   }
 
+  /** Current epoch for statement signing / the status endpoint. No record created. */
+  async epochOf({ owner }) { return this._get(owner)?.epoch ?? 0; }
+
   /**
-   * Apply a registration. kind 'seed': approverDid must be the bound
-   * registrationDid (first seed registration binds it). kind
-   * 'existing-device': approverDid must be a live registered device.
-   * -> { status: 'admitted' } | { status: 'pending', id, admitAt }
+   * Single-use statement gate (fix design §1): the HTTP layer verifies the
+   * Ed25519 signature first, then consumes here. Rejects expired, epoch-
+   * stale and replayed statements.
+   */
+  async consumeStatement({ owner, signature, expiresAt, epoch }) {
+    checkOwner(owner);
+    const r = this._rec(owner); const now = this.now();
+    this._settle(r, now);
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) throw new RegistryError('statement-expired');
+    if (epoch !== r.epoch) throw new RegistryError('statement-stale-epoch');
+    const h = String(signature);
+    if (r.usedStatements.has(h)) throw new RegistryError('statement-replayed');
+    r.usedStatements.set(h, expiresAt);
+    return { status: 'consumed' };
+  }
+
+  /**
+   * Apply a registration. The device index claim happens FIRST
+   * (set-if-absent) and is undone if the apply fails, so concurrent claims
+   * race safely. kind 'seed': approverDid must be the bound registrationDid
+   * (first seed registration binds it); the 3-day wait applies while a
+   * non-revoked device remains. kind 'existing-device': approver must be a
+   * live device; admitted immediately; frozen while a batch revoke is pending.
    */
   async applyRegistration({ owner, deviceDid, approverDid, kind }) {
     checkDid(deviceDid); checkDid(approverDid);
+    checkOwner(owner);
+    const mapped = this.deviceIndex.get(deviceDid);
+    if (mapped && mapped !== owner) throw new RegistryError('device-registered-elsewhere');
+    const claimed = !mapped;
+    if (claimed) this.deviceIndex.set(deviceDid, owner);
+    try {
+      return await this._applyRegistration({ owner, deviceDid, approverDid, kind });
+    } catch (e) {
+      if (claimed && this.deviceIndex.get(deviceDid) === owner) this.deviceIndex.delete(deviceDid);
+      throw e;
+    }
+  }
+
+  async _applyRegistration({ owner, deviceDid, approverDid, kind }) {
     const r = this._rec(owner); const now = this.now();
     this._settle(r, now);
     if (r.devices.has(deviceDid) && !r.devices.get(deviceDid).revokedAt) return { status: 'admitted', repeated: true };
+    if (kind !== 'seed' && kind !== 'existing-device') throw new RegistryError('bad-registration-kind');
+    const lane = kind === 'seed' ? 'seed' : 'existing';
+    if (r.appTimes[lane].length >= MAX_APPLICATIONS_PER_LANE_PER_HOUR) throw new RegistryError('registration-rate');
+    r.appTimes[lane].push(now);
     if (kind === 'seed') {
       if (r.registrationDid && r.registrationDid !== approverDid) throw new RegistryError('registration-key-mismatch');
       r.registrationDid = approverDid;
-    } else if (kind === 'existing-device') {
+      // A new seed application supersedes any pending one for the same device.
+      for (const p of r.pending) if (p.deviceDid === deviceDid && !p.cancelledAt && !p.admittedAt) p.cancelledAt = now;
+      const lanePending = r.pending.filter((p) => p.kind === 'seed' && !p.cancelledAt && !p.admittedAt).length;
+      if (lanePending >= MAX_PENDING_PER_LANE) throw new RegistryError('too-many-pending');
+    } else {
       if (!this._isLive(r, approverDid)) throw new RegistryError('approver-not-registered');
-    } else throw new RegistryError('bad-registration-kind');
-    const live = this._liveDevices(r);
-    // The wait applies while a non-revoked device remains; it always ends.
-    if (live.length === 0) {
+      if (r.batchRevokes.some((b) => !b.appliedAt)) throw new RegistryError('batch-revoke-pending');
       r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now, revokedAt: 0 });
       return { status: 'admitted', repeated: false };
     }
-    // Seed ultimately wins: a seed-signed application supersedes any cancelled
-    // or pending state for this owner and is never cancellable a second time.
+    if (this._liveDevices(r).length === 0) {
+      r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now, revokedAt: 0 });
+      r.cancelsUsed = 0;
+      return { status: 'admitted', repeated: false };
+    }
     const id = r.nextId++;
     const admitAt = now + RECOVERY_WAIT_MS;
     r.pending.push({ id, deviceDid, approverDid, kind, appliedAt: now, admitAt,
@@ -114,7 +192,7 @@ export class MemoryRegistry {
     return { status: 'pending', id, admitAt };
   }
 
-  /** Cancel a pending registration. Actor must be a live registered device; once per owner. */
+  /** Cancel a pending seed registration. Actor must be a live registered device; once per epoch. */
   async cancelPending({ owner, actorDid, pendingId }) {
     checkDid(actorDid);
     const r = this._rec(owner); const now = this.now();
@@ -141,19 +219,32 @@ export class MemoryRegistry {
 
   /**
    * Batch revoke (epoch advance), signed by the bound registration key.
-   * Carries the same wait as registration (design §0.1): it becomes effective
-   * RECOVERY_WAIT_MS later, killing only that epoch's devices, never the
-   * registration key itself.
+   * Carries the same wait as registration; on effect it revokes only
+   * existing-device terminals (seed-registered devices are exempt).
    */
   async requestBatchRevoke({ owner, registrationDid }) {
     checkDid(registrationDid);
     const r = this._rec(owner); const now = this.now();
     this._settle(r, now);
     if (!r.registrationDid || r.registrationDid !== registrationDid) throw new RegistryError('registration-key-mismatch');
+    if (r.batchTimes.length >= MAX_BATCH_REVOKES_PER_DAY) throw new RegistryError('batch-revoke-rate');
+    r.batchTimes.push(now);
     const id = r.nextId++;
     const effectiveAt = now + RECOVERY_WAIT_MS;
     r.batchRevokes.push({ id, appliedAt: 0, effectiveAt, requestedAt: now });
     return { status: 'pending', id, effectiveAt };
+  }
+
+  /** Release a device from this owner (registration-key signed; seed migration). */
+  async releaseDevice({ owner, deviceDid, registrationDid }) {
+    checkDid(deviceDid); checkDid(registrationDid);
+    const r = this._rec(owner);
+    if (!r.registrationDid || r.registrationDid !== registrationDid) throw new RegistryError('registration-key-mismatch');
+    if (!r.devices.has(deviceDid)) throw new RegistryError('device-not-found');
+    r.devices.delete(deviceDid);
+    for (const p of r.pending) if (p.deviceDid === deviceDid && !p.admittedAt) p.cancelledAt = this.now();
+    if (this.deviceIndex.get(deviceDid) === owner) this.deviceIndex.delete(deviceDid);
+    return { status: 'released', did: deviceDid };
   }
 
   /** Create the pack record. Called only after bytes + readback verify. */
@@ -166,17 +257,21 @@ export class MemoryRegistry {
       if (existing.size !== size) throw new RegistryError('pack-size-mismatch');
       return { status: 'repeated' };
     }
+    if (r.packs.size >= MAX_PACKS_PER_OWNER) throw new RegistryError('pack-count-cap');
+    let total = size;
+    for (const p of r.packs.values()) total += p.size;
+    if (total > MAX_PACK_BYTES_PER_OWNER) throw new RegistryError('pack-bytes-cap');
     r.packs.set(sha256, { sha256, size, deviceDid, createdAt: this.now() });
     return { status: 'recorded' };
   }
 
-  /** The owner this device is registered for, or null (revoked devices: null). */
+  /** The owner this live device is registered for, via the index (no scan). */
   async ownerOfDevice(deviceDid) {
     checkDid(deviceDid);
-    for (const r of this.owners.values()) {
-      if (this._isLive(r, deviceDid)) return r.owner;
-    }
-    return null;
+    const owner = this.deviceIndex.get(deviceDid);
+    if (!owner) return null;
+    const r = this._get(owner);
+    return r && this._isLive(r, deviceDid) ? owner : null;
   }
 
   /** Fetch check at request time: live device + pack record for its owner. */
@@ -184,31 +279,43 @@ export class MemoryRegistry {
     checkSha(sha256);
     const owner = await this.ownerOfDevice(deviceDid);
     if (!owner) return null;
-    const r = this._rec(owner);
-    const pack = r.packs.get(sha256);
+    const r = this._get(owner);
+    const pack = r?.packs.get(sha256);
     return pack ? { owner, pack } : null;
   }
 
   /** Publish a head at the next sequence; stale sequences are rollback. */
-  async publishHead({ owner, deviceDid, seq, headSha }) {
-    checkDid(deviceDid); checkSha(headSha);
+  async publishHead({ owner, deviceDid, seq, headSha, headNameHex }) {
+    checkDid(deviceDid); checkSha(headSha); checkSha(headNameHex);
     if (!Number.isInteger(seq) || seq < 1) throw new RegistryError('bad-head-seq');
-    const r = this._rec(owner);
+    const r = this._rec(owner); const now = this.now();
+    this._settle(r, now);
     if (!this._isLive(r, deviceDid)) throw new RegistryError('device-not-registered');
+    if (r.headName && r.headName !== headNameHex) throw new RegistryError('head-name-mismatch');
+    if (r.headTimes.length >= MAX_HEAD_PUBLISHES_PER_HOUR) throw new RegistryError('head-rate');
     if (seq < r.headSeq) throw new RegistryError('head-seq-rollback');
     if (seq === r.headSeq && r.headSha) {
       if (r.headSha === headSha) return { status: 'repeated', seq };
       throw new RegistryError('head-seq-conflict');
     }
     if (seq > r.headSeq + 1) throw new RegistryError('head-seq-not-allocated');
-    r.headSeq = seq; r.headSha = headSha;
+    r.headTimes.push(now);
+    r.headSeq = seq; r.headSha = headSha; r.headName = headNameHex;
     return { status: 'published', seq };
   }
 
-  /** Readback status for one (owner, sha256) pair (deletion/retention proof surface). */
+  /** Current head for a live device (head read path). No record created. */
+  async getHead({ owner }) {
+    const r = this._get(owner);
+    if (!r || !r.headSha) return null;
+    return { seq: r.headSeq, headSha: r.headSha, headName: r.headName };
+  }
+
+  /** Readback status for one (owner, sha256) pair (internal; not HTTP-exposed). */
   async packStatus({ owner, sha256 }) {
     checkSha(sha256);
-    const r = this._rec(owner);
+    const r = this._get(owner);
+    if (!r) return { owner, epoch: 0, pack: null, devices: [] };
     this._settle(r, this.now());
     const pack = r.packs.get(sha256);
     return { owner, epoch: r.epoch, pack: pack ? { ...pack } : null,
@@ -217,14 +324,19 @@ export class MemoryRegistry {
 }
 
 /**
- * Durable Object design (design §3): one instance per owner pseudonym.
- * This class is the documented shape for a future wiring step; it is NOT
- * exported from the Worker entry and no binding exists yet, so nothing is
- * created by shipping it. The MemoryRegistry above implements the same
- * interface for tests and for the pre-binding HTTP layer.
+ * Durable Object design (design §3): one OwnerRegistryDO per owner pseudonym
+ * plus one global DeviceIndexDO (deviceDid -> owner). These classes are the
+ * documented shape for a future wiring step; they are NOT exported from the
+ * Worker entry and no binding exists yet, so nothing is created by shipping
+ * them. MemoryRegistry above implements the same interface for tests.
  */
 export class OwnerRegistryDO {
   constructor(state) { this.state = state; }
   static idFromOwner(owner) { checkOwner(owner); return owner; }
+  async fetch() { return new Response(JSON.stringify({ error: 'registry-not-wired' }), { status: 503 }); }
+}
+export class DeviceIndexDO {
+  constructor(state) { this.state = state; }
+  static id() { return 'device-index'; }
   async fetch() { return new Response(JSON.stringify({ error: 'registry-not-wired' }), { status: 503 }); }
 }

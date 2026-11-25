@@ -14,21 +14,21 @@ test('pinned HKDF vectors for the synthetic seed (0x00..0x1f)', () => {
   assert.equal(hex(d.recoveryRecipient.x25519Scalar), 'eb5619e88f54b2836288a6e4b5d182ad8dd3599a9f5e961779ea170f9a83b328');
   assert.equal(hex(d.registrationKey), '2df2d208823622de4111fa245abc7918e163836f0548f9dd93ff7fd99f630cc8');
   assert.equal(d.registration.did, 'did:key:z6MksLrd9vGHF9sfS5b3z4bZ3JVLKycE3aHrzHMfnPdQLaRX');
-  assert.equal(d.owner, '4dce4381c38e733aa1118dfbf8e66207c8b176022709aa593639fc6327a44c94');
+  // Owner = SHA-256("awai-drive/v1/owner" || registration public key), not HKDF.
+  assert.equal(d.owner, 'e9191977e81b17a27d64f49ca5605f6232067048ceae00377308f64ca713f084');
   assert.equal(d.headNameHex, 'b239f8d9aff14f9448e37838cd0e9351d37a328f1510574cf4e1f94e6f5534d8');
   assert.equal(hex(d.headSignRoot), '20fe3a291271d10bc2c1f419516175bc3f8ec698414353db1bf6f8452fc526ed');
-  // Independent cross-check: seed 0x01*32, owner-pseudonym from HKDF directly.
-  assert.equal(deriveFromSeed(Buffer.alloc(32, 1)).owner, 'e652c72c8e3b0d622e09475480d1c91eb70e32d9ed9617e3ee722a488ec929df');
+  assert.equal(deriveFromSeed(Buffer.alloc(32, 1)).owner, 'bb407bc4ac7cfa8b671f096634957f321bca229927e11e265a6ac5beed283f75');
 });
 
-test('table shape: prefix, five labels, lengths', () => {
+test('table shape: prefix, four labels, lengths', () => {
   assert.equal(DERIVATION_PREFIX, 'awai-drive/v1/');
   assert.deepEqual(DERIVATION_TABLE.map((r) => [r.label, r.bytes]), [
-    ['recovery-recipient', 96], ['device-registration', 32], ['owner-pseudonym', 32],
+    ['recovery-recipient', 96], ['device-registration', 32],
     ['head/name', 32], ['head/sign-root', 32],
   ]);
   assert.throws(() => deriveFromSeed(Buffer.alloc(16)), /32 bytes/);
-  assert.throws(() => deriveLabel(SEED, 'head', 32), /unknown derivation label/);
+  assert.throws(() => deriveLabel(SEED, 'owner-pseudonym', 32), /unknown derivation label/);
 });
 
 test('domain separation: every label gives different bytes for the same seed', () => {

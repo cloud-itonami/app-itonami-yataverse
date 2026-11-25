@@ -30,9 +30,9 @@
 //   implemented here.
 import crypto from 'node:crypto';
 import { ed25519 } from '@noble/curves/ed25519';
-import { siweMessage, blockResource, carResource, e2eeGetResource, e2eePutResource, e2eeHeadResource } from '../../src/cacao.mjs';
+import { siweMessage, blockResource, carResource, e2eeGetResource, e2eePutResource, e2eeHeadResource, e2eeHeadReadResource } from '../../src/cacao.mjs';
 
-export { blockResource, carResource, e2eeGetResource, e2eePutResource, e2eeHeadResource };
+export { blockResource, carResource, e2eeGetResource, e2eePutResource, e2eeHeadResource, e2eeHeadReadResource };
 
 export const NONCE_TTL_S = 120;
 export const MAX_LIFETIME_S = 300;
