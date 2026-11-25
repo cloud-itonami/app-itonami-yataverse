@@ -75,7 +75,8 @@ test('control 4: batch-revoke statement is single-use (replay rejected)', async 
     issuedAt: T0, expiresAt: T0 + 300_000, epoch: 0 });
   const body = { owner: OWNER, registrationDid: DERIVED.registration.did, statement: stmt.fields, signature: stmt.signature };
   assert.equal((await post('batch-revoke', body, s, r)).status, 200);
-  assert.equal((await post('batch-revoke', body, s, r)).status, 401, 'replayed batch-revoke must be 401');
+  const replay = await post('batch-revoke', body, s, r);
+  assert.ok([401, 429].includes(replay.status), 'replayed batch-revoke must be rejected');
 });
 
 test('control 5a: batch revoke kills pre-batch terminals, exempts seed applied at-or-after request, freezes adds', async () => {

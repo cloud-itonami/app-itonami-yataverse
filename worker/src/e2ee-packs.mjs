@@ -253,6 +253,8 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
         const bb = bindingError(owner, approval.approverDid);
         if (bb) return stmtFail(bb);
       }
+      try { await registry.checkRegistrationRates({ owner, kind }); await registry.checkRegisterable({ owner, deviceDid, kind }); await registry.checkClaimable({ owner, deviceDid }); }
+      catch (e) { if (e instanceof RegistryError) { const [status, code] = regError(e); return reply(status, { error: code }); } throw e; }
       bad = await consume(registry, { statement: approval.statement, signature: approval.signature });
       if (bad) return stmtFail(bad);
       bad = await consume(registry, { statement: deviceConsent.statement, signature: deviceConsent.signature });
@@ -266,6 +268,9 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
       let bad = verifyStatementCrypto(body, { op: 'cancel', actorDid, env, nowMs });
       if (bad) return stmtFail(bad);
       if (!(await live(body.owner, actorDid))) return reply(403, { error: 'actor-not-registered' });
+      const ps = await registry.pendingState({ owner: body.owner, id: Number(body.statement.args[0]) });
+      if (!ps) return reply(404, { error: 'pending-not-found' });
+      if (!ps.cancellable) return reply(409, { error: 'pending-not-cancellable' });
       bad = await consume(registry, body);
       if (bad) return stmtFail(bad);
       return reply(200, await registry.cancelPending({ owner: body.owner, actorDid, pendingId: Number(body.statement.args[0]) }));
@@ -276,6 +281,8 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
       let bad = verifyStatementCrypto(body, { op: 'revoke', actorDid, env, nowMs });
       if (bad) return stmtFail(bad);
       if (!(await live(body.owner, actorDid))) return reply(403, { error: 'actor-not-registered' });
+      if (!(await registry.isLiveDevice({ owner: body.owner, did: body.statement.args[0] })))
+        return reply(404, { error: 'device-not-found' });
       bad = await consume(registry, body);
       if (bad) return stmtFail(bad);
       return reply(200, await registry.revokeDevice({ owner: body.owner, actorDid, targetDid: body.statement.args[0] }));
@@ -287,6 +294,11 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
       if (bad) return stmtFail(bad);
       bad = bindingError(body.owner, registrationDid);
       if (bad) return stmtFail(bad);
+      // Registered check before the used-marker (no unknown-owner writes).
+      if ((await registry.registrationDidOf({ owner: body.owner })) !== registrationDid)
+        return reply(403, { error: 'registration-key-mismatch' });
+      try { await registry.checkBatchRate({ owner: body.owner }); }
+      catch (e) { if (e instanceof RegistryError) { const [status, code] = regError(e); return reply(status, { error: code }); } throw e; }
       bad = await consume(registry, body);
       if (bad) return stmtFail(bad);
       return reply(200, await registry.requestBatchRevoke({ owner: body.owner, registrationDid }));
@@ -298,6 +310,10 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
       if (bad) return stmtFail(bad);
       bad = bindingError(body.owner, registrationDid);
       if (bad) return stmtFail(bad);
+      if ((await registry.registrationDidOf({ owner: body.owner })) !== registrationDid)
+        return reply(403, { error: 'registration-key-mismatch' });
+      if (!(await registry.deviceKnown({ owner: body.owner, did: body.statement.args[0] })))
+        return reply(404, { error: 'device-not-found' });
       bad = await consume(registry, body);
       if (bad) return stmtFail(bad);
       return reply(200, await registry.releaseDevice({ owner: body.owner, deviceDid: body.statement.args[0], registrationDid }));

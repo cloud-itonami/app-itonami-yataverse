@@ -35,6 +35,15 @@ function coreSnapshot(r) {
   });
 }
 
+/** Deep clone of the registry state (for failed-op comparison after settle). */
+function cloneOf(r) {
+  const c = new MemoryRegistry({ now: r.now });
+  c.owners = new Map([...r.owners.entries()].map(([o, rec]) => [o, structuredClone(rec)]));
+  c.deviceIndex = new Map(r.deviceIndex);
+  c.usedStatements = new Map(r.usedStatements);
+  return c;
+}
+
 async function run(seed, extraReads) {
   const rand = mulberry32(seed);
   const readRand = mulberry32(seed ^ 0x9e37);
@@ -91,10 +100,10 @@ async function run(seed, extraReads) {
   for (let step = 0; step < 500; step++) {
     const op = Math.floor(rand() * 9);
     const bad = rand() < 0.15;
-    const before = coreSnapshot(r);
+    const clone = cloneOf(r);
     const beforeIndex = new Map(r.deviceIndex);
     const liveBefore = prevLive.size;
-    let ok = true; let out;
+    let ok = true; let out; let errCode = null;
     try {
       const d = pick(devices);
       if (op === 0) out = await r.applyRegistration({ owner: OWNER, deviceDid: d.did, approverDid: bad ? stranger.did : REGDID, kind: 'seed' });
@@ -106,38 +115,16 @@ async function run(seed, extraReads) {
       else if (op === 6) out = await r.recordPack({ owner: OWNER, deviceDid: d.did, sha256: shaN(packN++), size: 1 + Math.floor(rand() * 1000) });
       else if (op === 7) out = await r.checkPackCapacity({ owner: OWNER, sha256: shaN(packN++), size: 1 + Math.floor(rand() * 1000) });
       else out = await r.consumeStatement({ owner: OWNER, signature: `sig-${step}`, expiresAt: now + 1000, epoch: recEpoch(r) });
-    } catch (e) { ok = false; }
+    } catch (e) { ok = false; errCode = e.code ?? e.message; }
     if (!ok) {
-      // (4) failed ops change nothing (settle-driven index deletions and
-      // rate-window expiries aside: counts may only drop, never rise).
-      const after = JSON.parse(coreSnapshot(r));
-      const beforeJ = JSON.parse(before);
-      after.counts.forEach((c, i) => {
-        c.forEach((n, j) => assert.ok(n <= beforeJ.counts[i][j], `step ${step} op ${op}: failed op raised a count`));
-        after.counts[i] = beforeJ.counts[i];
-      });
-      // Device records may only grow (settle admissions); never shrink.
-      const newDevices = new Set();
-      after.deviceKeys.forEach((keys, i) => {
-        const beforeIds = new Set(beforeJ.deviceKeys[i].map((s) => s.split('|')[0]));
-        for (const k of keys) {
-          const id = k.split('|')[0];
-          if (!beforeIds.has(id)) newDevices.add(id);
-          else if (!beforeJ.deviceKeys[i].includes(k)) newDevices.add(id); // generation bump = admission
-        }
-        for (const b of beforeJ.deviceKeys[i]) {
-          const id = b.split('|')[0];
-          assert.ok(keys.some((k) => k.startsWith(id)), `step ${step} op ${op}: failed op dropped a device record`);
-        }
-        after.deviceKeys[i] = beforeJ.deviceKeys[i];
-      });
-      // Used entries may only drop (expiry sweep), never grow, on failure.
-      for (const u of after.used) assert.ok(beforeJ.used.includes(u), `step ${step} op ${op}: failed op marked a statement used`);
-      after.used = beforeJ.used;
-      assert.equal(JSON.stringify(after), before, `step ${step} op ${op}: failed op mutated core state`);
-      // Index additions are allowed only for settle admissions (new device records).
+      // (4) failed ops change nothing: compare against the pre-clone settled
+      // at the same clock time (no loosening). Settle both sides first:
+      // the failed op itself may have thrown before settling.
+      await r.epochOf({ owner: OWNER });
+      await clone.epochOf({ owner: OWNER });
+      assert.equal(coreSnapshot(r), coreSnapshot(clone), `step ${step} op ${op}: failed op mutated core state`);
       for (const [did, o] of r.deviceIndex) {
-        assert.ok(beforeIndex.get(did) === o || newDevices.has(did),
+        assert.ok(beforeIndex.get(did) === o || clone.deviceIndex.get(did) === o,
           `step ${step} op ${op}: failed op added index entry ${did}`);
       }
     } else {

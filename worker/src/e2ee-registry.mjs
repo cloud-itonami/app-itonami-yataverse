@@ -164,6 +164,9 @@ export class MemoryRegistry {
       } else {
         const p = e.ref;
         p.admittedAt = e.t;
+        // If the index belongs to another owner, this application is dead.
+        const mapped = this.deviceIndex.get(p.deviceDid);
+        if (mapped && mapped !== r.owner) { this._cancelApplication(r, p, e.t); continue; }
         const old = r.devices.get(p.deviceDid);
         // Never overwrite a live record: entry via another path already ended this one.
         if (old && !old.revokedAt && !old.released) continue;
@@ -196,7 +199,71 @@ export class MemoryRegistry {
   async epochOf({ owner }) {
     const r = this._get(owner);
     if (r) this._settle(r, this.now());
+    const now = this.now();
+    for (const [h, exp] of this.usedStatements) if (exp <= now) this.usedStatements.delete(h);
     return r?.epoch ?? 0;
+  }
+
+  /** Bound registration key for one owner (no record created). */
+  async registrationDidOf({ owner }) {
+    const r = this._get(owner);
+    if (r) this._settle(r, this.now());
+    return r?.registrationDid ?? null;
+  }
+
+  /** Non-mutating cap pre-checks, so HTTP can reject before any used-marker. */
+  async checkBatchRate({ owner }) {
+    const r = this._get(owner);
+    if (!r) return { status: 'ok' };
+    this._settle(r, this.now());
+    if (r.batchTimes.length >= MAX_BATCH_REVOKES_PER_DAY) throw new RegistryError('batch-revoke-rate');
+    return { status: 'ok' };
+  }
+  /** Live-device and pending-state reads for pre-consume HTTP checks. */
+  async isLiveDevice({ owner, did }) {
+    const r = this._get(owner);
+    return r ? Boolean(this._isLive(r, did)) : false;
+  }
+  async pendingState({ owner, id }) {
+    const r = this._get(owner);
+    if (!r) return null;
+    this._settle(r, this.now());
+    const p = [...r.pending, ...r.pendingReleases, ...r.pendingRevokes].find((x) => x.id === id);
+    if (!p || p.cancelledAt || p.admittedAt || p.doneAt) return null;
+    return { cancellable: Boolean(p.cancellable) && r.cancelsUsed < 1 };
+  }
+  async deviceKnown({ owner, did }) {
+    const r = this._get(owner);
+    return Boolean(r?.devices.has(did));
+  }
+  async checkRegistrationRates({ owner, kind }) {
+    const r = this._get(owner);
+    if (!r) return { status: 'ok' };
+    this._settle(r, this.now());
+    const lane = kind === 'seed' ? 'seed' : 'existing';
+    if (r.appTimes[lane].length >= MAX_APPLICATIONS_PER_LANE_PER_HOUR) throw new RegistryError('registration-rate');
+    if (kind === 'seed') {
+      const lanePending = r.pending.filter((p) => p.kind === 'seed' && !p.cancelledAt && !p.admittedAt).length;
+      if (lanePending >= MAX_PENDING_PER_LANE) throw new RegistryError('too-many-pending');
+    } else if (r.batchRevokes.some((b) => !b.appliedAt)) {
+      throw new RegistryError('batch-revoke-pending');
+    }
+    return { status: 'ok' };
+  }
+  /** A revoked/released device may only come back via seed (pre-consume check). */
+  async checkRegisterable({ owner, deviceDid, kind }) {
+    const r = this._get(owner);
+    if (!r) return { status: 'ok' };
+    this._settle(r, this.now());
+    const existing = r.devices.get(deviceDid);
+    if (existing && (existing.revokedAt || existing.released) && kind !== 'seed') throw new RegistryError('device-revoked-seed-only');
+    return { status: 'ok' };
+  }
+  /** Index claim pre-check: a device mapped to another owner is rejected. */
+  async checkClaimable({ owner, deviceDid }) {
+    const mapped = this.deviceIndex.get(deviceDid);
+    if (mapped && mapped !== owner) throw new RegistryError('device-registered-elsewhere');
+    return { status: 'ok' };
   }
 
   /**
@@ -269,7 +336,9 @@ export class MemoryRegistry {
       checkOwnerBinding(owner, approverDid);
       if (r.registrationDid && r.registrationDid !== approverDid) throw new RegistryError('registration-key-mismatch');
       // A new seed application supersedes any pending one for the same device.
-      for (const p of r.pending) if (p.deviceDid === deviceDid && !p.cancelledAt && !p.admittedAt) this._cancelApplication(r, p, now);
+      // The replacement keeps the index reservation: cancel the old entries
+      // without freeing it.
+      for (const p of r.pending) if (p.deviceDid === deviceDid && !p.cancelledAt && !p.admittedAt) p.cancelledAt = now;
       const lanePending = r.pending.filter((p) => p.kind === 'seed' && !p.cancelledAt && !p.admittedAt).length;
       if (lanePending >= MAX_PENDING_PER_LANE) throw new RegistryError('too-many-pending');
     }
