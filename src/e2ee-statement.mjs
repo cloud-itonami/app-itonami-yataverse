@@ -3,18 +3,20 @@
 // One length-prefixed encoding for every mutating op (register, cancel,
 // revoke, batch-revoke, release), so a signature for one op/service can never
 // be reused as another: the encoding binds domain, audience, version, op,
-// owner, actor, all op arguments, the validity window and the registry epoch.
+// owner, actor, all op arguments, the validity window, the registry epoch
+// and the registry incarnation (allowlist-carried generation; nothing is in
+// use yet, so the domain change needs no migration).
 // The server rebuilds the statement from the submitted fields (never parses
 // it), so separator ambiguity with DIDs or arguments cannot arise.
 import crypto from 'node:crypto';
 
-export const STATEMENT_VERSION = 'yataverse:e2ee:v2';
+export const STATEMENT_VERSION = 'yataverse:e2ee:v3';
 export const STATEMENT_WINDOW_MS = 300_000;
 
-/** Length-prefixed canonical form: version, domain, aud, op, owner, actor, args count, args, issued, expires, epoch. */
-export function canonicalStatement({ domain, aud, op, owner, actorDid, args = [], issuedAt, expiresAt, epoch }) {
+/** Length-prefixed canonical form: version, domain, aud, op, owner, actor, args count, args, issued, expires, epoch, incarnation. */
+export function canonicalStatement({ domain, aud, op, owner, actorDid, args = [], issuedAt, expiresAt, epoch, incarnation = 0 }) {
   const fields = [STATEMENT_VERSION, String(domain), String(aud), String(op), String(owner), String(actorDid),
-    String(args.length), ...args.map(String), String(issuedAt), String(expiresAt), String(epoch)];
+    String(args.length), ...args.map(String), String(issuedAt), String(expiresAt), String(epoch), String(incarnation)];
   return fields.map((f) => { const b = Buffer.from(f, 'utf8'); return `${b.length}:${b.toString('utf8')}`; }).join('');
 }
 

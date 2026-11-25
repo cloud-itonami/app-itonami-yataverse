@@ -72,22 +72,41 @@ const regError = (e) => {
       'owner-binding-mismatch': 401, 'device-revoked-seed-only': 409,
       'too-many-pending': 429, 'registration-rate': 429, 'batch-revoke-rate': 429,
       'head-rate': 429, 'pack-count-cap': 429, 'pack-bytes-cap': 429,
+      'intent-open': 409, 'held-gens-full': 429, 'stale-claim': 409,
     };
     return [map[e.code] ?? 400, e.code];
   }
   throw e;
 };
 
+/** Allowlist with incarnation: entries are `ownerHex` or `ownerHex:generation`
+ *  (bare hex = generation 0). The generation is the registry incarnation
+ *  carried OUTSIDE the owner record (settings); it is part of the statement
+ *  signature domain. Empty (the default) denies every owner. */
+export function allowlistEntries(env) {
+  const list = String(env.E2EE_OWNER_ALLOWLIST ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  const out = new Map();
+  for (const e of list) {
+    const i = e.lastIndexOf(':');
+    if (i > 0 && /^\d+$/.test(e.slice(i + 1))) out.set(e.slice(0, i), Number(e.slice(i + 1)));
+    else out.set(e, 0);
+  }
+  return out;
+}
 /** Per-person owner allowlist; empty (the default) denies every owner. */
 export function ownerAllowlisted(env, owner) {
-  const list = String(env.E2EE_OWNER_ALLOWLIST ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-  return list.includes(owner);
+  return allowlistEntries(env).has(owner);
+}
+/** Registry incarnation (generation) for an allowlisted owner, or null. */
+export function ownerIncarnation(env, owner) {
+  return allowlistEntries(env).get(owner) ?? null;
 }
 
 function statementShape(stmt) {
   return stmt && typeof stmt === 'object' && typeof stmt.op === 'string' && typeof stmt.owner === 'string'
     && typeof stmt.actorDid === 'string' && Array.isArray(stmt.args)
-    && Number.isFinite(stmt.issuedAt) && Number.isFinite(stmt.expiresAt) && Number.isInteger(stmt.epoch);
+    && Number.isFinite(stmt.issuedAt) && Number.isFinite(stmt.expiresAt) && Number.isInteger(stmt.epoch)
+    && (stmt.incarnation === undefined || Number.isInteger(stmt.incarnation));
 }
 
 const ARGS_COUNT = { register: 3, cancel: 1, revoke: 1, 'batch-revoke': 0, release: 1 };
@@ -100,6 +119,9 @@ function verifyStatementCrypto(body, { op, actorDid, env, nowMs }) {
   const stmt = body?.statement;
   if (!statementShape(stmt) || stmt.op !== op || stmt.actorDid !== actorDid || stmt.owner !== body?.owner)
     return 'bad-statement';
+  const incarnation = ownerIncarnation(env, stmt.owner);
+  if (incarnation === null) return 'owner-not-allowlisted';
+  if ((stmt.incarnation ?? 0) !== incarnation) return 'statement-stale-incarnation';
   if (stmt.issuedAt > nowMs + 30_000) return 'statement-not-yet-valid';
   if (stmt.expiresAt <= stmt.issuedAt || stmt.expiresAt - stmt.issuedAt > STATEMENT_WINDOW_MS)
     return 'statement-expired';
@@ -111,7 +133,7 @@ function verifyStatementCrypto(body, { op, actorDid, env, nowMs }) {
   if (sig.length !== 64 || sig.toString('base64url') !== body.signature) return 'bad-statement-signature';
   const canonical = canonicalStatement({ domain: String(env.CACAO_DOMAIN ?? ''), aud: String(env.CACAO_AUD ?? ''),
     op: stmt.op, owner: stmt.owner, actorDid: stmt.actorDid, args: stmt.args,
-    issuedAt: stmt.issuedAt, expiresAt: stmt.expiresAt, epoch: stmt.epoch });
+    issuedAt: stmt.issuedAt, expiresAt: stmt.expiresAt, epoch: stmt.epoch, incarnation });
   let ok = false;
   try { ok = ed25519.verify(sig, Buffer.from(canonical, 'utf8'), pub); } catch { ok = false; }
   return ok ? null : 'bad-statement-signature';
@@ -326,13 +348,17 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
   }
 }
 
-/** GET status: epoch only; unknown owners get the same shape with epoch 0. */
+/** GET status: epoch + incarnation (allowlist-carried). The allowlist is
+ *  consulted before any instance: a non-allowlisted owner gets the same
+ *  shape as an unknown owner and touches no registry (default deny). */
 export async function handleE2eeStatus(request, owner, env, deps) {
   const reply = (status, body) => new Response(JSON.stringify(body),
     { status, headers: { 'content-type': 'application/json', 'cache-control': 'private, no-store' } });
   if (!deps.registry) return reply(503, { error: 'e2ee-registry-not-configured' });
   if (request.method !== 'GET') return reply(405, { error: 'method-not-allowed' });
-  try { return reply(200, { epoch: await deps.registry.epochOf({ owner }) }); }
+  if (!ownerAllowlisted(env, owner)) return reply(200, { epoch: 0, incarnation: 0 });
+  const incarnation = ownerIncarnation(env, owner) ?? 0;
+  try { return reply(200, { epoch: await deps.registry.epochOf({ owner }), incarnation }); }
   catch (e) { if (e instanceof RegistryError) return reply(400, { error: e.code }); throw e; }
 }
 
