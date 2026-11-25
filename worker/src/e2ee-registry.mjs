@@ -82,7 +82,7 @@ export class MemoryRegistry {
     this.now = now;
     this.owners = new Map();
     this.deviceIndex = new Map(); // deviceDid -> owner (global DeviceIndexDO shape)
-    this.usedStatements = new Map(); // sha256(signature) -> expiresAt (global; no owner record needed)
+    this.usedStatements = new Map(); // raw signature -> expiresAt (global; no owner record needed)
   }
 
   _rec(owner) {
@@ -104,6 +104,24 @@ export class MemoryRegistry {
 
   _liveDevices(r) { return [...r.devices.values()].filter((d) => !d.revokedAt && !d.released); }
 
+  /** Unified cancel + provisional-index release for one pending application. */
+  _cancelApplication(r, p, now) {
+    p.cancelledAt = now;
+    if (p.deviceDid && this.deviceIndex.get(p.deviceDid) === r.owner) {
+      const d = r.devices.get(p.deviceDid);
+      const live = d && !d.revokedAt && !d.released;
+      const other = [...r.pending, ...r.pendingReleases, ...r.pendingRevokes]
+        .some((q) => q !== p && (q.deviceDid === p.deviceDid || q.targetDid === p.deviceDid)
+          && !q.cancelledAt && !q.admittedAt && !q.doneAt);
+      if (!live && !other) this.deviceIndex.delete(p.deviceDid);
+    }
+  }
+
+  /** End every not-yet-effective application for one device (entry via another path). */
+  _endApplicationsFor(r, did, now) {
+    for (const p of r.pending) if (p.deviceDid === did && !p.admittedAt && !p.cancelledAt) this._cancelApplication(r, p, now);
+  }
+
   /** Settle in effective-time order, one event at a time, so the outcome
    *  never depends on when reads happen. Same-time order: batch revokes and
    *  zero-terminal ops before admissions (revocation wins ties). Exclusion
@@ -119,37 +137,42 @@ export class MemoryRegistry {
     for (const e of events) {
       if (e.kind === 'batch') {
         const b = e.ref;
-        b.appliedAt = now;
+        b.appliedAt = e.t;
         r.epoch += 1;
         r.cancelsUsed = 0;
         for (const d of r.devices.values()) {
           const appliedAt = d.appliedAt ?? d.approvedAt;
-          if (!d.revokedAt && !d.released && !(d.kind === 'seed' && appliedAt >= b.requestedAt)) d.revokedAt = now;
+          if (!d.revokedAt && !d.released && !(d.kind === 'seed' && appliedAt >= b.requestedAt)) {
+            d.revokedAt = e.t;
+            if (this.deviceIndex.get(d.did) === r.owner) this.deviceIndex.delete(d.did);
+          }
         }
-        for (const p of r.pending) if (!p.admittedAt && !p.cancelledAt && p.appliedAt < b.requestedAt) p.cancelledAt = now;
+        for (const p of r.pending) if (!p.admittedAt && !p.cancelledAt && p.appliedAt < b.requestedAt) this._cancelApplication(r, p, e.t);
       } else if (e.kind === 'release') {
         const p = e.ref;
-        p.doneAt = now;
+        p.doneAt = e.t;
         const d = r.devices.get(p.deviceDid);
-        if (d) { d.released = true; d.releasedAt = now; }
-        for (const q of r.pending) if (q.deviceDid === p.deviceDid && !q.admittedAt) q.cancelledAt = now;
+        if (d) { d.released = true; d.releasedAt = e.t; }
+        for (const q of [...r.pending]) if (q.deviceDid === p.deviceDid && !q.admittedAt) this._cancelApplication(r, q, e.t);
         if (this.deviceIndex.get(p.deviceDid) === r.owner) this.deviceIndex.delete(p.deviceDid);
       } else if (e.kind === 'revoke') {
         const p = e.ref;
-        p.doneAt = now;
+        p.doneAt = e.t;
         const d = r.devices.get(p.targetDid);
-        if (d && !d.revokedAt) d.revokedAt = now;
+        if (d && !d.revokedAt) d.revokedAt = e.t;
         if (this.deviceIndex.get(p.targetDid) === r.owner) this.deviceIndex.delete(p.targetDid);
       } else {
         const p = e.ref;
-        p.admittedAt = now;
+        p.admittedAt = e.t;
         const old = r.devices.get(p.deviceDid);
+        // Never overwrite a live record: entry via another path already ended this one.
+        if (old && !old.revokedAt && !old.released) continue;
         // An application issued before a revocation/release must not revive.
         const killAt = Math.max(old?.revokedAt ?? 0, old?.releasedAt ?? 0);
-        if (old && killAt && p.appliedAt < killAt) { p.cancelledAt = now; continue; }
+        if (old && killAt && p.appliedAt < killAt) { this._cancelApplication(r, p, e.t); continue; }
         // A revoked/released device coming back via seed gets a new generation.
         r.devices.set(p.deviceDid, { did: p.deviceDid, approvedBy: p.approverDid, kind: p.kind,
-          approvedAt: now, appliedAt: p.appliedAt, revokedAt: 0, released: false, releasedAt: 0,
+          approvedAt: e.t, appliedAt: p.appliedAt, revokedAt: 0, released: false, releasedAt: 0,
           generation: (old?.generation ?? 0) + 1 });
         if (p.kind === 'seed') r.cancelsUsed = 0;
       }
@@ -158,7 +181,7 @@ export class MemoryRegistry {
     r.appTimes.existing = within(r.appTimes.existing, now, HOUR);
     r.batchTimes = within(r.batchTimes, now, DAY);
     r.headTimes = within(r.headTimes, now, HOUR);
-    for (const [h, exp] of r.reservations) if (exp <= now) r.reservations.delete(h);
+    for (const [h, rv] of r.reservations) if (rv.expiresAt <= now) r.reservations.delete(h);
   }
 
   _isLive(r, did) {
@@ -209,6 +232,8 @@ export class MemoryRegistry {
     // Binding before any record, claim or count (unbound attempts are free).
     if (kind === 'seed') checkOwnerBinding(owner, approverDid);
     if (kind !== 'seed' && kind !== 'existing-device') throw new RegistryError('bad-registration-kind');
+    // An existing-device application for an unknown owner fails before any record.
+    if (kind === 'existing-device' && !this._get(owner)) throw new RegistryError('approver-not-registered');
     const mapped = this.deviceIndex.get(deviceDid);
     if (mapped && mapped !== owner) throw new RegistryError('device-registered-elsewhere');
     const claimed = !mapped;
@@ -243,6 +268,8 @@ export class MemoryRegistry {
       if (r.batchRevokes.some((b) => !b.appliedAt)) throw new RegistryError('batch-revoke-pending');
       r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now,
         appliedAt: now, revokedAt: 0, released: false, releasedAt: 0, generation: (existing?.generation ?? 0) + 1 });
+      // Entry via this path ends any other application for the device.
+      this._endApplicationsFor(r, deviceDid, now);
       return { status: 'admitted', repeated: false };
     }
     if (this._liveDevices(r).length === 0) {
@@ -272,9 +299,8 @@ export class MemoryRegistry {
     const p = [...r.pending, ...r.pendingReleases, ...r.pendingRevokes].find((x) => x.id === pendingId);
     if (!p || p.cancelledAt || p.admittedAt || p.doneAt) throw new RegistryError('pending-not-found');
     if (!p.cancellable || r.cancelsUsed >= 1) throw new RegistryError('pending-not-cancellable');
-    p.cancelledAt = now; p.cancelledBy = actorDid; r.cancelsUsed += 1;
-    // A cancelled registration's provisional index entry is freed.
-    if (p.deviceDid && this.deviceIndex.get(p.deviceDid) === owner) this.deviceIndex.delete(p.deviceDid);
+    this._cancelApplication(r, p, now);
+    r.cancelsUsed += 1;
     return { status: 'cancelled', id: p.id };
   }
 
@@ -288,9 +314,9 @@ export class MemoryRegistry {
     this._settle(r, now);
     if (!this._isLive(r, actorDid)) throw new RegistryError('actor-not-registered');
     const t = r.devices.get(targetDid);
-    if (!t || t.revokedAt) throw new RegistryError('device-not-found');
-    // Applications for this device issued before the revocation die with it.
-    for (const p of r.pending) if (p.deviceDid === targetDid && !p.admittedAt) p.cancelledAt = now;
+    if (!t || t.revokedAt || t.released) throw new RegistryError('device-not-found');
+    // Delete-on-revoke only for a live target; others keep their applications.
+    for (const p of r.pending) if (p.deviceDid === targetDid && !p.admittedAt) this._cancelApplication(r, p, now);
     if (this._liveDevices(r).length === 1) {
       const id = r.nextId++;
       const effectiveAt = now + RECOVERY_WAIT_MS;
@@ -335,7 +361,7 @@ export class MemoryRegistry {
     this._settle(r, now);
     if (!r.registrationDid || r.registrationDid !== registrationDid) throw new RegistryError('registration-key-mismatch');
     if (!r.devices.has(deviceDid)) throw new RegistryError('device-not-found');
-    for (const p of r.pending) if (p.deviceDid === deviceDid && !p.admittedAt) p.cancelledAt = now;
+    for (const p of [...r.pending]) if (p.deviceDid === deviceDid && !p.admittedAt) this._cancelApplication(r, p, now);
     if (this._liveDevices(r).length === 1 && !r.devices.get(deviceDid).revokedAt) {
       const id = r.nextId++;
       const effectiveAt = now + RECOVERY_WAIT_MS;
@@ -380,14 +406,18 @@ export class MemoryRegistry {
   /** Create the pack record. Called only after bytes + readback verify. */
   async recordPack({ owner, deviceDid, sha256, size }) {
     checkDid(deviceDid); checkSha(sha256);
-    const r = this._rec(owner);
-    if (!this._isLive(r, deviceDid)) throw new RegistryError('device-not-registered');
+    const existingRec = this._get(owner);
+    if (!existingRec || !this._isLive(existingRec, deviceDid)) throw new RegistryError('device-not-registered');
+    const r = existingRec;
     const existing = r.packs.get(sha256);
     if (existing) {
       if (existing.size !== size) throw new RegistryError('pack-size-mismatch');
       return { status: 'repeated' };
     }
-    if (r.packs.size >= MAX_PACKS_PER_OWNER && !r.reservations.has(sha256)) throw new RegistryError('pack-count-cap');
+    // Recount with reservations when this pack has none (or only expired ones).
+    const own = r.reservations.get(sha256);
+    const reserved = own && own.expiresAt > this.now() ? own : null;
+    if (r.packs.size + r.reservations.size - (reserved ? 1 : 0) >= MAX_PACKS_PER_OWNER) throw new RegistryError('pack-count-cap');
     let total = size;
     for (const p of r.packs.values()) total += p.size;
     for (const [h, rv] of r.reservations) if (h !== sha256) total += rv.size;
