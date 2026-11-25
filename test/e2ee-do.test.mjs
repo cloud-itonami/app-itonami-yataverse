@@ -472,6 +472,121 @@ test('fixed: a finish without the owner-recorded claim is rejected (repro: claim
   assert.equal(w.transport.lookup(tid)?.owner, A.owner, 'the claimed finish has its index entry');
 });
 
+// ---- Promise-returning claim transport: a real DO claim is an RPC ----
+// Each claim is held open; the test settles it after observing the owner's
+// state mid-await. `deliver` runs the real device index claim, `replay`
+// answers with a foreign reply, `fail` rejects the RPC.
+function promiseTransport(inner = new FakeTransport()) {
+  const calls = [];
+  return {
+    calls, inner,
+    lookup: (tid) => inner.lookup(tid),
+    indexFor: (tid) => inner.indexFor(tid),
+    enqueueRelease: (ownerDo, row) => inner.enqueueRelease(ownerDo, row),
+    deliverAll: () => inner.deliverAll(),
+    claim(tid, owner, gen, seq, inc) {
+      let settle;
+      const reply = new Promise((resolve, reject) => {
+        settle = {
+          deliver: () => { try { resolve(inner.claim(tid, owner, gen, seq, inc)); } catch (e) { reject(e); } },
+          replay: (res) => resolve(res),
+          fail: (e) => reject(e),
+        };
+      });
+      calls.push({ tid, owner, gen, seq, inc, settle });
+      return reply;
+    },
+  };
+}
+const prodOwner = (transport, nowFn) =>
+  new OwnerRegistryDO(new MapStorage(), { owner: A.owner, now: nowFn, transport }); // no testPhases
+
+test('async register: a Promise claim is awaited, then admitted with index and held generation', async () => {
+  const now = 1_700_000_000_000;
+  const transport = promiseTransport();
+  const o = prodOwner(transport, () => now);
+  const tid = T[0].did;
+  const pending = o.register({ owner: A.owner, deviceDid: tid, approverDid: A.registration.did, kind: 'seed' });
+  assert.equal(transport.calls.length, 1, 'the claim is in flight');
+  assert.equal(o.isLiveDevice({ owner: A.owner, did: tid }), false, 'nothing is applied before the reply');
+  transport.calls[0].settle.deliver();
+  const out = await pending;
+  assert.equal(out.status, 'admitted');
+  assert.equal(o.isLiveDevice({ owner: A.owner, did: tid }), true);
+  assert.deepEqual(o._heldGens(A.owner, tid),
+    [{ gen: transport.calls[0].gen, seq: transport.calls[0].seq, inc: transport.calls[0].inc }]);
+  assert.equal(transport.lookup(tid)?.gen, transport.calls[0].gen, 'the live terminal owns its index entry');
+  assert.equal(o.storage.keys('intent/').length, 0, 'the intent is applied and deleted');
+});
+
+test('async register: a rejected claim clears the intent and propagates (nothing live or indexed)', async () => {
+  const now = 1_700_000_000_000;
+  const transport = promiseTransport();
+  const o = prodOwner(transport, () => now);
+  const tid = T[1].did;
+  const pending = o.register({ owner: A.owner, deviceDid: tid, approverDid: A.registration.did, kind: 'seed' });
+  const boom = new Error('device-do-unavailable');
+  transport.calls[0].settle.fail(boom);
+  await assert.rejects(pending, (e) => e === boom);
+  assert.equal(o.storage.keys('intent/').length, 0, 'the intent is cleared');
+  assert.equal(o.isLiveDevice({ owner: A.owner, did: tid }), false);
+  assert.equal(transport.lookup(tid), null);
+});
+
+test('async register: expiry during the await is caught by finish (intent-gone)', async () => {
+  let now = 1_700_000_000_000;
+  const transport = promiseTransport();
+  const o = prodOwner(transport, () => now);
+  const tid = T[2].did;
+  const pending = o.register({ owner: A.owner, deviceDid: tid, approverDid: A.registration.did, kind: 'seed' });
+  const expiresAt = o.storage.get(`intent/${tid}`).expiresAt;
+  now = expiresAt + 1; // the owner's clock moves while the device reply is in flight
+  transport.calls[0].settle.deliver();
+  await assert.rejects(pending, (e) => e.code === 'intent-gone');
+  assert.equal(o.storage.get(`intent/${tid}`).claimed, true,
+    'the claim was recorded after the await; finish refused on expiry, not on a missing record');
+  assert.equal(o.isLiveDevice({ owner: A.owner, did: tid }), false);
+});
+
+test('async register: a replacement during the await wins, the older finish is intent-gone', async () => {
+  let now = 1_700_000_000_000;
+  const transport = promiseTransport();
+  const o = prodOwner(transport, () => now);
+  const tid = T[0].did;
+  const first = o.register({ owner: A.owner, deviceDid: tid, approverDid: A.registration.did, kind: 'seed' });
+  const firstCall = transport.calls[0];
+  now = o.storage.get(`intent/${tid}`).expiresAt + 1;
+  // A second registration for the same terminal replaces the expired intent.
+  const second = o.register({ owner: A.owner, deviceDid: tid, approverDid: A.registration.did, kind: 'seed' });
+  assert.equal(transport.calls.length, 2);
+  const secondCall = transport.calls[1];
+  assert.equal(secondCall.seq, firstCall.seq + 1);
+  firstCall.settle.deliver(); // the older reply lands on the replaced intent
+  await assert.rejects(first, (e) => e.code === 'intent-gone');
+  secondCall.settle.deliver();
+  const out = await second;
+  assert.equal(out.status, 'admitted');
+  assert.equal(o.isLiveDevice({ owner: A.owner, did: tid }), true);
+  assert.equal(transport.lookup(tid)?.gen, secondCall.gen, 'index and live agree on the newer generation');
+  assert.deepEqual(o._heldGens(A.owner, tid),
+    [{ gen: secondCall.gen, seq: secondCall.seq, inc: secondCall.inc }]);
+});
+
+test("async register: another generation's replied claim is not recorded (intent-unclaimed)", async () => {
+  const now = 1_700_000_000_000;
+  const transport = promiseTransport();
+  const o = prodOwner(transport, () => now);
+  const tid = T[1].did;
+  const pending = o.register({ owner: A.owner, deviceDid: tid, approverDid: A.registration.did, kind: 'seed' });
+  const own = transport.calls[0];
+  // A replayed letter from an older application: claimed shape, foreign generation.
+  own.settle.replay({ status: 'claimed', generation: 'e'.repeat(32), seq: own.seq, inc: own.inc });
+  await assert.rejects(pending, (e) => e.code === 'intent-unclaimed');
+  assert.equal(o.storage.get(`intent/${tid}`).claimed, undefined, 'the foreign reply was not recorded');
+  assert.equal(o.isLiveDevice({ owner: A.owner, did: tid }), false);
+  assert.equal(transport.lookup(tid), null);
+});
+
 test('device index: (incarnation, seq) pair order, per owner, never reset', () => {
   const idx = new DeviceIndexDO(new MapStorage(), {});
   idx.did = 't';

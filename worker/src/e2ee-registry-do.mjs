@@ -4,10 +4,11 @@
 //   closed pairs kept forever; only release advances closed; claims accept
 //   lexicographic (incarnation, seq) order > closed and >= held pair.
 // - OwnerRegistryDO: one instance per owner; registration exposed as one
-//   async entry, register = begin (intent) / claim (external await) /
-//   finish (apply), with the device DO's claim response recorded on the
-//   intent in a separate sync transaction; finish rejects an intent without
-//   that record (a crashed or absent claim can never be applied). heldGens
+//   async entry, register = begin (intent) / claim (external await; the
+//   reply may be a Promise) / finish (apply), with the device DO's claim
+//   response recorded on the intent in a separate sync transaction only
+//   after the claim settles; finish rejects an intent without that record
+//   (a crashed or absent claim can never be applied). heldGens
 //   (cap 32, 429 when full) and an ack-based outbox: an alarm retries a
 //   release with ×2 backoff capped at 5 min until the device DO acks; only
 //   the ack deletes the row (tests fake delay/duplicate/reorder/drop/lost
@@ -446,9 +447,16 @@ export class OwnerRegistryDO {
   _claimRegistration({ owner, deviceDid, generation, seq, incarnation, transport = this.transport }) {
     const tp = transport ?? this.transport;
     if (!tp?.lookup) throw new Error('no-index-transport');
+    const record = (res) => {
+      this._recordClaim(deviceDid, { generation, seq, incarnation }, res);
+      return res;
+    };
     const res = tp.claim(deviceDid, owner, generation, seq, incarnation);
-    this._recordClaim(deviceDid, { generation, seq, incarnation }, res);
-    return res;
+    // A real DO claim is an external RPC: its reply may be a Promise. Record
+    // only after it settles; a pending Promise must never be read as "not
+    // claimed" (that made every `register` finish `intent-unclaimed`).
+    if (res && typeof res.then === 'function') return res.then(record);
+    return record(res);
   }
   finishRegistration(a) {
     this._requireTestPhases();
@@ -476,12 +484,12 @@ export class OwnerRegistryDO {
       return res;
     });
   }
-  /** The one production entry: begin -> claim (recorded) -> finish. */
+  /** The one production entry: begin -> claim (awaited, recorded) -> finish. */
   async register({ owner, deviceDid, approverDid, kind, incarnation = this.incarnation, transport = this.transport }) {
     const b = this._beginRegistration({ owner, deviceDid, approverDid, kind, incarnation });
     if (b.status !== 'intent') return b;
     try {
-      this._claimRegistration({ owner, deviceDid, generation: b.generation, seq: b.seq,
+      await this._claimRegistration({ owner, deviceDid, generation: b.generation, seq: b.seq,
         incarnation: b.incarnation, transport });
     } catch (e) {
       this.clearIntent({ owner, deviceDid });
@@ -491,19 +499,28 @@ export class OwnerRegistryDO {
       generation: b.generation, seq: b.seq, incarnation: b.incarnation });
   }
   /**
-   * Sync convenience (directory callers and older tests): begin -> claim
-   * (recorded) -> finish in one call. The async `register` is the shape the
-   * Worker uses; this exists because the rest of the class is synchronous.
+   * TEST-ONLY sync convenience (directory callers and older tests):
+   * begin -> claim (recorded) -> finish in one call. Requires `testPhases`;
+   * the production entry is the async `register` alone. A transport whose
+   * claim returns a Promise cannot be used here (the reply would land after
+   * finish): the call clears its intent and refuses, use `register`.
    */
   applyRegistration({ owner, deviceDid, approverDid, kind, incarnation = this.incarnation, transport = this.transport }) {
+    this._requireTestPhases();
     const b = this._beginRegistration({ owner, deviceDid, approverDid, kind, incarnation });
     if (b.status !== 'intent') return b;
+    let claimed;
     try {
-      this._claimRegistration({ owner, deviceDid, generation: b.generation, seq: b.seq,
+      claimed = this._claimRegistration({ owner, deviceDid, generation: b.generation, seq: b.seq,
         incarnation: b.incarnation, transport });
     } catch (e) {
       this.clearIntent({ owner, deviceDid });
       throw e;
+    }
+    if (claimed && typeof claimed.then === 'function') {
+      claimed.catch(() => {}); // the late reply has no intent to record into
+      this.clearIntent({ owner, deviceDid });
+      throw new Error('async-claim-requires-register');
     }
     return this._finishRegistration({ owner, deviceDid, approverDid, kind,
       generation: b.generation, seq: b.seq, incarnation: b.incarnation });
