@@ -165,7 +165,7 @@ export class OwnerRegistryDO {
     return this.storage.transact(() => {
       this._load();
       const r = fn();
-      this._outboxDead(this.owner);
+      this._sweepHeldGens(this.owner);
       this._drainOutbox();
       this._save();
       return r;
@@ -179,6 +179,10 @@ export class OwnerRegistryDO {
       checkOwner(owner); const r = this.core.rec(owner); this.core.settle(r, this.now());
       const open = this._intent(deviceDid);
       if (open && open.expiresAt > this.now()) err('intent-open');
+      // An expired intent that a new intent replaces must be closed first,
+      // or its claim (if it was made) is never released: the alarm sweep
+      // only sees intents that still exist.
+      if (open) this._closeIntentLocked(owner, deviceDid, open);
       const seq = (this.storage.get(`seq/${deviceDid}`) ?? 0) + 1;
       const gen = randomBytes(16).toString('hex');
       const held = this._heldGens(owner, deviceDid);
@@ -230,12 +234,12 @@ export class OwnerRegistryDO {
     return this.storage.transact(() => {
       this._load();
       for (const rec of this.core.owners.values()) this.core.settle(rec, n());
-      this._outboxDead(this.owner);
       const intents = this.storage.keys('intent/');
       for (const k of intents) {
         const q = this.storage.get(k); const tid = k.split('/')[1];
         if (q.expiresAt <= n()) this._closeIntentLocked(this.owner, tid, q);
       }
+      this._sweepHeldGens(this.owner);
       const r = this._drainOutbox();
       this._save();
       return r;
@@ -339,22 +343,22 @@ export class OwnerRegistryDO {
     const q = this._intent(tid);
     if (q) { this._outboxPush(owner, tid, q.generation, q.seq, q.incarnation); this.storage.del(`intent/${tid}`); }
   }
-  _outboxDead(owner) {
+  // Release every generation the terminal may hold unless something still
+  // relies on its index entry: a live terminal, or an open application (even
+  // while the stored record is still a tombstone, e.g. re-registration after
+  // release). Applications end by cancellation, replacement, an effective
+  // revoke, or expiry; each of those turns `open` false, so the next sweep
+  // empties the list and outboxes a release -- no claim is left behind.
+  _sweepHeldGens(owner) {
     const r = this.core.get(owner);
     if (!r) return;
-    // A terminal with an open application relies on the index even while its
-    // stored record is still a tombstone (re-registration after release):
-    // the intent's claim must survive until that application settles, so the
-    // whole-list close waits for it (revoke/release/cancel close it then).
-    const pendingApp = (tid) => r.pending.some((p) => p.deviceDid === tid && !p.cancelledAt && !p.admittedAt);
-    for (const [tid, term] of r.devices) {
-      const dead = term.revokedAt || term.released;
-      if (!dead || pendingApp(tid)) continue;
-      // Deferred ops landing later are moot on an already-tombstoned
-      // terminal; a first close drains the heldGens list, later scans find
-      // nothing (the list stays empty). Idempotent by emptiness.
-      this._closeForDevice(owner, tid);
-    }
+    const openApp = (tid) => r.pending.some((p) => p.deviceDid === tid && !p.cancelledAt && !p.admittedAt);
+    const live = (tid) => { const t = r.devices.get(tid); return Boolean(t && !t.revokedAt && !t.released); };
+    const tids = new Set(r.devices.keys());
+    for (const p of r.pending) tids.add(p.deviceDid);
+    const prefix = `heldGens/${owner}/`;
+    for (const k of this.storage.keys(prefix)) tids.add(k.slice(prefix.length));
+    for (const tid of tids) if (!live(tid) && !openApp(tid)) this._closeForDevice(owner, tid);
   }
   _closeForDevice(owner, tid) { // whole-list close (dead terminals only)
     const held = this._heldGens(owner, tid);
@@ -365,35 +369,20 @@ export class OwnerRegistryDO {
     return this._tx(() => {
       const r = this.core.revokeDevice(a);
       this._closeIntentNow(a.owner, a.targetDid);
-      this._outboxDead(a.owner);
-      return r;
+      return r; // the transaction's sweep releases the terminal's held generations
     });
   }
   releaseDevice(a) {
     return this._tx(() => {
       const r = this.core.releaseDevice(a);
       this._closeIntentNow(a.owner, a.deviceDid);
-      this._outboxDead(a.owner);
       return r;
     });
   }
   cancelPending(a) {
-    return this._tx(() => {
-      const r = this.core.cancelPending(a);
-      const tid = [...this.core.get(a.owner).pending, ...this.core.get(a.owner).pendingReleases, ...this.core.get(a.owner).pendingRevokes]
-        .find((p) => p.id === a.pendingId)?.deviceDid;
-      // Only release when the terminal no longer relies on the index
-      // (fix-B rule): a live terminal or a still-pending application keeps
-      // its generations; a later revoke/release outboxes the whole list.
-      if (tid) {
-        const term = this.core.get(a.owner).devices.get(tid);
-        const live = term && !term.revokedAt && !term.released;
-        const pend = [...this.core.get(a.owner).pending, ...this.core.get(a.owner).pendingReleases, ...this.core.get(a.owner).pendingRevokes]
-          .some((p) => (p.deviceDid === tid || p.targetDid === tid) && !p.cancelledAt && !p.admittedAt && !p.doneAt);
-        if (!live && !pend) this._closeForDevice(a.owner, tid);
-      }
-      return r;
-    });
+    // Cancelling the last open application for a terminal leaves nothing
+    // relying on its index entry; the transaction's sweep releases it.
+    return this._tx(() => this.core.cancelPending(a));
   }
   requestBatchRevoke(a) {
     return this._tx(() => {

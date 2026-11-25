@@ -7,11 +7,17 @@
 //   MemoryRegistry (rejections must match);
 // - deliberately broken rule variants recorded failing;
 // - review repros (binding first, cap 429, same-claim redelivery,
-//   ownerOfDevice via the index, incarnation domain).
+//   ownerOfDevice via the index, incarnation domain);
+// - release-path inverses: every way an application ends frees its index
+//   entry (cancel, batch effect, intent replacement, application
+//   replacement, intent expiry) so no claim is left behind forever;
+// - a quiet-state invariant inside the randomized run: with no letters,
+//   outbox rows or open intents/appointments, an index entry may only
+//   belong to a live terminal of that owner.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { MemoryRegistry, RegistryError } from '../worker/src/e2ee-registry.mjs';
-import { MapStorage, DeviceIndexDO, OwnerRegistryDO, FakeTransport } from '../worker/src/e2ee-registry-do.mjs';
+import { MapStorage, DeviceIndexDO, OwnerRegistryDO, FakeTransport, INTENT_TTL_MS } from '../worker/src/e2ee-registry-do.mjs';
 import { HELD_GENS_CAP } from '../worker/src/e2ee-registry-core.mjs';
 import { deriveFromSeed } from '../src/recovery-derivation.mjs';
 import { keyFromSeed } from '../src/cacao.mjs';
@@ -59,6 +65,39 @@ class World {
       }
     }
     return v;
+  }
+  // Quiet owner: nothing in flight for it -- no outbox row, no open intent,
+  // no open application/release/revoke, no un-applied batch revoke.
+  _quietOwner(owner) {
+    const ow = this.owners.get(owner);
+    ow._load();
+    const r = ow.core.get(owner);
+    const open = (list, admitted) => (r ? list.filter((p) => !p.cancelledAt && !p.doneAt && !(admitted && p.admittedAt)).length : 0);
+    return !ow.storage.keys('outbox/').length && !ow.storage.keys('intent/').length &&
+      !open(r?.pending, true) && !open(r?.pendingReleases) && !open(r?.pendingRevokes) &&
+      !(r ? r.batchRevokes.filter((b) => !b.appliedAt).length : 0);
+  }
+  // Quiet-state invariant: no letter is in flight on the transport and the
+  // owner has nothing pending, so an index entry it holds can only be for a
+  // terminal that is live in that owner's record. (An open application would
+  // make the owner non-quiet; its claim is covered by live-or-pending.)
+  checkQuiet() {
+    const res = { problems: [], checked: 0, all: false };
+    if (this.transport.q.length) return res;
+    let quietOwners = 0;
+    for (const [owner] of this.owners) {
+      if (!this._quietOwner(owner)) continue;
+      quietOwners++; res.checked++;
+      for (const tid of T.map((x) => x.did)) {
+        const held = this.transport.lookup(tid);
+        if (!held || held.owner !== owner) continue;
+        if (!this.owners.get(owner).isLiveDevice({ owner, did: tid })) {
+          res.problems.push(`quiet-held ${tid.slice(-6)} owner=${owner.slice(0, 4)}`);
+        }
+      }
+    }
+    res.all = quietOwners === this.owners.size;
+    return res;
   }
   clone() {
     const w = new World();
@@ -272,9 +311,115 @@ test('regression: re-registering a released terminal keeps the pending claim', a
   assert.deepEqual(held(), claim2);
 });
 
+// ---- release-path inverses: an ended application must not keep a claim ----
+// Each way an application ends must free its index entry: the terminal ends
+// up with no held claim, the owner's closed pair advanced past the ended
+// generation, and an empty heldGens list. Skipping too much in the sweep
+// would turn "live with no index" into "index held forever", so each path is
+// pinned here.
+const releaseSetup = () => {
+  const st = { now: 1_700_000_000_000 };
+  st.transport = new FakeTransport();
+  st.o = new OwnerRegistryDO(new MapStorage(), { owner: A.owner, now: () => st.now, transport: st.transport });
+  st.o.applyRegistration({ owner: A.owner, deviceDid: T[0].did, approverDid: A.registration.did, kind: 'seed', transport: st.transport });
+  return st;
+};
+const heldGens = (st, did) => st.o._heldGens(A.owner, did);
+const closedPair = (st, did) => st.transport.indexFor(did).storage.get('closed')?.[A.owner] ?? null;
+
+test('release path: cancelling the application frees its index entry', async () => {
+  const st = releaseSetup();
+  const p = st.o.applyRegistration({ owner: A.owner, deviceDid: T[1].did, approverDid: A.registration.did, kind: 'seed', transport: st.transport });
+  const claim = st.transport.lookup(T[1].did);
+  assert.equal(claim.owner, A.owner);
+  assert.equal(st.o.cancelPending({ owner: A.owner, actorDid: T[0].did, pendingId: p.id }).status, 'cancelled');
+  assert.deepEqual(heldGens(st, T[1].did), [], 'a cancelled application keeps no held generation');
+  assert.ok(st.transport.q.length >= 1, 'a release letter is queued');
+  await st.transport.deliverAll();
+  assert.equal(st.transport.lookup(T[1].did), null);
+  assert.deepEqual(closedPair(st, T[1].did), [claim.inc, claim.seq]);
+  assert.deepEqual(heldGens(st, T[1].did), []);
+});
+
+test('release path: an effective batch revoke frees the index entry', async () => {
+  const st = releaseSetup();
+  st.o.applyRegistration({ owner: A.owner, deviceDid: T[1].did, approverDid: A.registration.did, kind: 'seed', transport: st.transport });
+  const claim = st.transport.lookup(T[1].did);
+  st.now += 3_600_000;
+  const batch = st.o.requestBatchRevoke({ owner: A.owner, registrationDid: A.registration.did });
+  st.now = batch.effectiveAt + 1;
+  st.o.alarm(st.now);
+  const rec = st.o.core.get(A.owner);
+  // The application was admitted first (its admitAt precedes the batch
+  // effect), then the batch revoked the terminal as a seed applied before
+  // the request: the freed entry must not depend on the batch's
+  // cancelApplication branch.
+  assert.equal(rec.devices.get(T[1].did).revokedAt, batch.effectiveAt);
+  assert.equal(st.o.isLiveDevice({ owner: A.owner, did: T[1].did }), false);
+  assert.deepEqual(heldGens(st, T[1].did), [], 'a revoked terminal keeps no held generation');
+  await st.transport.deliverAll();
+  assert.equal(st.transport.lookup(T[1].did), null);
+  assert.deepEqual(closedPair(st, T[1].did), [claim.inc, claim.seq]);
+  assert.deepEqual(heldGens(st, T[1].did), []);
+});
+
+test('release path: replacing an expired intent releases the old claim', async () => {
+  const st = releaseSetup();
+  const it1 = st.o.createIntent({ owner: A.owner, deviceDid: T[1].did });
+  st.transport.claim(T[1].did, A.owner, it1.generation, it1.seq, it1.incarnation);
+  assert.equal(st.transport.lookup(T[1].did).seq, it1.seq);
+  st.now += INTENT_TTL_MS + 1;
+  const it2 = st.o.createIntent({ owner: A.owner, deviceDid: T[1].did });
+  assert.notEqual(it2.generation, it1.generation);
+  assert.deepEqual(heldGens(st, T[1].did), [], 'nothing relies on the expired intent still');
+  assert.ok(st.transport.q.length >= 1, 'replacing an expired intent queues its release');
+  await st.transport.deliverAll();
+  assert.equal(st.transport.lookup(T[1].did), null);
+  assert.deepEqual(closedPair(st, T[1].did), [it1.incarnation, it1.seq]);
+  assert.deepEqual(heldGens(st, T[1].did), []);
+  assert.equal(st.o.storage.keys('intent/').length, 1, 'the new intent stays open');
+});
+
+test('release path: a replaced application is released once nothing relies on it', async () => {
+  const st = releaseSetup();
+  st.o.applyRegistration({ owner: A.owner, deviceDid: T[1].did, approverDid: A.registration.did, kind: 'seed', transport: st.transport });
+  const claim1 = st.transport.lookup(T[1].did);
+  st.now += 1000;
+  const p2 = st.o.applyRegistration({ owner: A.owner, deviceDid: T[1].did, approverDid: A.registration.did, kind: 'seed', transport: st.transport });
+  const claim2 = st.transport.lookup(T[1].did);
+  assert.equal(claim2.seq, claim1.seq + 1, 'the replacement claim supersedes the old one');
+  // While the replacement is pending the terminal still relies on the index,
+  // so both generations stay listed (design: live-or-pending keeps them).
+  assert.deepEqual(heldGens(st, T[1].did).map((g) => g.seq), [claim1.seq, claim2.seq]);
+  await st.transport.deliverAll();
+  assert.equal(st.transport.lookup(T[1].did).seq, claim2.seq);
+  assert.equal(st.o.cancelPending({ owner: A.owner, actorDid: T[0].did, pendingId: p2.id }).status, 'cancelled');
+  assert.deepEqual(heldGens(st, T[1].did), [], 'with the last application gone every generation is released');
+  assert.ok(st.transport.q.length >= 2, 'one release per possibly-held generation');
+  await st.transport.deliverAll();
+  assert.equal(st.transport.lookup(T[1].did), null);
+  assert.deepEqual(closedPair(st, T[1].did), [claim2.inc, claim2.seq]);
+  assert.deepEqual(heldGens(st, T[1].did), []);
+});
+
+test('release path: intent expiry with no live terminal or application frees the index', async () => {
+  const st = releaseSetup();
+  const it = st.o.createIntent({ owner: A.owner, deviceDid: T[1].did });
+  st.transport.claim(T[1].did, A.owner, it.generation, it.seq, it.incarnation);
+  st.now += INTENT_TTL_MS + 1;
+  st.o.alarm(st.now);
+  assert.deepEqual(heldGens(st, T[1].did), [], 'an expired intent on a dead terminal is released, not listed');
+  assert.ok(st.transport.q.length >= 1);
+  assert.equal(st.o.storage.keys('intent/').length, 0);
+  await st.transport.deliverAll();
+  assert.equal(st.transport.lookup(T[1].did), null);
+  assert.deepEqual(closedPair(st, T[1].did), [it.incarnation, it.seq]);
+  assert.deepEqual(heldGens(st, T[1].did), []);
+});
+
 // ---- randomized differential + invariants (3600 ops) ----
 test('randomized: 2 owners x 3 terminals x 11 ops, differential vs MemoryRegistry', async () => {
-  const counts = { ops: 0, ok: 0, err: 0 };
+  const counts = { ops: 0, ok: 0, err: 0, quiet: 0, allQuiet: 0 };
   for (const seed of [5, 17, 23]) {
     const rand = mulberry32(seed ^ 0x51f7);
     let now = 1_700_000_000_000;
@@ -357,6 +502,15 @@ test('randomized: 2 owners x 3 terminals x 11 ops, differential vs MemoryRegistr
       for (const [o2] of [[A.owner], [B.owner]]) { const r = oracle._get(o2); if (r) oracle._settle(r, now); }
       for (const ow of w.owners.values()) ow.alarm(now);
       await w.transport.deliverAll();
+      // Quiet-state invariant (checked after every step's alarm + delivery):
+      // no letter in flight and nothing pending for an owner means every
+      // index entry that owner holds belongs to a live terminal. An open
+      // application would make the owner non-quiet, and its claim is the
+      // live-or-pending case already covered above.
+      const quiet = w.checkQuiet();
+      counts.quiet += quiet.checked;
+      if (quiet.all) counts.allQuiet++;
+      assert.deepEqual(quiet.problems, [], `quiet seed ${seed} step ${step} kind ${kind}`);
       // Known legitimate divergence (recorded, bounded): the oracle's
       // global map reserves a device through cancellation/admission cycles
       // differently from the per-device bound pair (which frees provisional
@@ -389,8 +543,10 @@ test('randomized: 2 owners x 3 terminals x 11 ops, differential vs MemoryRegistr
       assert.deepEqual(v, [], `seed ${seed} step ${step} kind ${kind}`);
     }
   }
-  console.log(`randomized counts: ops=${counts.ops} ok=${counts.ok} err=${counts.err} sequences=3 reservationDivergence=${counts.reservationDivergence ?? 0}`);
+  console.log(`randomized counts: ops=${counts.ops} ok=${counts.ok} err=${counts.err} sequences=3 reservationDivergence=${counts.reservationDivergence ?? 0} quietOwners=${counts.quiet} allQuietSteps=${counts.allQuiet}`);
   assert.ok(counts.ok > 0 && counts.ops >= 3000);
+  assert.ok(counts.quiet > 0, 'the quiet-state invariant must actually be checked');
+  assert.ok(counts.allQuiet > 0, 'and both owners must reach a quiet state at least once');
 });
 
 // ---- deliberately broken variants ----
