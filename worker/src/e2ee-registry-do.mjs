@@ -246,11 +246,16 @@ export class OwnerRegistryDO {
     if (!list.length) this.storage.del(`heldGens/${owner}/${tid}`);
     else this.storage.put(`heldGens/${owner}/${tid}`, list.slice(-HELD_GENS_CAP));
   }
-  // expiry cleanup for one terminal's open intent
-  clearIntent({ owner, deviceDid }) {
+  // Failing/abandoned intent cleanup. The caller names the exact intent it
+  // created: a replacement (a newer generation that took the terminal's
+  // single intent slot) must survive its predecessor's cleanup, so anything
+  // other than the same (generation, seq, incarnation) is left untouched.
+  clearIntent({ owner, deviceDid, generation, seq, incarnation }) {
     return this._tx(() => {
       const q = this._intent(deviceDid);
       if (!q) return { cleared: false };
+      if (q.generation !== generation || q.seq !== seq || q.incarnation !== incarnation)
+        return { cleared: false };
       this._closeIntentLocked(owner, deviceDid, q, { clearOnly: false });
       return { cleared: true };
     });
@@ -492,7 +497,7 @@ export class OwnerRegistryDO {
       await this._claimRegistration({ owner, deviceDid, generation: b.generation, seq: b.seq,
         incarnation: b.incarnation, transport });
     } catch (e) {
-      this.clearIntent({ owner, deviceDid });
+      this.clearIntent({ owner, deviceDid, generation: b.generation, seq: b.seq, incarnation: b.incarnation });
       throw e;
     }
     return this._finishRegistration({ owner, deviceDid, approverDid, kind,
@@ -514,12 +519,12 @@ export class OwnerRegistryDO {
       claimed = this._claimRegistration({ owner, deviceDid, generation: b.generation, seq: b.seq,
         incarnation: b.incarnation, transport });
     } catch (e) {
-      this.clearIntent({ owner, deviceDid });
+      this.clearIntent({ owner, deviceDid, generation: b.generation, seq: b.seq, incarnation: b.incarnation });
       throw e;
     }
     if (claimed && typeof claimed.then === 'function') {
       claimed.catch(() => {}); // the late reply has no intent to record into
-      this.clearIntent({ owner, deviceDid });
+      this.clearIntent({ owner, deviceDid, generation: b.generation, seq: b.seq, incarnation: b.incarnation });
       throw new Error('async-claim-requires-register');
     }
     return this._finishRegistration({ owner, deviceDid, approverDid, kind,

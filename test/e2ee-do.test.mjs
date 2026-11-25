@@ -227,7 +227,8 @@ function exhaustiveActions(w) {
       if (w.ack(o.owner, ing.generation) === 'ok') add(`finish ${tag}`, (c) => c.owners.get(o.owner).finishRegistration({
         owner: o.owner, deviceDid: EX_TID, approverDid: o.registration.did, kind: 'seed',
         generation: ing.generation, seq: ing.seq, incarnation: ing.incarnation }));
-      add(`abandon ${tag}`, (c) => c.owners.get(o.owner).clearIntent({ owner: o.owner, deviceDid: EX_TID }));
+      add(`abandon ${tag}`, (c) => c.owners.get(o.owner).clearIntent({ owner: o.owner, deviceDid: EX_TID,
+        generation: ing.generation, seq: ing.seq, incarnation: ing.incarnation }));
     }
     if (live) add(`revoke ${tag}`, (c) => c.owners.get(o.owner).revokeDevice({
       owner: o.owner, actorDid: EX_TID, targetDid: EX_TID }));
@@ -314,7 +315,8 @@ async function hole1Under(rule) {
     const b1 = w.owners.get(o.owner).beginRegistration({ owner: o.owner, deviceDid: tid,
       approverDid: o.registration.did, kind: 'seed', transport: w.transport });
     w.claim(o.owner, tid, b1);
-    w.owners.get(o.owner).clearIntent({ owner: o.owner, deviceDid: tid }); // release 1 queued
+    w.owners.get(o.owner).clearIntent({ owner: o.owner, deviceDid: tid,
+      generation: b1.generation, seq: b1.seq, incarnation: b1.incarnation }); // release 1 queued
     const b2 = w.owners.get(o.owner).beginRegistration({ owner: o.owner, deviceDid: tid,
       approverDid: o.registration.did, kind: 'seed', transport: w.transport });
     w.claim(o.owner, tid, b2);
@@ -424,7 +426,8 @@ test('finish rejects an older generation after a newer intent replaced it', () =
   const tid = T[0].did;
   const b1 = beginSeed(w, tid);
   assert.equal(w.claim(A.owner, tid, b1), 'ok');
-  w.owners.get(A.owner).clearIntent({ owner: A.owner, deviceDid: tid });
+  w.owners.get(A.owner).clearIntent({ owner: A.owner, deviceDid: tid,
+    generation: b1.generation, seq: b1.seq, incarnation: b1.incarnation });
   const b2 = beginSeed(w, tid);
   assert.equal(w.claim(A.owner, tid, b2), 'ok');
   assert.throws(() => finishSeed(w, tid, b1), (e) => e.code === 'intent-gone');
@@ -447,7 +450,8 @@ test('finish rejects an intent that is gone', () => {
   const tid = T[0].did;
   const b = beginSeed(w, tid);
   assert.equal(w.claim(A.owner, tid, b), 'ok');
-  w.owners.get(A.owner).clearIntent({ owner: A.owner, deviceDid: tid });
+  w.owners.get(A.owner).clearIntent({ owner: A.owner, deviceDid: tid,
+    generation: b.generation, seq: b.seq, incarnation: b.incarnation });
   assert.throws(() => finishSeed(w, tid, b), (e) => e.code === 'intent-gone');
   assert.equal(w.owners.get(A.owner).isLiveDevice({ owner: A.owner, did: tid }), false);
 });
@@ -464,7 +468,8 @@ test('fixed: a finish without the owner-recorded claim is rejected (repro: claim
   assert.throws(() => finishSeed(w, tid, b), (e) => e.code === 'intent-unclaimed');
   assert.equal(o.isLiveDevice({ owner: A.owner, did: tid }), false);
   assert.equal(w.transport.lookup(tid), null, 'a refused finish leaves no index entry');
-  o.clearIntent({ owner: A.owner, deviceDid: tid });
+  o.clearIntent({ owner: A.owner, deviceDid: tid,
+    generation: b.generation, seq: b.seq, incarnation: b.incarnation });
   const out = await o.register({ owner: A.owner, deviceDid: tid, approverDid: A.registration.did,
     kind: 'seed', transport: w.transport });
   assert.equal(out.status, 'admitted');
@@ -570,6 +575,31 @@ test('async register: a replacement during the await wins, the older finish is i
   assert.equal(transport.lookup(tid)?.gen, secondCall.gen, 'index and live agree on the newer generation');
   assert.deepEqual(o._heldGens(A.owner, tid),
     [{ gen: secondCall.gen, seq: secondCall.seq, inc: secondCall.inc }]);
+});
+
+// A failed claim from a replaced intent must not clear the replacement. The
+// older register's catch ran a generation-blind clearIntent that closed the
+// newer intent, so the newer (correct) registration failed `intent-gone`.
+test('async register: a replaced intent whose claim fails leaves the newer intent intact', async () => {
+  let now = 1_700_000_000_000;
+  const transport = promiseTransport();
+  const o = prodOwner(transport, () => now);
+  const tid = T[0].did;
+  const first = o.register({ owner: A.owner, deviceDid: tid, approverDid: A.registration.did, kind: 'seed' });
+  const firstCall = transport.calls[0];
+  now = o.storage.get(`intent/${tid}`).expiresAt + 1; // the first intent lapses while its claim is in flight
+  const second = o.register({ owner: A.owner, deviceDid: tid, approverDid: A.registration.did, kind: 'seed' });
+  const secondCall = transport.calls[1];
+  assert.equal(o.storage.get(`intent/${tid}`)?.generation, secondCall.gen, 'the second intent replaced the first');
+  firstCall.settle.fail(new Error('claim-timeout')); // the stale claim now rejects
+  await assert.rejects(first, (e) => e.message === 'claim-timeout');
+  assert.equal(o.storage.get(`intent/${tid}`)?.generation, secondCall.gen,
+    'the failed older claim left the replacement intent open');
+  secondCall.settle.deliver();
+  const out = await second;
+  assert.equal(out.status, 'admitted');
+  assert.equal(o.isLiveDevice({ owner: A.owner, did: tid }), true);
+  assert.equal(transport.lookup(tid)?.gen, secondCall.gen, 'the surviving registration owns the index entry');
 });
 
 test("async register: another generation's replied claim is not recorded (intent-unclaimed)", async () => {
@@ -924,7 +954,8 @@ test('randomized: 3000 sequences, device-key actors, delayed delivery, crashes',
           counts.begin++;
           try { ow(o).claimRegistration({ owner: o.owner, deviceDid: did, generation: int.generation,
             seq: int.seq, incarnation: int.incarnation, transport }); }
-          catch (e) { ow(o).clearIntent({ owner: o.owner, deviceDid: did }); throw e; }
+          catch (e) { ow(o).clearIntent({ owner: o.owner, deviceDid: did,
+            generation: int.generation, seq: int.seq, incarnation: int.incarnation }); throw e; }
           counts.claim++;
           b = { ok: ow(o).finishRegistration({ owner: o.owner, deviceDid: did, approverDid: approver, kind,
             generation: int.generation, seq: int.seq, incarnation: int.incarnation }) };
