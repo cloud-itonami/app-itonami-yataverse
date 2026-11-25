@@ -32,6 +32,13 @@
 //   the next request, not after a cache window.
 // - Signed statements are single-use: consumeStatement rejects replays,
 //   expired statements and epoch-stale statements.
+//
+// Concurrency note (DO wiring): the in-memory methods below contain no await
+// between their validation and their writes, so each call is atomic in this
+// process. Cloudflare Durable Objects can interleave requests at awaits;
+// the DO wiring step must keep the same no-await-between-check-and-write
+// discipline (or use a transaction) and keep capacity reservations, which
+// already make concurrent PUTs safe against overshoot.
 
 import { ed25519PubFromDidKey } from './cacao-auth.mjs';
 import { ownerFromRegistrationPub } from '../../src/recovery-derivation.mjs';
@@ -41,9 +48,10 @@ export const MAX_PENDING_PER_LANE = 3;
 export const MAX_APPLICATIONS_PER_LANE_PER_HOUR = 10;
 export const MAX_BATCH_REVOKES_PER_DAY = 1;
 export const MAX_HEAD_PUBLISHES_PER_HOUR = 100;
-// Provisional pack caps. Assumed scale: one owner holds originals of about
+// Pack caps encode the assumed scale: one owner holds originals of about
 // 1.6 GiB in packs of at most 12 MiB, plus head records; 1024 packs and
-// 4 GiB total cover that with headroom. Owner to confirm.
+// 4 GiB total cover that with headroom. Real B2 cost and production caps
+// are handled as a separate item before public exposure.
 export const MAX_PACKS_PER_OWNER = 1024;
 export const MAX_PACK_BYTES_PER_OWNER = 4 * 1024 * 1024 * 1024;
 
@@ -84,7 +92,7 @@ export class MemoryRegistry {
       r = { owner, devices: new Map(), packs: new Map(), pending: [], batchRevokes: [],
             pendingReleases: [], pendingRevokes: [],
             headSeq: 0, headSha: null, headName: null, epoch: 0, registrationDid: null,
-            cancelsUsed: 0, nextId: 1,
+            cancelsUsed: 0, nextId: 1, reservations: new Map(),
             appTimes: { seed: [], existing: [] }, batchTimes: [], headTimes: [] };
       this.owners.set(owner, r);
     }
@@ -94,44 +102,55 @@ export class MemoryRegistry {
   /** Read-only lookup: never creates an owner record. */
   _get(owner) { checkOwner(owner); return this.owners.get(owner) ?? null; }
 
-  _liveDevices(r) { return [...r.devices.values()].filter((d) => !d.revokedAt); }
+  _liveDevices(r) { return [...r.devices.values()].filter((d) => !d.revokedAt && !d.released); }
 
-  /** Batch revokes first, then zero-terminal ops, then admissions. */
+  /** Settle in effective-time order, one event at a time, so the outcome
+   *  never depends on when reads happen. Same-time order: batch revokes and
+   *  zero-terminal ops before admissions (revocation wins ties). Exclusion
+   *  from a batch is by application time, including later-added devices:
+   *  pendings applied before the batch request are cancelled at its effect. */
   _settle(r, now) {
-    for (const b of r.batchRevokes) {
-      if (!b.appliedAt && b.effectiveAt <= now) {
+    const events = [];
+    for (const b of r.batchRevokes) if (!b.appliedAt && b.effectiveAt <= now) events.push({ t: b.effectiveAt, pri: 0, kind: 'batch', ref: b });
+    for (const p of r.pendingReleases) if (!p.cancelledAt && !p.doneAt && p.effectiveAt <= now) events.push({ t: p.effectiveAt, pri: 0, kind: 'release', ref: p });
+    for (const p of r.pendingRevokes) if (!p.cancelledAt && !p.doneAt && p.effectiveAt <= now) events.push({ t: p.effectiveAt, pri: 0, kind: 'revoke', ref: p });
+    for (const p of r.pending) if (!p.cancelledAt && !p.admittedAt && p.admitAt <= now) events.push({ t: p.admitAt, pri: 1, kind: 'admit', ref: p });
+    events.sort((a, b) => a.t - b.t || a.pri - b.pri);
+    for (const e of events) {
+      if (e.kind === 'batch') {
+        const b = e.ref;
         b.appliedAt = now;
         r.epoch += 1;
         r.cancelsUsed = 0;
-        // Exempt only seed registrations applied at-or-after the batch request.
         for (const d of r.devices.values()) {
           const appliedAt = d.appliedAt ?? d.approvedAt;
-          if (!d.revokedAt && !(d.kind === 'seed' && appliedAt >= b.requestedAt)) d.revokedAt = now;
+          if (!d.revokedAt && !d.released && !(d.kind === 'seed' && appliedAt >= b.requestedAt)) d.revokedAt = now;
         }
-      }
-    }
-    for (const p of r.pendingReleases) {
-      if (!p.cancelledAt && !p.doneAt && p.effectiveAt <= now) {
+        for (const p of r.pending) if (!p.admittedAt && !p.cancelledAt && p.appliedAt < b.requestedAt) p.cancelledAt = now;
+      } else if (e.kind === 'release') {
+        const p = e.ref;
         p.doneAt = now;
-        r.devices.delete(p.deviceDid);
+        const d = r.devices.get(p.deviceDid);
+        if (d) { d.released = true; d.releasedAt = now; }
         for (const q of r.pending) if (q.deviceDid === p.deviceDid && !q.admittedAt) q.cancelledAt = now;
         if (this.deviceIndex.get(p.deviceDid) === r.owner) this.deviceIndex.delete(p.deviceDid);
-      }
-    }
-    for (const p of r.pendingRevokes) {
-      if (!p.cancelledAt && !p.doneAt && p.effectiveAt <= now) {
+      } else if (e.kind === 'revoke') {
+        const p = e.ref;
         p.doneAt = now;
         const d = r.devices.get(p.targetDid);
         if (d && !d.revokedAt) d.revokedAt = now;
-      }
-    }
-    for (const p of r.pending) {
-      if (!p.cancelledAt && !p.admittedAt && p.admitAt <= now) {
+        if (this.deviceIndex.get(p.targetDid) === r.owner) this.deviceIndex.delete(p.targetDid);
+      } else {
+        const p = e.ref;
         p.admittedAt = now;
         const old = r.devices.get(p.deviceDid);
-        // A revoked device coming back via seed gets a new generation record.
+        // An application issued before a revocation/release must not revive.
+        const killAt = Math.max(old?.revokedAt ?? 0, old?.releasedAt ?? 0);
+        if (old && killAt && p.appliedAt < killAt) { p.cancelledAt = now; continue; }
+        // A revoked/released device coming back via seed gets a new generation.
         r.devices.set(p.deviceDid, { did: p.deviceDid, approvedBy: p.approverDid, kind: p.kind,
-          approvedAt: now, appliedAt: p.appliedAt, revokedAt: 0, generation: (old?.generation ?? 0) + 1 });
+          approvedAt: now, appliedAt: p.appliedAt, revokedAt: 0, released: false, releasedAt: 0,
+          generation: (old?.generation ?? 0) + 1 });
         if (p.kind === 'seed') r.cancelsUsed = 0;
       }
     }
@@ -139,16 +158,21 @@ export class MemoryRegistry {
     r.appTimes.existing = within(r.appTimes.existing, now, HOUR);
     r.batchTimes = within(r.batchTimes, now, DAY);
     r.headTimes = within(r.headTimes, now, HOUR);
+    for (const [h, exp] of r.reservations) if (exp <= now) r.reservations.delete(h);
   }
 
   _isLive(r, did) {
     this._settle(r, this.now());
     const d = r.devices.get(did);
-    return d && !d.revokedAt ? d : null;
+    return d && !d.revokedAt && !d.released ? d : null;
   }
 
-  /** Current epoch for statement signing / the status endpoint. No record created. */
-  async epochOf({ owner }) { return this._get(owner)?.epoch ?? 0; }
+  /** Current epoch for statement signing / the status endpoint. Settles first. */
+  async epochOf({ owner }) {
+    const r = this._get(owner);
+    if (r) this._settle(r, this.now());
+    return r?.epoch ?? 0;
+  }
 
   /**
    * Single-use statement gate (fix design §1): the HTTP layer verifies the
@@ -160,7 +184,9 @@ export class MemoryRegistry {
     checkOwner(owner);
     const now = this.now();
     for (const [h, exp] of this.usedStatements) if (exp <= now) this.usedStatements.delete(h);
-    const current = this._get(owner)?.epoch ?? 0;
+    const rec = this._get(owner);
+    if (rec) this._settle(rec, now);
+    const current = rec?.epoch ?? 0;
     if (!Number.isFinite(expiresAt) || expiresAt <= now) throw new RegistryError('statement-expired');
     if (epoch !== current) throw new RegistryError('statement-stale-epoch');
     const h = String(signature);
@@ -180,6 +206,9 @@ export class MemoryRegistry {
   async applyRegistration({ owner, deviceDid, approverDid, kind }) {
     checkDid(deviceDid); checkDid(approverDid);
     checkOwner(owner);
+    // Binding before any record, claim or count (unbound attempts are free).
+    if (kind === 'seed') checkOwnerBinding(owner, approverDid);
+    if (kind !== 'seed' && kind !== 'existing-device') throw new RegistryError('bad-registration-kind');
     const mapped = this.deviceIndex.get(deviceDid);
     if (mapped && mapped !== owner) throw new RegistryError('device-registered-elsewhere');
     const claimed = !mapped;
@@ -196,10 +225,9 @@ export class MemoryRegistry {
     const r = this._rec(owner); const now = this.now();
     this._settle(r, now);
     const existing = r.devices.get(deviceDid);
-    if (existing && !existing.revokedAt) return { status: 'admitted', repeated: true };
-    if (kind !== 'seed' && kind !== 'existing-device') throw new RegistryError('bad-registration-kind');
-    // A revoked device may only come back via a seed application (new generation).
-    if (existing?.revokedAt && kind !== 'seed') throw new RegistryError('device-revoked-seed-only');
+    if (existing && !existing.revokedAt && !existing.released) return { status: 'admitted', repeated: true };
+    // A revoked/released device may only come back via a seed application (new generation).
+    if ((existing?.revokedAt || existing?.released) && kind !== 'seed') throw new RegistryError('device-revoked-seed-only');
     const lane = kind === 'seed' ? 'seed' : 'existing';
     if (r.appTimes[lane].length >= MAX_APPLICATIONS_PER_LANE_PER_HOUR) throw new RegistryError('registration-rate');
     r.appTimes[lane].push(now);
@@ -214,13 +242,13 @@ export class MemoryRegistry {
       if (!this._isLive(r, approverDid)) throw new RegistryError('approver-not-registered');
       if (r.batchRevokes.some((b) => !b.appliedAt)) throw new RegistryError('batch-revoke-pending');
       r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now,
-        appliedAt: now, revokedAt: 0, generation: (existing?.generation ?? 0) + 1 });
+        appliedAt: now, revokedAt: 0, released: false, releasedAt: 0, generation: (existing?.generation ?? 0) + 1 });
       return { status: 'admitted', repeated: false };
     }
     if (this._liveDevices(r).length === 0) {
       r.registrationDid = approverDid;
       r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now,
-        appliedAt: now, revokedAt: 0, generation: (existing?.generation ?? 0) + 1 });
+        appliedAt: now, revokedAt: 0, released: false, releasedAt: 0, generation: (existing?.generation ?? 0) + 1 });
       r.cancelsUsed = 0;
       return { status: 'admitted', repeated: false };
     }
@@ -236,13 +264,17 @@ export class MemoryRegistry {
   /** Cancel a pending registration or zero-terminal op. Actor must be live; once per epoch. */
   async cancelPending({ owner, actorDid, pendingId }) {
     checkDid(actorDid);
-    const r = this._rec(owner); const now = this.now();
+    const r = this._get(owner);
+    if (!r) throw new RegistryError('actor-not-registered');
+    const now = this.now();
     this._settle(r, now);
     if (!this._isLive(r, actorDid)) throw new RegistryError('actor-not-registered');
     const p = [...r.pending, ...r.pendingReleases, ...r.pendingRevokes].find((x) => x.id === pendingId);
     if (!p || p.cancelledAt || p.admittedAt || p.doneAt) throw new RegistryError('pending-not-found');
     if (!p.cancellable || r.cancelsUsed >= 1) throw new RegistryError('pending-not-cancellable');
     p.cancelledAt = now; p.cancelledBy = actorDid; r.cancelsUsed += 1;
+    // A cancelled registration's provisional index entry is freed.
+    if (p.deviceDid && this.deviceIndex.get(p.deviceDid) === owner) this.deviceIndex.delete(p.deviceDid);
     return { status: 'cancelled', id: p.id };
   }
 
@@ -250,11 +282,15 @@ export class MemoryRegistry {
    *  terminal defers by the wait (same rule as release-to-zero). */
   async revokeDevice({ owner, actorDid, targetDid }) {
     checkDid(actorDid); checkDid(targetDid);
-    const r = this._rec(owner); const now = this.now();
+    const r = this._get(owner);
+    if (!r) throw new RegistryError('actor-not-registered');
+    const now = this.now();
     this._settle(r, now);
     if (!this._isLive(r, actorDid)) throw new RegistryError('actor-not-registered');
     const t = r.devices.get(targetDid);
     if (!t || t.revokedAt) throw new RegistryError('device-not-found');
+    // Applications for this device issued before the revocation die with it.
+    for (const p of r.pending) if (p.deviceDid === targetDid && !p.admittedAt) p.cancelledAt = now;
     if (this._liveDevices(r).length === 1) {
       const id = r.nextId++;
       const effectiveAt = now + RECOVERY_WAIT_MS;
@@ -263,6 +299,7 @@ export class MemoryRegistry {
       return { status: 'pending', id, effectiveAt };
     }
     t.revokedAt = now;
+    if (this.deviceIndex.get(targetDid) === owner) this.deviceIndex.delete(targetDid);
     return { status: 'revoked', did: targetDid, revokedAt: now };
   }
 
@@ -274,7 +311,9 @@ export class MemoryRegistry {
   async requestBatchRevoke({ owner, registrationDid }) {
     checkDid(registrationDid);
     checkOwnerBinding(owner, registrationDid);
-    const r = this._rec(owner); const now = this.now();
+    const r = this._get(owner);
+    if (!r) throw new RegistryError('registration-key-mismatch');
+    const now = this.now();
     this._settle(r, now);
     if (!r.registrationDid || r.registrationDid !== registrationDid) throw new RegistryError('registration-key-mismatch');
     if (r.batchTimes.length >= MAX_BATCH_REVOKES_PER_DAY) throw new RegistryError('batch-revoke-rate');
@@ -290,10 +329,13 @@ export class MemoryRegistry {
   async releaseDevice({ owner, deviceDid, registrationDid }) {
     checkDid(deviceDid); checkDid(registrationDid);
     checkOwnerBinding(owner, registrationDid);
-    const r = this._rec(owner); const now = this.now();
+    const r = this._get(owner);
+    if (!r) throw new RegistryError('registration-key-mismatch');
+    const now = this.now();
     this._settle(r, now);
     if (!r.registrationDid || r.registrationDid !== registrationDid) throw new RegistryError('registration-key-mismatch');
     if (!r.devices.has(deviceDid)) throw new RegistryError('device-not-found');
+    for (const p of r.pending) if (p.deviceDid === deviceDid && !p.admittedAt) p.cancelledAt = now;
     if (this._liveDevices(r).length === 1 && !r.devices.get(deviceDid).revokedAt) {
       const id = r.nextId++;
       const effectiveAt = now + RECOVERY_WAIT_MS;
@@ -301,23 +343,38 @@ export class MemoryRegistry {
                                cancelledAt: 0, cancelledBy: null, cancellable: r.cancelsUsed < 1 });
       return { status: 'pending', id, effectiveAt };
     }
-    r.devices.delete(deviceDid);
-    for (const p of r.pending) if (p.deviceDid === deviceDid && !p.admittedAt) p.cancelledAt = this.now();
+    // Immediate release keeps a tombstone so revocation state survives.
+    const d = r.devices.get(deviceDid);
+    d.released = true; d.releasedAt = now;
     if (this.deviceIndex.get(deviceDid) === owner) this.deviceIndex.delete(deviceDid);
     return { status: 'released', did: deviceDid };
   }
 
-  /** Capacity pre-check for a pack PUT: call before storing bytes. */
+  /** Capacity pre-check + reservation for a pack PUT: call before storing
+   *  bytes. The reservation expires (120 s) and is refunded on failure or
+   *  converted at record time, so races cannot overshoot the cap. */
   async checkPackCapacity({ owner, sha256, size }) {
     checkSha(sha256);
-    const r = this._rec(owner);
-    this._settle(r, this.now());
-    if (r.packs.has(sha256)) return { status: 'ok' };
-    if (r.packs.size >= MAX_PACKS_PER_OWNER) throw new RegistryError('pack-count-cap');
+    const r = this._get(owner);
+    if (!r) return { status: 'ok' };
+    const now = this.now();
+    this._settle(r, now);
+    if (r.packs.has(sha256) || r.reservations.has(sha256)) return { status: 'ok' };
+    let count = r.packs.size + r.reservations.size;
     let total = size;
     for (const p of r.packs.values()) total += p.size;
+    for (const rv of r.reservations.values()) total += rv.size;
+    if (count >= MAX_PACKS_PER_OWNER) throw new RegistryError('pack-count-cap');
     if (total > MAX_PACK_BYTES_PER_OWNER) throw new RegistryError('pack-bytes-cap');
+    r.reservations.set(sha256, { size, expiresAt: now + 120_000 });
     return { status: 'ok' };
+  }
+
+  /** Refund a capacity reservation (PUT failed after reserving). */
+  async releaseCapacity({ owner, sha256 }) {
+    const r = this._get(owner);
+    if (r) r.reservations.delete(sha256);
+    return { status: 'released' };
   }
 
   /** Create the pack record. Called only after bytes + readback verify. */
@@ -330,10 +387,12 @@ export class MemoryRegistry {
       if (existing.size !== size) throw new RegistryError('pack-size-mismatch');
       return { status: 'repeated' };
     }
-    if (r.packs.size >= MAX_PACKS_PER_OWNER) throw new RegistryError('pack-count-cap');
+    if (r.packs.size >= MAX_PACKS_PER_OWNER && !r.reservations.has(sha256)) throw new RegistryError('pack-count-cap');
     let total = size;
     for (const p of r.packs.values()) total += p.size;
+    for (const [h, rv] of r.reservations) if (h !== sha256) total += rv.size;
     if (total > MAX_PACK_BYTES_PER_OWNER) throw new RegistryError('pack-bytes-cap');
+    r.reservations.delete(sha256); // the reservation converts to the record
     r.packs.set(sha256, { sha256, size, deviceDid, createdAt: this.now() });
     return { status: 'recorded' };
   }
@@ -361,7 +420,9 @@ export class MemoryRegistry {
   async publishHead({ owner, deviceDid, seq, headSha, headNameHex }) {
     checkDid(deviceDid); checkSha(headSha); checkSha(headNameHex);
     if (!Number.isInteger(seq) || seq < 1) throw new RegistryError('bad-head-seq');
-    const r = this._rec(owner); const now = this.now();
+    const r = this._get(owner);
+    if (!r) throw new RegistryError('device-not-registered');
+    const now = this.now();
     this._settle(r, now);
     if (!this._isLive(r, deviceDid)) throw new RegistryError('device-not-registered');
     if (r.headName && r.headName !== headNameHex) throw new RegistryError('head-name-mismatch');

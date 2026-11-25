@@ -144,8 +144,9 @@ test('control 9: one device maps to one owner (index enforced)', async () => {
   regNow = T0;
   const r = registry();
   await r.applyRegistration({ owner: OWNER, deviceDid: DEVICE.did, approverDid: DERIVED.registration.did, kind: 'seed' });
-  await assert.rejects(() => r.applyRegistration({ owner: 'b'.repeat(64), deviceDid: DEVICE.did,
-    approverDid: DERIVED.registration.did, kind: 'seed' }), /device-registered-elsewhere/);
+  const other = deriveFromSeed(Buffer.alloc(32, 5));
+  await assert.rejects(() => r.applyRegistration({ owner: other.owner, deviceDid: DEVICE.did,
+    approverDid: other.registration.did, kind: 'seed' }), /device-registered-elsewhere/);
 });
 
 test('control 10: head name binds to owner; status reveals epoch only', async () => {

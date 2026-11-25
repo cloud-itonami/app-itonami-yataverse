@@ -35,7 +35,7 @@ import { parseCar, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { verifyBlock } from '../../src/cid.mjs';
 import { canonicalStatement, STATEMENT_WINDOW_MS } from '../../src/e2ee-statement.mjs';
 import { verifyCacaoRegistered, ed25519PubFromDidKey, e2eeGetResource, e2eePutResource, e2eeHeadResource, e2eeHeadReadResource } from './cacao-auth.mjs';
-import { RegistryError, RECOVERY_WAIT_MS } from './e2ee-registry.mjs';
+import { RegistryError, RECOVERY_WAIT_MS, checkOwnerBinding } from './e2ee-registry.mjs';
 
 export const E2EE_PACK_PATH = /^\/awai-drive\/v1\/e2ee-packs\/([0-9a-f]{64})$/;
 export const E2EE_REGISTRY_PREFIX = '/awai-drive/v1/e2ee-registry/';
@@ -125,6 +125,12 @@ const consume = async (registry, body) => {
   } catch (e) { if (e instanceof RegistryError) return e.code; throw e; }
 };
 
+/** Owner <-> registration-key binding, checked before any used-marker. */
+function bindingError(owner, registrationDid) {
+  try { checkOwnerBinding(owner, registrationDid); return null; }
+  catch (e) { if (e instanceof RegistryError) return e.code; throw e; }
+}
+
 export async function handleE2eePack(request, id, env, store, deps) {
   const { readCapped, admitWriteRequest, admitWriteBytes, registry } = deps;
   const cors = corsHeaders(request, env);
@@ -160,6 +166,7 @@ export async function handleE2eePack(request, id, env, store, deps) {
     if (a.notFound) return notFound();
     const owner = await registry.ownerOfDevice(a.did);
     if (!owner) return notFound();
+    if (!ownerAllowlisted(env, owner)) return reply(403, { error: 'owner-not-allowlisted' });
     const bytes = await readCapped(request, cap);
     if (!bytes) return reply(413, { error: 'pack-too-large' });
     const overBytes = await admitWriteBytes(request, env, bytes.length);
@@ -172,14 +179,15 @@ export async function handleE2eePack(request, id, env, store, deps) {
     try { await registry.checkPackCapacity({ owner, sha256: id, size: bytes.length }); }
     catch (e) { const [status, code] = regError(e); return reply(status, { error: code }); }
     // Bytes first, readback second, registry record last (design §1).
+    const refund = () => registry.releaseCapacity({ owner, sha256: id }).catch(() => {});
     const put = await store.putE2eePack(id, bytes);
-    if (put.status !== 200) return reply(502, { error: `store-write-failed-${put.status}` });
+    if (put.status !== 200) { await refund(); return reply(502, { error: `store-write-failed-${put.status}` }); }
     const back = await store.getE2eePack(id);
-    if (back.status !== 200) return reply(502, { error: `readback-failed-${back.status}` });
+    if (back.status !== 200) { await refund(); return reply(502, { error: `readback-failed-${back.status}` }); }
     const again = await readCapped(back, cap);
-    if (!again || again.length !== bytes.length || sha256Hex(again) !== id) return reply(502, { error: 'readback-mismatch' });
+    if (!again || again.length !== bytes.length || sha256Hex(again) !== id) { await refund(); return reply(502, { error: 'readback-mismatch' }); }
     try { await registry.recordPack({ owner, deviceDid: a.did, sha256: id, size: bytes.length }); }
-    catch (e) { const [status, code] = regError(e); return reply(status, { error: code }); }
+    catch (e) { await refund(); const [status, code] = regError(e); return reply(status, { error: code }); }
     return reply(200, { sha256: id, bytes: bytes.length });
   }
 
@@ -189,6 +197,7 @@ export async function handleE2eePack(request, id, env, store, deps) {
     if (a.notFound) return notFound();
     const gate = await registry.canFetch({ deviceDid: a.did, sha256: id });
     if (!gate) return notFound();
+    if (!ownerAllowlisted(env, gate.owner)) return reply(403, { error: 'owner-not-allowlisted' });
     const res = await store.getE2eePack(id);
     // A registry record without bytes (interrupted PUT) cannot be read.
     if (res.status === 404) return notFound();
@@ -239,6 +248,11 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
         { op: 'register', actorDid: deviceDid, env, nowMs });
       if (bad) return stmtFail(bad);
       if (kind === 'existing-device' && !(await live(owner, approval.approverDid))) return reply(403, { error: 'approver-not-registered' });
+      // Binding before marking either statement used.
+      if (kind === 'seed') {
+        const bb = bindingError(owner, approval.approverDid);
+        if (bb) return stmtFail(bb);
+      }
       bad = await consume(registry, { statement: approval.statement, signature: approval.signature });
       if (bad) return stmtFail(bad);
       bad = await consume(registry, { statement: deviceConsent.statement, signature: deviceConsent.signature });
@@ -271,6 +285,8 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
       const registrationDid = body.statement?.actorDid;
       let bad = verifyStatementCrypto(body, { op: 'batch-revoke', actorDid: registrationDid, env, nowMs });
       if (bad) return stmtFail(bad);
+      bad = bindingError(body.owner, registrationDid);
+      if (bad) return stmtFail(bad);
       bad = await consume(registry, body);
       if (bad) return stmtFail(bad);
       return reply(200, await registry.requestBatchRevoke({ owner: body.owner, registrationDid }));
@@ -279,6 +295,8 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
       if (!ownerAllowlisted(env, body?.owner)) return reply(403, { error: 'owner-not-allowlisted' });
       const registrationDid = body.statement?.actorDid;
       let bad = verifyStatementCrypto(body, { op: 'release', actorDid: registrationDid, env, nowMs });
+      if (bad) return stmtFail(bad);
+      bad = bindingError(body.owner, registrationDid);
       if (bad) return stmtFail(bad);
       bad = await consume(registry, body);
       if (bad) return stmtFail(bad);
@@ -326,17 +344,15 @@ export async function handleE2eeHead(request, headNameHex, env, deps) {
   const owner = body.owner; const deviceDid = body.deviceDid;
   if (!owner || !deviceDid || !Number.isInteger(body.seq) || !/^[0-9a-f]{64}$/.test(String(body.headSha ?? '')))
     return reply(400, { error: 'bad-head-request' });
-  // The owner comes from the device index, never from the body.
-  const indexOwner = await registry.ownerOfDevice(deviceDid);
-  if (!indexOwner) return reply(404, { error: 'head-not-found' });
-  if (owner !== indexOwner) return reply(400, { error: 'owner-mismatch' });
-  if (!ownerAllowlisted(env, indexOwner)) return reply(403, { error: 'owner-not-allowlisted' });
-  // The registry is the ordering authority: only headSeq+1 (or an
-  // idempotent retry at headSeq) is accepted; anything else is rollback.
+  // CACAO first: the device-to-owner mapping is not enumerable without auth.
   const v = verifyCacaoRegistered(request.headers.get('authorization'),
     e2eeHeadResource(headNameHex, body.seq), env, deps);
   if (v.error) return reply(v.error[0], { error: v.error[1] });
   if (v.did !== deviceDid) return reply(401, { error: 'cacao-issuer-mismatch' });
+  // The owner comes from the device index, never from the body.
+  const indexOwner = await registry.ownerOfDevice(deviceDid);
+  if (!indexOwner || owner !== indexOwner) return reply(404, { error: 'head-not-found' });
+  if (!ownerAllowlisted(env, indexOwner)) return reply(403, { error: 'owner-not-allowlisted' });
   try {
     return reply(200, await registry.publishHead({ owner, deviceDid, seq: body.seq, headSha: body.headSha, headNameHex }));
   } catch (e) {
