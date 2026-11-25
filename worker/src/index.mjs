@@ -24,6 +24,13 @@
 //                          IPFS_READ_ORIGINS (AWAI-3472) are answered for GET/HEAD /ipfs/<cid> only.
 //   PUT|GET|HEAD|OPTIONS /awai-drive/v1/packs/<sha256>
 //                          Awai Drive encrypted snapshot packs (see drive-packs.mjs).
+//   PUT|GET|HEAD|OPTIONS /awai-drive/v1/e2ee-packs/<sha256>
+//                          Owner-scoped E2EE packs (see e2ee-packs.mjs): CACAO +
+//                          owner registry only, bytes bound before the record.
+//   POST /awai-drive/v1/e2ee-registry/register|cancel|revoke|batch-revoke
+//                          Device registration against the owner registry.
+//   POST /awai-drive/v1/e2ee-heads/<headNameHex>
+//                          Head sequence publish; the registry is the order authority.
 //   GET /health           liveness, no configuration values.
 //   GET|HEAD https://{name}{suffix}/{path}
 //                          the name plane (names.mjs): a host one label under a suffix in
@@ -56,6 +63,7 @@ import { checkWritableBlock } from '../../src/block.mjs';
 import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
 import { handleDrivePack, DRIVE_PACK_PATH } from './drive-packs.mjs';
+import { handleE2eePack, handleE2eeRegistry, handleE2eeHead, E2EE_PACK_PATH, E2EE_REGISTRY_PREFIX, E2EE_HEAD_PATH } from './e2ee-packs.mjs';
 import { admitWriteRequest, admitWriteBytes } from './write-limits.mjs';
 import { isServiceAuth, verifyServiceAuth, IMPORT_CAR_LXM } from './service-auth.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
@@ -177,6 +185,9 @@ function b2(env, deps) {
     put: (cid, bytes, digestHex) => call('PUT', cid, { body: bytes, payloadHash: digestHex,
       headers: { 'content-type': 'application/octet-stream' } }),
     getPack: (id) => call('GET', `drive-packs/${id}`),
+    getE2eePack: (id) => call('GET', `e2ee-packs/${id}`),
+    putE2eePack: (id, bytes) => call('PUT', `e2ee-packs/${id}`, { body: bytes, payloadHash: id,
+      headers: { 'content-type': 'application/octet-stream' } }),
     // Receipt records: <B2_PREFIX>receipts/by-request/<requestId hex>.
     getReceipt: (rid) => call('GET', `receipts/by-request/${rid}`),
     putReceipt: (rid, bytes) => call('PUT', `receipts/by-request/${rid}`, { body: bytes, payloadHash: hex(sha256(bytes)),
@@ -758,6 +769,19 @@ async function handleCore(request, env, deps = {}) {
   if (url.pathname.startsWith('/.well-known/')) {
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
     return wellKnown(url.pathname, env, writeLimits(env), json) ?? fail(404, 'not-found');
+  }
+  const e2eePack = E2EE_PACK_PATH.exec(url.pathname);
+  const e2eeHead = E2EE_HEAD_PATH.exec(url.pathname);
+  if (e2eePack || e2eeHead || url.pathname.startsWith(E2EE_REGISTRY_PREFIX)) {
+    try {
+      const store = b2(env, deps);
+      const shared = { readCapped, admitWriteRequest, admitWriteBytes, registry: deps.e2eeRegistry ?? null };
+      if (e2eePack) return await handleE2eePack(request, e2eePack[1], env, store, { ...shared, ...deps });
+      if (e2eeHead) return await handleE2eeHead(request, e2eeHead[1], env, { ...shared, ...deps });
+      const action = url.pathname.slice(E2EE_REGISTRY_PREFIX.length);
+      return await handleE2eeRegistry(request, action, env, store, { ...shared, readCapped });
+    }
+    catch (e) { return storeFailure(e); }
   }
   const pack = DRIVE_PACK_PATH.exec(url.pathname);
   if (pack || url.pathname.startsWith('/awai-drive/')) {

@@ -47,6 +47,13 @@
     // CORS (comma-separated) and the largest pack accepted (12 MiB, Drive's CAR bound).
     "DRIVE_ALLOWED_ORIGINS": "http://tauri.localhost,tauri://localhost",
     "DRIVE_MAX_PACK_BYTES": "12582912",
+    // Owner-scoped E2EE packs (/awai-drive/v1/e2ee-packs/<sha256>, worker/src/e2ee-packs.mjs):
+    // CACAO + owner registry only (no CACAO_WRITER_DIDS, no tenant token). The owner
+    // registry (worker/src/e2ee-registry.mjs) is designed as one Durable Object instance
+    // per owner pseudonym; NO durable_objects binding is declared here yet, so the
+    // routes answer 503 e2ee-registry-not-configured until that binding is approved
+    // and wired. Bytes live under <B2_PREFIX>e2ee-packs/<sha256>, separate from
+    // drive-packs/, so the legacy route can never serve e2ee bytes.
     // Web origins allowed by CORS on /ipfs (comma-separated, AWAI-3274): the Nagare WebView.
     // Browsers from these origins may POST /ipfs (CAR, still with a write token) and GET/HEAD
     // /ipfs/<cid>. A write with any other Origin header is refused with 403.

@@ -75,6 +75,10 @@ function mint({ privateKey, did }, { aud, domain, resources = [], ttlSec = 300, 
 /** The one resource a write CACAO names (worker/src/cacao-auth.mjs checks the same strings). */
 export const blockResource = (cid) => `yataverse:put:${cid}`;
 export const carResource = (sha256Hex) => `yataverse:car:${sha256Hex}`;
+/** Owner-scoped E2EE pack resources (worker/src/e2ee-packs.mjs; design §6). */
+export const e2eeGetResource = (sha256Hex) => `yataverse:e2ee:get:${sha256Hex}`;
+export const e2eePutResource = (sha256Hex) => `yataverse:e2ee:put:${sha256Hex}`;
+export const e2eeHeadResource = (headNameHex, seq) => `yataverse:e2ee:head:${headNameHex}:${seq}`;
 
 /** CACAO for a direct block write (`Authorization: CACAO <b64>`). */
 export const mintDirect = (key, opts) => mint(key, { ...opts, profile: 'direct' });
