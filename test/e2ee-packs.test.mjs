@@ -224,3 +224,29 @@ test('head publish + device-CACAO head read; stranger gets 404', async () => {
     { headers: { authorization: cacao(STRANGER, n, [e2eeHeadReadResource(headName)]) } }), envFor(), deps(s, r));
   assert.equal(stranger.status, 404);
 });
+
+test('null / non-object JSON bodies answer 400 everywhere (no TypeError)', async () => {
+  const { s, r } = await setup();
+  const headName = DERIVED.headNameHex;
+  for (const payload of ['null', '42', '[1]']) {
+    const headRes = await handle(new Request(`https://yataverse.com/awai-drive/v1/e2ee-heads/${headName}`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: payload }), envFor(), deps(s, r));
+    assert.equal(headRes.status, 400, `head POST with ${payload}`);
+    const regRes = await handle(new Request('https://yataverse.com/awai-drive/v1/e2ee-registry/register',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: payload }), envFor(), deps(s, r));
+    assert.equal(regRes.status, 400, `register with ${payload}`);
+  }
+});
+
+test('registry handler without deps.now uses the wall-clock default', async () => {
+  const { s, r } = await setup();
+  const { handleE2eeRegistry } = await import('../worker/src/e2ee-packs.mjs');
+  const depsNoNow = deps(s, r); delete depsNoNow.now; depsNoNow.registry = r;
+  depsNoNow.admitWriteRequest = () => null;
+  depsNoNow.readCapped = async (req) => Buffer.from(await req.arrayBuffer());
+  const res = await handleE2eeRegistry(
+    new Request('https://yataverse.com/awai-drive/v1/e2ee-registry/register',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: 'null' }),
+    'register', envFor(), null, depsNoNow);
+  assert.equal(res.status, 400, 'no TypeError without deps.now');
+});

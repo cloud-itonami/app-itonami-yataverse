@@ -225,8 +225,9 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
   if (!raw) return reply(413, { error: 'too-large' });
   let body;
   try { body = JSON.parse(raw.toString('utf8')); } catch { return reply(400, { error: 'body-not-json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return reply(400, { error: 'body-not-object' });
   const deny = (e) => { const [status, code] = regError(e); return reply(status, { error: code }); };
-  const nowMs = deps.now().getTime();
+  const nowMs = (deps.now ?? (() => new Date()))().getTime();
   const stmtFail = (bad) => reply(bad === 'bad-statement-args' ? 400 : 401, { error: bad });
   const live = async (owner, did) => (await registry.ownerOfDevice(did)) === owner;
   try {
@@ -358,6 +359,7 @@ export async function handleE2eeHead(request, headNameHex, env, deps) {
   if (!raw) return reply(413, { error: 'too-large' });
   let body;
   try { body = JSON.parse(raw.toString('utf8')); } catch { return reply(400, { error: 'body-not-json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return reply(400, { error: 'body-not-object' });
   const owner = body.owner; const deviceDid = body.deviceDid;
   if (!owner || !deviceDid || !Number.isInteger(body.seq) || !/^[0-9a-f]{64}$/.test(String(body.headSha ?? '')))
     return reply(400, { error: 'bad-head-request' });
