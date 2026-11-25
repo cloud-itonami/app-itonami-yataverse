@@ -129,7 +129,7 @@ const time = (s) => (typeof s === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d
 const STR = ['iss', 'aud', 'iat', 'nonce', 'domain', 'version', 'exp'];
 
 /**
- * Verify `Authorization: CACAO *** for one write. `resource` is what this request writes
+ * Verify `Authorization: CACAO ...` for one write. `resource` is what this request writes
  * (blockResource / carResource). -> { did } or { error: [status, code] }.
  * The writer list (CACAO_WRITER_DIDS) is checked here.
  */
