@@ -33,7 +33,7 @@ import crypto from 'node:crypto';
 import { ed25519 } from '@noble/curves/ed25519';
 import { parseCar, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { verifyBlock } from '../../src/cid.mjs';
-import { canonicalStatement } from '../../src/e2ee-statement.mjs';
+import { canonicalStatement, STATEMENT_WINDOW_MS } from '../../src/e2ee-statement.mjs';
 import { verifyCacaoRegistered, ed25519PubFromDidKey, e2eeGetResource, e2eePutResource, e2eeHeadResource, e2eeHeadReadResource } from './cacao-auth.mjs';
 import { RegistryError, RECOVERY_WAIT_MS } from './e2ee-registry.mjs';
 
@@ -69,6 +69,7 @@ const regError = (e) => {
       'head-seq-rollback': 409, 'head-seq-conflict': 409, 'head-seq-not-allocated': 409,
       'statement-expired': 401, 'statement-stale-epoch': 401, 'statement-replayed': 401,
       'device-registered-elsewhere': 409, 'batch-revoke-pending': 409, 'head-name-mismatch': 409,
+      'owner-binding-mismatch': 401, 'device-revoked-seed-only': 409,
       'too-many-pending': 429, 'registration-rate': 429, 'batch-revoke-rate': 429,
       'head-rate': 429, 'pack-count-cap': 429, 'pack-bytes-cap': 429,
     };
@@ -89,14 +90,20 @@ function statementShape(stmt) {
     && Number.isFinite(stmt.issuedAt) && Number.isFinite(stmt.expiresAt) && Number.isInteger(stmt.epoch);
 }
 
+const ARGS_COUNT = { register: 3, cancel: 1, revoke: 1, 'batch-revoke': 0, release: 1 };
+
 /**
- * Verify one signed statement (crypto first, then single-use consumption).
- * -> null on success, or an error code string.
+ * Check a statement's shape, window and signature (no consumption).
+ * Order: shape -> window -> args count -> crypto. -> null or an error code.
  */
-async function verifyStatement(body, { op, actorDid, env, registry }) {
+function verifyStatementCrypto(body, { op, actorDid, env, nowMs }) {
   const stmt = body?.statement;
   if (!statementShape(stmt) || stmt.op !== op || stmt.actorDid !== actorDid || stmt.owner !== body?.owner)
     return 'bad-statement';
+  if (stmt.issuedAt > nowMs + 30_000) return 'statement-not-yet-valid';
+  if (stmt.expiresAt <= stmt.issuedAt || stmt.expiresAt - stmt.issuedAt > STATEMENT_WINDOW_MS)
+    return 'statement-expired';
+  if (stmt.args.length !== ARGS_COUNT[op]) return 'bad-statement-args';
   const pub = ed25519PubFromDidKey(actorDid);
   if (!pub) return 'bad-statement';
   if (typeof body.signature !== 'string' || !/^[A-Za-z0-9_-]{86}$/.test(body.signature)) return 'bad-statement-signature';
@@ -107,12 +114,16 @@ async function verifyStatement(body, { op, actorDid, env, registry }) {
     issuedAt: stmt.issuedAt, expiresAt: stmt.expiresAt, epoch: stmt.epoch });
   let ok = false;
   try { ok = ed25519.verify(sig, Buffer.from(canonical, 'utf8'), pub); } catch { ok = false; }
-  if (!ok) return 'bad-statement-signature';
-  try { await registry.consumeStatement({ owner: stmt.owner, signature: body.signature,
-    expiresAt: stmt.expiresAt, epoch: stmt.epoch }); }
-  catch (e) { if (e instanceof RegistryError) return e.code; throw e; }
-  return null;
+  return ok ? null : 'bad-statement-signature';
 }
+
+const consume = async (registry, body) => {
+  try {
+    await registry.consumeStatement({ owner: body.statement.owner, signature: body.signature,
+      expiresAt: body.statement.expiresAt, epoch: body.statement.epoch });
+    return null;
+  } catch (e) { if (e instanceof RegistryError) return e.code; throw e; }
+};
 
 export async function handleE2eePack(request, id, env, store, deps) {
   const { readCapped, admitWriteRequest, admitWriteBytes, registry } = deps;
@@ -157,6 +168,9 @@ export async function handleE2eePack(request, id, env, store, deps) {
     let car;
     try { car = parseCar(bytes); } catch (e) { if (e instanceof CarError) return reply(400, { error: e.code }); throw e; }
     for (const b of car.blocks) if (!verifyBlock(b.cid, b.bytes)) return reply(400, { error: 'pack-block-does-not-hash-to-cid' });
+    // Capacity pre-check before storing bytes (re-checked exactly at record time).
+    try { await registry.checkPackCapacity({ owner, sha256: id, size: bytes.length }); }
+    catch (e) { const [status, code] = regError(e); return reply(status, { error: code }); }
     // Bytes first, readback second, registry record last (design §1).
     const put = await store.putE2eePack(id, bytes);
     if (put.status !== 200) return reply(502, { error: `store-write-failed-${put.status}` });
@@ -203,6 +217,9 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
   let body;
   try { body = JSON.parse(raw.toString('utf8')); } catch { return reply(400, { error: 'body-not-json' }); }
   const deny = (e) => { const [status, code] = regError(e); return reply(status, { error: code }); };
+  const nowMs = deps.now().getTime();
+  const stmtFail = (bad) => reply(bad === 'bad-statement-args' ? 400 : 401, { error: bad });
+  const live = async (owner, did) => (await registry.ownerOfDevice(did)) === owner;
   try {
     if (action === 'register') {
       const { owner, deviceDid, kind, approval, deviceConsent } = body ?? {};
@@ -214,41 +231,57 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
       if (!same(approval.statement, deviceConsent.statement)) return reply(401, { error: 'bad-statement' });
       const args = [deviceDid, approval.approverDid, kind];
       if (JSON.stringify(approval.statement.args) !== JSON.stringify(args)) return reply(401, { error: 'bad-statement' });
-      let bad = await verifyStatement({ ...body, statement: approval.statement, signature: approval.signature },
-        { op: 'register', actorDid: approval.approverDid, env, registry });
-      if (bad) return reply(401, { error: bad });
-      bad = await verifyStatement({ ...body, statement: deviceConsent.statement, signature: deviceConsent.signature },
-        { op: 'register', actorDid: deviceDid, env, registry });
-      if (bad) return reply(401, { error: bad });
+      // Verify both signatures, check the approver, then mark both used.
+      let bad = verifyStatementCrypto({ ...body, statement: approval.statement, signature: approval.signature },
+        { op: 'register', actorDid: approval.approverDid, env, nowMs });
+      if (bad) return stmtFail(bad);
+      bad = verifyStatementCrypto({ ...body, statement: deviceConsent.statement, signature: deviceConsent.signature },
+        { op: 'register', actorDid: deviceDid, env, nowMs });
+      if (bad) return stmtFail(bad);
+      if (kind === 'existing-device' && !(await live(owner, approval.approverDid))) return reply(403, { error: 'approver-not-registered' });
+      bad = await consume(registry, { statement: approval.statement, signature: approval.signature });
+      if (bad) return stmtFail(bad);
+      bad = await consume(registry, { statement: deviceConsent.statement, signature: deviceConsent.signature });
+      if (bad) return stmtFail(bad);
       const out = await registry.applyRegistration({ owner, deviceDid, approverDid: approval.approverDid, kind });
       return reply(200, { ...out, waitMs: RECOVERY_WAIT_MS });
     }
     if (action === 'cancel') {
       if (!ownerAllowlisted(env, body?.owner)) return reply(403, { error: 'owner-not-allowlisted' });
       const actorDid = body.statement?.actorDid;
-      const bad = await verifyStatement(body, { op: 'cancel', actorDid, env, registry });
-      if (bad) return reply(401, { error: bad });
+      let bad = verifyStatementCrypto(body, { op: 'cancel', actorDid, env, nowMs });
+      if (bad) return stmtFail(bad);
+      if (!(await live(body.owner, actorDid))) return reply(403, { error: 'actor-not-registered' });
+      bad = await consume(registry, body);
+      if (bad) return stmtFail(bad);
       return reply(200, await registry.cancelPending({ owner: body.owner, actorDid, pendingId: Number(body.statement.args[0]) }));
     }
     if (action === 'revoke') {
       if (!ownerAllowlisted(env, body?.owner)) return reply(403, { error: 'owner-not-allowlisted' });
       const actorDid = body.statement?.actorDid;
-      const bad = await verifyStatement(body, { op: 'revoke', actorDid, env, registry });
-      if (bad) return reply(401, { error: bad });
+      let bad = verifyStatementCrypto(body, { op: 'revoke', actorDid, env, nowMs });
+      if (bad) return stmtFail(bad);
+      if (!(await live(body.owner, actorDid))) return reply(403, { error: 'actor-not-registered' });
+      bad = await consume(registry, body);
+      if (bad) return stmtFail(bad);
       return reply(200, await registry.revokeDevice({ owner: body.owner, actorDid, targetDid: body.statement.args[0] }));
     }
     if (action === 'batch-revoke') {
       if (!ownerAllowlisted(env, body?.owner)) return reply(403, { error: 'owner-not-allowlisted' });
       const registrationDid = body.statement?.actorDid;
-      const bad = await verifyStatement(body, { op: 'batch-revoke', actorDid: registrationDid, env, registry });
-      if (bad) return reply(401, { error: bad });
+      let bad = verifyStatementCrypto(body, { op: 'batch-revoke', actorDid: registrationDid, env, nowMs });
+      if (bad) return stmtFail(bad);
+      bad = await consume(registry, body);
+      if (bad) return stmtFail(bad);
       return reply(200, await registry.requestBatchRevoke({ owner: body.owner, registrationDid }));
     }
     if (action === 'release') {
       if (!ownerAllowlisted(env, body?.owner)) return reply(403, { error: 'owner-not-allowlisted' });
       const registrationDid = body.statement?.actorDid;
-      const bad = await verifyStatement(body, { op: 'release', actorDid: registrationDid, env, registry });
-      if (bad) return reply(401, { error: bad });
+      let bad = verifyStatementCrypto(body, { op: 'release', actorDid: registrationDid, env, nowMs });
+      if (bad) return stmtFail(bad);
+      bad = await consume(registry, body);
+      if (bad) return stmtFail(bad);
       return reply(200, await registry.releaseDevice({ owner: body.owner, deviceDid: body.statement.args[0], registrationDid }));
     }
     return reply(404, { error: 'not-found' });
@@ -293,6 +326,11 @@ export async function handleE2eeHead(request, headNameHex, env, deps) {
   const owner = body.owner; const deviceDid = body.deviceDid;
   if (!owner || !deviceDid || !Number.isInteger(body.seq) || !/^[0-9a-f]{64}$/.test(String(body.headSha ?? '')))
     return reply(400, { error: 'bad-head-request' });
+  // The owner comes from the device index, never from the body.
+  const indexOwner = await registry.ownerOfDevice(deviceDid);
+  if (!indexOwner) return reply(404, { error: 'head-not-found' });
+  if (owner !== indexOwner) return reply(400, { error: 'owner-mismatch' });
+  if (!ownerAllowlisted(env, indexOwner)) return reply(403, { error: 'owner-not-allowlisted' });
   // The registry is the ordering authority: only headSeq+1 (or an
   // idempotent retry at headSeq) is accepted; anything else is rollback.
   const v = verifyCacaoRegistered(request.headers.get('authorization'),

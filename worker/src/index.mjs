@@ -785,7 +785,7 @@ async function handleCore(request, env, deps = {}) {
       if (e2eeStatus) return await handleE2eeStatus(request, e2eeStatus[1], env, { ...shared, ...deps });
       if (e2eeHead) return await handleE2eeHead(request, e2eeHead[1], env, { ...shared, ...deps });
       const action = url.pathname.slice(E2EE_REGISTRY_PREFIX.length);
-      return await handleE2eeRegistry(request, action, env, store, { ...shared, readCapped });
+      return await handleE2eeRegistry(request, action, env, store, { ...shared, readCapped, now: deps.now });
     }
     catch (e) { return storeFailure(e); }
   }

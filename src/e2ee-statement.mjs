@@ -11,10 +11,10 @@ import crypto from 'node:crypto';
 export const STATEMENT_VERSION = 'yataverse:e2ee:v2';
 export const STATEMENT_WINDOW_MS = 300_000;
 
-/** Length-prefixed canonical form: `<byteLen>:<value>` per field, concatenated. */
+/** Length-prefixed canonical form: version, domain, aud, op, owner, actor, args count, args, issued, expires, epoch. */
 export function canonicalStatement({ domain, aud, op, owner, actorDid, args = [], issuedAt, expiresAt, epoch }) {
   const fields = [STATEMENT_VERSION, String(domain), String(aud), String(op), String(owner), String(actorDid),
-    ...args.map(String), String(issuedAt), String(expiresAt), String(epoch)];
+    String(args.length), ...args.map(String), String(issuedAt), String(expiresAt), String(epoch)];
   return fields.map((f) => { const b = Buffer.from(f, 'utf8'); return `${b.length}:${b.toString('utf8')}`; }).join('');
 }
 

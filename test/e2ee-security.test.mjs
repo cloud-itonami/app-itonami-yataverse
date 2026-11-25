@@ -1,4 +1,4 @@
-// Negative controls for the fix design (Organizer review of 61596fe).
+// Negative controls for the signed-statement registry protocol (fake storage).
 // Each test names the hole it controls; every test in this file fails on
 // 61596fe (recorded pre-fix) and passes on the fixed head. Fake storage only.
 import test from 'node:test';
@@ -78,18 +78,24 @@ test('control 4: batch-revoke statement is single-use (replay rejected)', async 
   assert.equal((await post('batch-revoke', body, s, r)).status, 401, 'replayed batch-revoke must be 401');
 });
 
-test('control 5a: batch revoke exempts seed-registered devices, freezes existing-device adds', async () => {
+test('control 5a: batch revoke kills pre-batch terminals, exempts seed applied at-or-after request, freezes adds', async () => {
   regNow = T0;
   const r = registry();
-  const seedDev = DEVICE.did;
-  await r.applyRegistration({ owner: OWNER, deviceDid: seedDev, approverDid: DERIVED.registration.did, kind: 'seed' });
+  const oldDev = DEVICE.did;
+  await r.applyRegistration({ owner: OWNER, deviceDid: oldDev, approverDid: DERIVED.registration.did, kind: 'seed' });
+  regNow += 1000; // batch requested strictly after enrollment
   const b = await r.requestBatchRevoke({ owner: OWNER, registrationDid: DERIVED.registration.did });
   assert.equal(b.status, 'pending');
+  // A seed registration applied AFTER the batch request is exempt.
+  const fresh = keyFromSeed(newSeed()).did;
+  const p = await r.applyRegistration({ owner: OWNER, deviceDid: fresh, approverDid: DERIVED.registration.did, kind: 'seed' });
+  assert.equal(p.status, 'pending');
   // Existing-device additions are frozen while the batch is pending.
   await assert.rejects(() => r.applyRegistration({ owner: OWNER, deviceDid: keyFromSeed(newSeed()).did,
-    approverDid: seedDev, kind: 'existing-device' }), /batch-revoke-pending/);
+    approverDid: oldDev, kind: 'existing-device' }), /batch-revoke-pending/);
   regNow += RECOVERY_WAIT_MS;
-  assert.equal(await r.ownerOfDevice(seedDev), OWNER, 'seed-registered device survives its own batch revoke');
+  assert.equal(await r.ownerOfDevice(oldDev), null, 'terminal enrolled before the batch is revoked');
+  assert.equal(await r.ownerOfDevice(fresh), OWNER, 'seed applied at-or-after the request survives');
 });
 
 test('control 5b/6: existing-device registration is admitted immediately (no wait)', async () => {
@@ -167,12 +173,14 @@ test('control 12/13: non-allowlisted owner denied; rate limit fires before signa
   assert.equal(rl.status, 429, 'IP rate limit must fire before signature verification');
 });
 
-test('control 15: release operation exists for seed migration', async () => {
+test('control 15: release of the last terminal waits, then the device can migrate seeds', async () => {
   regNow = T0;
   const r = registry();
   await r.applyRegistration({ owner: OWNER, deviceDid: DEVICE.did, approverDid: DERIVED.registration.did, kind: 'seed' });
   assert.equal(typeof r.releaseDevice, 'function');
-  await r.releaseDevice({ owner: OWNER, deviceDid: DEVICE.did, registrationDid: DERIVED.registration.did });
+  const out = await r.releaseDevice({ owner: OWNER, deviceDid: DEVICE.did, registrationDid: DERIVED.registration.did });
+  assert.equal(out.status, 'pending', 'release to zero terminals waits');
+  regNow += RECOVERY_WAIT_MS;
   assert.equal(await r.ownerOfDevice(DEVICE.did), null);
   // After release the device can register under a new seed owner.
   const other = deriveFromSeed(Buffer.alloc(32, 4));

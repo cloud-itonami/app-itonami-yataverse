@@ -33,13 +33,19 @@
 // - Signed statements are single-use: consumeStatement rejects replays,
 //   expired statements and epoch-stale statements.
 
+import { ed25519PubFromDidKey } from './cacao-auth.mjs';
+import { ownerFromRegistrationPub } from '../../src/recovery-derivation.mjs';
+
 export const RECOVERY_WAIT_MS = 3 * 24 * 60 * 60 * 1000;
 export const MAX_PENDING_PER_LANE = 3;
 export const MAX_APPLICATIONS_PER_LANE_PER_HOUR = 10;
 export const MAX_BATCH_REVOKES_PER_DAY = 1;
 export const MAX_HEAD_PUBLISHES_PER_HOUR = 100;
-export const MAX_PACKS_PER_OWNER = 128;
-export const MAX_PACK_BYTES_PER_OWNER = 512 * 1024 * 1024;
+// Provisional pack caps. Assumed scale: one owner holds originals of about
+// 1.6 GiB in packs of at most 12 MiB, plus head records; 1024 packs and
+// 4 GiB total cover that with headroom. Owner to confirm.
+export const MAX_PACKS_PER_OWNER = 1024;
+export const MAX_PACK_BYTES_PER_OWNER = 4 * 1024 * 1024 * 1024;
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -57,11 +63,18 @@ function checkSha(sha) { if (!SHA_RE.test(String(sha ?? ''))) throw new Registry
 function checkDid(did) { if (!DID_RE.test(String(did ?? ''))) throw new RegistryError('bad-device-did'); }
 const within = (arr, now, window) => arr.filter((t) => t > now - window);
 
+/** Owner <-> registration-key binding: owner must equal sha256(prefix || reg pub). */
+export function checkOwnerBinding(owner, registrationDid) {
+  const pub = ed25519PubFromDidKey(registrationDid);
+  if (!pub || ownerFromRegistrationPub(pub) !== owner) throw new RegistryError('owner-binding-mismatch');
+}
+
 export class MemoryRegistry {
   constructor({ now = () => Date.now() } = {}) {
     this.now = now;
     this.owners = new Map();
     this.deviceIndex = new Map(); // deviceDid -> owner (global DeviceIndexDO shape)
+    this.usedStatements = new Map(); // sha256(signature) -> expiresAt (global; no owner record needed)
   }
 
   _rec(owner) {
@@ -69,8 +82,9 @@ export class MemoryRegistry {
     let r = this.owners.get(owner);
     if (!r) {
       r = { owner, devices: new Map(), packs: new Map(), pending: [], batchRevokes: [],
+            pendingReleases: [], pendingRevokes: [],
             headSeq: 0, headSha: null, headName: null, epoch: 0, registrationDid: null,
-            cancelsUsed: 0, nextId: 1, usedStatements: new Map(),
+            cancelsUsed: 0, nextId: 1,
             appTimes: { seed: [], existing: [] }, batchTimes: [], headTimes: [] };
       this.owners.set(owner, r);
     }
@@ -82,28 +96,45 @@ export class MemoryRegistry {
 
   _liveDevices(r) { return [...r.devices.values()].filter((d) => !d.revokedAt); }
 
-  /** Batch revokes first, then admissions; sweep single-use statements and cap windows. */
+  /** Batch revokes first, then zero-terminal ops, then admissions. */
   _settle(r, now) {
     for (const b of r.batchRevokes) {
       if (!b.appliedAt && b.effectiveAt <= now) {
         b.appliedAt = now;
         r.epoch += 1;
         r.cancelsUsed = 0;
-        // Seed-registered devices are exempt; only existing-device terminals die.
-        for (const d of r.devices.values()) if (!d.revokedAt && d.kind !== 'seed') d.revokedAt = now;
+        // Exempt only seed registrations applied at-or-after the batch request.
+        for (const d of r.devices.values()) {
+          const appliedAt = d.appliedAt ?? d.approvedAt;
+          if (!d.revokedAt && !(d.kind === 'seed' && appliedAt >= b.requestedAt)) d.revokedAt = now;
+        }
+      }
+    }
+    for (const p of r.pendingReleases) {
+      if (!p.cancelledAt && !p.doneAt && p.effectiveAt <= now) {
+        p.doneAt = now;
+        r.devices.delete(p.deviceDid);
+        for (const q of r.pending) if (q.deviceDid === p.deviceDid && !q.admittedAt) q.cancelledAt = now;
+        if (this.deviceIndex.get(p.deviceDid) === r.owner) this.deviceIndex.delete(p.deviceDid);
+      }
+    }
+    for (const p of r.pendingRevokes) {
+      if (!p.cancelledAt && !p.doneAt && p.effectiveAt <= now) {
+        p.doneAt = now;
+        const d = r.devices.get(p.targetDid);
+        if (d && !d.revokedAt) d.revokedAt = now;
       }
     }
     for (const p of r.pending) {
       if (!p.cancelledAt && !p.admittedAt && p.admitAt <= now) {
         p.admittedAt = now;
-        if (!r.devices.has(p.deviceDid)) {
-          r.devices.set(p.deviceDid, { did: p.deviceDid, approvedBy: p.approverDid, kind: p.kind,
-                                       approvedAt: now, revokedAt: 0 });
-        }
+        const old = r.devices.get(p.deviceDid);
+        // A revoked device coming back via seed gets a new generation record.
+        r.devices.set(p.deviceDid, { did: p.deviceDid, approvedBy: p.approverDid, kind: p.kind,
+          approvedAt: now, appliedAt: p.appliedAt, revokedAt: 0, generation: (old?.generation ?? 0) + 1 });
         if (p.kind === 'seed') r.cancelsUsed = 0;
       }
     }
-    for (const [h, exp] of r.usedStatements) if (exp <= now) r.usedStatements.delete(h);
     r.appTimes.seed = within(r.appTimes.seed, now, HOUR);
     r.appTimes.existing = within(r.appTimes.existing, now, HOUR);
     r.batchTimes = within(r.batchTimes, now, DAY);
@@ -121,18 +152,20 @@ export class MemoryRegistry {
 
   /**
    * Single-use statement gate (fix design §1): the HTTP layer verifies the
-   * Ed25519 signature first, then consumes here. Rejects expired, epoch-
-   * stale and replayed statements.
+   * Ed25519 signature and the actor's liveness first, then consumes here.
+   * Rejects expired, epoch-stale and replayed statements. Creates no owner
+   * record: the used list is global.
    */
   async consumeStatement({ owner, signature, expiresAt, epoch }) {
     checkOwner(owner);
-    const r = this._rec(owner); const now = this.now();
-    this._settle(r, now);
+    const now = this.now();
+    for (const [h, exp] of this.usedStatements) if (exp <= now) this.usedStatements.delete(h);
+    const current = this._get(owner)?.epoch ?? 0;
     if (!Number.isFinite(expiresAt) || expiresAt <= now) throw new RegistryError('statement-expired');
-    if (epoch !== r.epoch) throw new RegistryError('statement-stale-epoch');
+    if (epoch !== current) throw new RegistryError('statement-stale-epoch');
     const h = String(signature);
-    if (r.usedStatements.has(h)) throw new RegistryError('statement-replayed');
-    r.usedStatements.set(h, expiresAt);
+    if (this.usedStatements.has(h)) throw new RegistryError('statement-replayed');
+    this.usedStatements.set(h, expiresAt);
     return { status: 'consumed' };
   }
 
@@ -162,14 +195,17 @@ export class MemoryRegistry {
   async _applyRegistration({ owner, deviceDid, approverDid, kind }) {
     const r = this._rec(owner); const now = this.now();
     this._settle(r, now);
-    if (r.devices.has(deviceDid) && !r.devices.get(deviceDid).revokedAt) return { status: 'admitted', repeated: true };
+    const existing = r.devices.get(deviceDid);
+    if (existing && !existing.revokedAt) return { status: 'admitted', repeated: true };
     if (kind !== 'seed' && kind !== 'existing-device') throw new RegistryError('bad-registration-kind');
+    // A revoked device may only come back via a seed application (new generation).
+    if (existing?.revokedAt && kind !== 'seed') throw new RegistryError('device-revoked-seed-only');
     const lane = kind === 'seed' ? 'seed' : 'existing';
     if (r.appTimes[lane].length >= MAX_APPLICATIONS_PER_LANE_PER_HOUR) throw new RegistryError('registration-rate');
     r.appTimes[lane].push(now);
     if (kind === 'seed') {
+      checkOwnerBinding(owner, approverDid);
       if (r.registrationDid && r.registrationDid !== approverDid) throw new RegistryError('registration-key-mismatch');
-      r.registrationDid = approverDid;
       // A new seed application supersedes any pending one for the same device.
       for (const p of r.pending) if (p.deviceDid === deviceDid && !p.cancelledAt && !p.admittedAt) p.cancelledAt = now;
       const lanePending = r.pending.filter((p) => p.kind === 'seed' && !p.cancelledAt && !p.admittedAt).length;
@@ -177,11 +213,14 @@ export class MemoryRegistry {
     } else {
       if (!this._isLive(r, approverDid)) throw new RegistryError('approver-not-registered');
       if (r.batchRevokes.some((b) => !b.appliedAt)) throw new RegistryError('batch-revoke-pending');
-      r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now, revokedAt: 0 });
+      r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now,
+        appliedAt: now, revokedAt: 0, generation: (existing?.generation ?? 0) + 1 });
       return { status: 'admitted', repeated: false };
     }
     if (this._liveDevices(r).length === 0) {
-      r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now, revokedAt: 0 });
+      r.registrationDid = approverDid;
+      r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now,
+        appliedAt: now, revokedAt: 0, generation: (existing?.generation ?? 0) + 1 });
       r.cancelsUsed = 0;
       return { status: 'admitted', repeated: false };
     }
@@ -189,23 +228,26 @@ export class MemoryRegistry {
     const admitAt = now + RECOVERY_WAIT_MS;
     r.pending.push({ id, deviceDid, approverDid, kind, appliedAt: now, admitAt,
                      cancelledAt: 0, cancelledBy: null, cancellable: r.cancelsUsed < 1 });
+    // Bound only once the application exists past every check above.
+    if (!r.registrationDid) r.registrationDid = approverDid;
     return { status: 'pending', id, admitAt };
   }
 
-  /** Cancel a pending seed registration. Actor must be a live registered device; once per epoch. */
+  /** Cancel a pending registration or zero-terminal op. Actor must be live; once per epoch. */
   async cancelPending({ owner, actorDid, pendingId }) {
     checkDid(actorDid);
     const r = this._rec(owner); const now = this.now();
     this._settle(r, now);
     if (!this._isLive(r, actorDid)) throw new RegistryError('actor-not-registered');
-    const p = r.pending.find((x) => x.id === pendingId);
-    if (!p || p.cancelledAt || p.admittedAt) throw new RegistryError('pending-not-found');
+    const p = [...r.pending, ...r.pendingReleases, ...r.pendingRevokes].find((x) => x.id === pendingId);
+    if (!p || p.cancelledAt || p.admittedAt || p.doneAt) throw new RegistryError('pending-not-found');
     if (!p.cancellable || r.cancelsUsed >= 1) throw new RegistryError('pending-not-cancellable');
     p.cancelledAt = now; p.cancelledBy = actorDid; r.cancelsUsed += 1;
     return { status: 'cancelled', id: p.id };
   }
 
-  /** Single-device revoke by a live registered device: immediate (registry read). */
+  /** Single-device revoke by a live registered device. Revoking the last live
+   *  terminal defers by the wait (same rule as release-to-zero). */
   async revokeDevice({ owner, actorDid, targetDid }) {
     checkDid(actorDid); checkDid(targetDid);
     const r = this._rec(owner); const now = this.now();
@@ -213,6 +255,13 @@ export class MemoryRegistry {
     if (!this._isLive(r, actorDid)) throw new RegistryError('actor-not-registered');
     const t = r.devices.get(targetDid);
     if (!t || t.revokedAt) throw new RegistryError('device-not-found');
+    if (this._liveDevices(r).length === 1) {
+      const id = r.nextId++;
+      const effectiveAt = now + RECOVERY_WAIT_MS;
+      r.pendingRevokes.push({ id, targetDid, doneAt: 0, effectiveAt, requestedAt: now,
+                              cancelledAt: 0, cancelledBy: null, cancellable: r.cancelsUsed < 1 });
+      return { status: 'pending', id, effectiveAt };
+    }
     t.revokedAt = now;
     return { status: 'revoked', did: targetDid, revokedAt: now };
   }
@@ -224,6 +273,7 @@ export class MemoryRegistry {
    */
   async requestBatchRevoke({ owner, registrationDid }) {
     checkDid(registrationDid);
+    checkOwnerBinding(owner, registrationDid);
     const r = this._rec(owner); const now = this.now();
     this._settle(r, now);
     if (!r.registrationDid || r.registrationDid !== registrationDid) throw new RegistryError('registration-key-mismatch');
@@ -235,16 +285,39 @@ export class MemoryRegistry {
     return { status: 'pending', id, effectiveAt };
   }
 
-  /** Release a device from this owner (registration-key signed; seed migration). */
+  /** Release a device from this owner (registration-key signed; seed migration).
+   *  Releasing the last live terminal defers by the wait (same rule as revoke-to-zero). */
   async releaseDevice({ owner, deviceDid, registrationDid }) {
     checkDid(deviceDid); checkDid(registrationDid);
-    const r = this._rec(owner);
+    checkOwnerBinding(owner, registrationDid);
+    const r = this._rec(owner); const now = this.now();
+    this._settle(r, now);
     if (!r.registrationDid || r.registrationDid !== registrationDid) throw new RegistryError('registration-key-mismatch');
     if (!r.devices.has(deviceDid)) throw new RegistryError('device-not-found');
+    if (this._liveDevices(r).length === 1 && !r.devices.get(deviceDid).revokedAt) {
+      const id = r.nextId++;
+      const effectiveAt = now + RECOVERY_WAIT_MS;
+      r.pendingReleases.push({ id, deviceDid, doneAt: 0, effectiveAt, requestedAt: now,
+                               cancelledAt: 0, cancelledBy: null, cancellable: r.cancelsUsed < 1 });
+      return { status: 'pending', id, effectiveAt };
+    }
     r.devices.delete(deviceDid);
     for (const p of r.pending) if (p.deviceDid === deviceDid && !p.admittedAt) p.cancelledAt = this.now();
     if (this.deviceIndex.get(deviceDid) === owner) this.deviceIndex.delete(deviceDid);
     return { status: 'released', did: deviceDid };
+  }
+
+  /** Capacity pre-check for a pack PUT: call before storing bytes. */
+  async checkPackCapacity({ owner, sha256, size }) {
+    checkSha(sha256);
+    const r = this._rec(owner);
+    this._settle(r, this.now());
+    if (r.packs.has(sha256)) return { status: 'ok' };
+    if (r.packs.size >= MAX_PACKS_PER_OWNER) throw new RegistryError('pack-count-cap');
+    let total = size;
+    for (const p of r.packs.values()) total += p.size;
+    if (total > MAX_PACK_BYTES_PER_OWNER) throw new RegistryError('pack-bytes-cap');
+    return { status: 'ok' };
   }
 
   /** Create the pack record. Called only after bytes + readback verify. */
