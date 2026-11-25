@@ -30,9 +30,9 @@
 //   implemented here.
 import crypto from 'node:crypto';
 import { ed25519 } from '@noble/curves/ed25519';
-import { siweMessage, blockResource, carResource } from '../../src/cacao.mjs';
+import { siweMessage, blockResource, carResource, e2eeGetResource, e2eePutResource, e2eeHeadResource, e2eeHeadReadResource } from '../../src/cacao.mjs';
 
-export { blockResource, carResource };
+export { blockResource, carResource, e2eeGetResource, e2eePutResource, e2eeHeadResource, e2eeHeadReadResource };
 
 export const NONCE_TTL_S = 120;
 export const MAX_LIFETIME_S = 300;
@@ -44,6 +44,9 @@ const HEADER = /^CACAO ([A-Za-z0-9+/]{16,}={0,2})$/;
 export const isCacao = (authorization) => typeof authorization === 'string' && authorization.startsWith('CACAO ');
 
 const configured = (env) => Boolean(env.CACAO_NONCE_SECRET && env.CACAO_AUD && env.CACAO_DOMAIN && env.CACAO_WRITER_DIDS);
+// Registry-alone routes (owner-scoped E2EE packs) do not use CACAO_WRITER_DIDS:
+// the owner registry is the authority, so the writer list is not required here.
+const configuredRegistered = (env) => Boolean(env.CACAO_NONCE_SECRET && env.CACAO_AUD && env.CACAO_DOMAIN);
 const b64url = (buf) => Buffer.from(buf).toString('base64url');
 const mac = (env, text) => crypto.createHmac('sha256', String(env.CACAO_NONCE_SECRET)).update(text).digest();
 
@@ -119,6 +122,8 @@ function ed25519FromDidKey(did) {
   if (bytes.length !== 34 || bytes[0] !== 0xed || bytes[1] !== 0x01) return null;
   return bytes.subarray(2);
 }
+/** The ed25519 public key behind a did:key, or null (used to verify registration signatures). */
+export function ed25519PubFromDidKey(did) { return ed25519FromDidKey(did); }
 
 const time = (s) => (typeof s === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(s) ? Date.parse(s) : NaN);
 const STR = ['iss', 'aud', 'iat', 'nonce', 'domain', 'version', 'exp'];
@@ -126,9 +131,20 @@ const STR = ['iss', 'aud', 'iat', 'nonce', 'domain', 'version', 'exp'];
 /**
  * Verify `Authorization: CACAO ...` for one write. `resource` is what this request writes
  * (blockResource / carResource). -> { did } or { error: [status, code] }.
+ * The writer list (CACAO_WRITER_DIDS) is checked here.
  */
 export function verifyCacao(authorization, resource, env, deps) {
-  if (!configured(env)) return { error: [503, 'cacao-not-configured'] };
+  return verifyCacaoImpl(authorization, resource, env, deps, true);
+}
+/**
+ * Same envelope checks as verifyCacao, but without the writer list: the owner
+ * registry is the authority. Used by the owner-scoped E2EE pack routes.
+ */
+export function verifyCacaoRegistered(authorization, resource, env, deps) {
+  return verifyCacaoImpl(authorization, resource, env, deps, false);
+}
+function verifyCacaoImpl(authorization, resource, env, deps, checkWriter) {
+  if (!(checkWriter ? configured(env) : configuredRegistered(env))) return { error: [503, 'cacao-not-configured'] };
   const deny = (code, status = 401) => ({ error: [status, code] });
   if (typeof authorization !== 'string' || authorization.length > MAX_HEADER_CHARS) return deny('cacao-malformed');
   const h = HEADER.exec(authorization);
@@ -157,8 +173,10 @@ export function verifyCacao(authorization, resource, env, deps) {
   const bad = nonceProblem(p.nonce, env, now);
   if (bad) return deny(bad);
   if (p.resources.length !== 1 || p.resources[0] !== resource) return deny('cacao-resource-does-not-match-this-write', 403);
-  const writers = String(env.CACAO_WRITER_DIDS).split(',').map((x) => x.trim()).filter(Boolean);
-  if (!writers.includes(p.iss)) return deny('cacao-writer-not-allowed', 403);
+  if (checkWriter) {
+    const writers = String(env.CACAO_WRITER_DIDS).split(',').map((x) => x.trim()).filter(Boolean);
+    if (!writers.includes(p.iss)) return deny('cacao-writer-not-allowed', 403);
+  }
   return { did: p.iss };
 }
 
