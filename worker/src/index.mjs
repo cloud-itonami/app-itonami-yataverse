@@ -23,7 +23,12 @@
 //                          POST on /ipfs, GET/HEAD on /ipfs/<cid>. Block PUT stays non-browser.
 //                          IPFS_READ_ORIGINS (AWAI-3472) are answered for GET/HEAD /ipfs/<cid> only.
 //   PUT|GET|HEAD|OPTIONS /awai-drive/v1/packs/<sha256>
-//                          Awai Drive encrypted snapshot packs (see drive-packs.mjs).
+//                          Awai Drive encrypted snapshot packs (see drive-packs.mjs). No
+//                          authentication (owner decision 2026-11-18); plain packs only.
+//   PUT|GET|HEAD|OPTIONS /awai-drive/v1/e2ee-packs/<sha256>
+//                          Same protocol / same handler for E2EE ciphertext only (item 216).
+//                          Requires a tenant Bearer token (DRIVE_E2EE_TOKEN_SHA256); separate
+//                          store namespace (e2ee-packs/), keys never server-side.
 //   GET /health           liveness, no configuration values.
 //   GET|HEAD https://{name}{suffix}/{path}
 //                          the name plane (names.mjs): a host one label under a suffix in
@@ -55,7 +60,7 @@ import { cidFromBytes, base32 } from '../../src/cid.mjs';
 import { checkWritableBlock } from '../../src/block.mjs';
 import { parseCar, encodeCarV1, CarError, CAR_CONTENT_TYPE } from '../../src/car.mjs';
 import { checkClosure, collectDag, DagError } from '../../src/dag.mjs';
-import { handleDrivePack, DRIVE_PACK_PATH } from './drive-packs.mjs';
+import { handleDrivePack, handleDriveE2eePack, DRIVE_PACK_PATH, DRIVE_E2EE_PACK_PATH } from './drive-packs.mjs';
 import { admitWriteRequest, admitWriteBytes } from './write-limits.mjs';
 import { isServiceAuth, verifyServiceAuth, IMPORT_CAR_LXM } from './service-auth.mjs';
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
@@ -177,11 +182,16 @@ function b2(env, deps) {
     put: (cid, bytes, digestHex) => call('PUT', cid, { body: bytes, payloadHash: digestHex,
       headers: { 'content-type': 'application/octet-stream' } }),
     getPack: (id) => call('GET', `drive-packs/${id}`),
+    // E2EE packs live in their own namespace: the plaintext route and the E2EE route can
+    // never answer for each other's bytes (worker/src/drive-packs.mjs, item 216).
+    getE2eePack: (id) => call('GET', `e2ee-packs/${id}`),
     // Receipt records: <B2_PREFIX>receipts/by-request/<requestId hex>.
     getReceipt: (rid) => call('GET', `receipts/by-request/${rid}`),
     putReceipt: (rid, bytes) => call('PUT', `receipts/by-request/${rid}`, { body: bytes, payloadHash: hex(sha256(bytes)),
       headers: { 'content-type': 'application/vnd.ipld.dag-cbor' } }),
     putPack: (id, bytes) => call('PUT', `drive-packs/${id}`, { body: bytes, payloadHash: id,
+      headers: { 'content-type': 'application/octet-stream' } }),
+    putE2eePack: (id, bytes) => call('PUT', `e2ee-packs/${id}`, { body: bytes, payloadHash: id,
       headers: { 'content-type': 'application/octet-stream' } }),
   };
 }
@@ -758,6 +768,14 @@ async function handleCore(request, env, deps = {}) {
   if (url.pathname.startsWith('/.well-known/')) {
     if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'method-not-allowed', { allow: 'GET, HEAD' });
     return wellKnown(url.pathname, env, writeLimits(env), json) ?? fail(404, 'not-found');
+  }
+  const e2eePack = DRIVE_E2EE_PACK_PATH.exec(url.pathname);
+  if (e2eePack) {
+    try {
+      const store = b2(env, deps);
+      return await handleDriveE2eePack(request, e2eePack[1], env, store, { readCapped, admitWriteRequest, admitWriteBytes, receipts: store && receiptOps(env, deps, store), requestIdOf });
+    }
+    catch (e) { return storeFailure(e); }
   }
   const pack = DRIVE_PACK_PATH.exec(url.pathname);
   if (pack || url.pathname.startsWith('/awai-drive/')) {

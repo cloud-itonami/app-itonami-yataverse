@@ -11,6 +11,9 @@
   //   wrangler secret put B2_KEY_ID            an application key scoped to that bucket
   //   wrangler secret put B2_APP_KEY
   //   wrangler secret put WRITE_TOKEN_SHA256   comma-separated SHA-256 hex of write tokens
+  //   wrangler secret put DRIVE_E2EE_TOKEN_SHA256  comma-separated SHA-256 hex of tenant Bearer
+  //                                            tokens for /awai-drive/v1/e2ee-packs/* (item 216).
+  //                                            Unset: the E2EE route answers 503, never open.
   //   wrangler secret put RECEIPT_SIGNING_KEY  Ed25519 private JWK {kty, crv, d, x} (AWAI-3305).
   //                                            Its keyId must be in RECEIPT_PUBLIC_KEYS below, or
   //                                            writes fail closed with 503.

@@ -95,3 +95,49 @@ export async function handleDrivePack(request, id, env, store, { readCapped, adm
   }
   return reply(405, { error: 'method-not-allowed' }, { allow: 'GET, HEAD, PUT, OPTIONS' });
 }
+
+// --- E2EE packs (item 216): the same protocol, but only for callers who present a tenant
+// Bearer token. The plaintext route above (owner decision 2026-11-18) is unchanged: anything
+// that is not E2EE ciphertext stays on /awai-drive/v1/packs/<sha256> with no authentication.
+// The two namespaces are separated by path AND by store key (e2ee-packs/<sha256> vs
+// drive-packs/<sha256>), so a pack written to one never answers on the other. Decryption keys
+// never reach this server: the ciphertext is E2EE by assumption and the server only checks the
+// pack's shape, exactly as for plaintext packs.
+//
+// Auth: env.DRIVE_E2EE_TOKEN_SHA256 is a comma-separated list of SHA-256 hex digests of tenant
+// Bearer tokens (same shape as WRITE_TOKEN_SHA256). Unset/empty fails closed with
+// 503 e2ee-packs-not-configured rather than silently serving unauthenticated. OPTIONS preflight
+// is answered without credentials (as on the plaintext route) so browsers can negotiate CORS;
+// GET/HEAD/PUT all require the token.
+export const DRIVE_E2EE_PACK_PATH = /^\/awai-drive\/v1\/e2ee-packs\/([a-f0-9]{64})$/;
+
+function e2eeTokenAllowed(authorization, configured) {
+  const m = /^Bearer ([\x21-\x7e]{16,512})$/.exec(authorization ?? '');
+  if (!m || !configured) return false;
+  const got = crypto.createHash('sha256').update(m[1]).digest();
+  let ok = false;
+  for (const h of String(configured).split(',').map((s) => s.trim().toLowerCase())) {
+    if (!/^[0-9a-f]{64}$/.test(h)) continue;
+    if (crypto.timingSafeEqual(got, Buffer.from(h, 'hex'))) ok = true;
+  }
+  return ok;
+}
+
+export async function handleDriveE2eePack(request, id, env, store, deps) {
+  if (request.method !== 'OPTIONS') {
+    if (!store) return new Response(JSON.stringify({ error: 'store-not-configured' }),
+      { status: 503, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
+    if (!id) return new Response(JSON.stringify({ error: 'not-found' }),
+      { status: 404, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
+    if (!env.DRIVE_E2EE_TOKEN_SHA256) return new Response(JSON.stringify({ error: 'e2ee-packs-not-configured' }),
+      { status: 503, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
+    if (!e2eeTokenAllowed(request.headers.get('authorization'), env.DRIVE_E2EE_TOKEN_SHA256))
+      return new Response(JSON.stringify({ error: 'unauthorized' }),
+        { status: 401, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', 'www-authenticate': 'Bearer' } });
+  }
+  // Reuse the plaintext pack handler verbatim; only the store namespace differs.
+  const e2eeStore = { ...store,
+    getPack: (packId) => store.getE2eePack(packId),
+    putPack: (packId, bytes) => store.putE2eePack(packId, bytes) };
+  return handleDrivePack(request, id, env, e2eeStore, deps);
+}

@@ -111,3 +111,66 @@ test('downloads: 404 when absent, 502 when the stored pack does not hash to its 
   assert.equal((await handle(new Request('https://yataverse.com/awai-drive/v1/packs/NOTHEX'), ENV, deps(s))).status, 404);
   assert.equal((await handle(new Request(url(id), { method: 'DELETE' }), ENV, deps(s))).status, 405);
 });
+
+// --- E2EE packs (item 216): tenant Bearer required, separate store namespace, plaintext route
+// untouched. Stub only: the in-memory fakeStore, no network.
+const E2EE_TOKEN = 'tenant-e2ee-token-0123456789abcdef';
+const e2eeUrl = (id) => `https://yataverse.com/awai-drive/v1/e2ee-packs/${id}`;
+const e2eeEnv = (extra = {}) => ({ ...ENV, DRIVE_E2EE_TOKEN_SHA256: sha(E2EE_TOKEN), ...extra });
+const e2eePut = (bytes, id = sha(bytes), token = E2EE_TOKEN) => new Request(e2eeUrl(id), { method: 'PUT', body: bytes,
+  headers: { origin: DRIVE_ORIGIN, 'Content-Type': 'application/vnd.ipld.car',
+    ...(token ? { authorization: `Bearer ${token}` } : {}) } });
+const e2eeGet = (id, token = E2EE_TOKEN) => new Request(e2eeUrl(id), { headers: { origin: DRIVE_ORIGIN,
+  ...(token ? { authorization: `Bearer ${token}` } : {}) } });
+
+test('E2EE packs: PUT/GET without a tenant token are 401, with a wrong token are 401', async () => {
+  const s = fakeStore(); const bytes = fixture('drive-v1.car'); const id = sha(bytes);
+  for (const req of [e2eePut(bytes, id, null), e2eePut(bytes, id, 'wrong-token-abcdefghijklmnop'),
+                     e2eeGet(id, null), e2eeGet(id, 'wrong-token-abcdefghijklmnop')]) {
+    const res = await handle(req, e2eeEnv(), deps(s));
+    assert.equal(res.status, 401);
+    assert.equal((await res.json()).error, 'unauthorized');
+    assert.equal(res.headers.get('www-authenticate'), 'Bearer');
+  }
+  assert.equal(dataKeys(s).length, 0, 'nothing stored without a token');
+});
+
+test('E2EE packs: unconfigured route fails closed with 503, never serves open', async () => {
+  const s = fakeStore(); const id = sha(fixture('drive-v1.car'));
+  const get = await handle(e2eeGet(id), ENV, deps(s));  // no DRIVE_E2EE_TOKEN_SHA256 in ENV
+  assert.equal(get.status, 503); assert.equal((await get.json()).error, 'e2ee-packs-not-configured');
+  const put = await handle(e2eePut(fixture('drive-v1.car')), ENV, deps(s));
+  assert.equal(put.status, 503);
+  assert.equal(dataKeys(s).length, 0);
+});
+
+test('E2EE packs: token round trip, stored under e2ee-packs/ and invisible on the plaintext route', async () => {
+  const s = fakeStore(); const bytes = fixture('drive-v1.car'); const id = sha(bytes);
+  const put = await handle(e2eePut(bytes), e2eeEnv(), deps(s));
+  assert.equal(put.status, 200);
+  await driveReceipt(put, id, bytes.length);
+  assert.ok(s.objects.has(`ipld/e2ee-packs/${id}`), 'E2EE bytes live in the e2ee namespace');
+  assert.ok(!s.objects.has(`ipld/drive-packs/${id}`), 'and NOT in the plaintext namespace');
+  const get = await handle(e2eeGet(id), e2eeEnv(), deps(s));
+  assert.equal(get.status, 200);
+  assert.equal(sha(Buffer.from(await get.arrayBuffer())), id);
+  // Namespace separation the other way: the plaintext route cannot see the E2EE pack,
+  // and the E2EE route cannot see a plaintext pack.
+  assert.equal((await handle(driveGet(id), e2eeEnv(), deps(s))).status, 404);
+  const s2 = fakeStore();
+  assert.equal((await handle(drivePut(bytes), e2eeEnv(), deps(s2))).status, 200);
+  assert.equal((await handle(e2eeGet(id), e2eeEnv(), deps(s2))).status, 404);
+});
+
+test('E2EE packs: CORS preflight needs no token (browser negotiation), like the plaintext route', async () => {
+  const s = fakeStore(); const id = sha(fixture('drive-v1.car'));
+  const pre = await handle(new Request(e2eeUrl(id), { method: 'OPTIONS',
+    headers: { origin: DRIVE_ORIGIN, 'access-control-request-method': 'PUT', 'access-control-request-headers': 'content-type, authorization' } }), e2eeEnv(), deps(s));
+  assert.equal(pre.status, 204);
+  assert.equal(pre.headers.get('access-control-allow-origin'), DRIVE_ORIGIN);
+});
+
+test('E2EE packs: unknown id under the e2ee path is 404, not the plaintext handler', async () => {
+  const s = fakeStore();
+  assert.equal((await handle(new Request('https://yataverse.com/awai-drive/v1/e2ee-packs/NOTHEX'), e2eeEnv(), deps(s))).status, 404);
+});
