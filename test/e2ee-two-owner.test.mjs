@@ -48,6 +48,26 @@ test('post-batch-revoke restore works without an extra read (idx scenario)', asy
   assert.equal(r.deviceIndex.get(X.did), A.owner);
 });
 
+test('double release is a no-op and never leaves index debris', async () => {
+  now = 1_700_000_000_000;
+  const r = reg();
+  await r.applyRegistration({ owner: A.owner, deviceDid: X.did, approverDid: A.registration.did, kind: 'seed' });
+  const rel1 = await r.releaseDevice({ owner: A.owner, deviceDid: X.did, registrationDid: A.registration.did });
+  assert.equal(rel1.status, 'pending');
+  now += RECOVERY_WAIT_MS + 1; // release becomes effective: X is dead but tombstoned
+  const Y = keyFromSeed(Buffer.alloc(32, 9));
+  await r.applyRegistration({ owner: A.owner, deviceDid: Y.did, approverDid: A.registration.did, kind: 'seed' });
+  // A seed application for the same device while another terminal is live.
+  const p = await r.applyRegistration({ owner: A.owner, deviceDid: X.did, approverDid: A.registration.did, kind: 'seed' });
+  assert.equal(p.status, 'pending');
+  // Releasing again must not duplicate the pending release or cancel the application via a second path.
+  const rel2 = await r.releaseDevice({ owner: A.owner, deviceDid: X.did, registrationDid: A.registration.did });
+  assert.equal(rel2.status, 'already-released', 'second release is a no-op');
+  // Cancelling the seed application frees the index exactly once.
+  await r.cancelPending({ owner: A.owner, actorDid: Y.did, pendingId: p.id });
+  assert.ok(!r.deviceIndex.has(X.did), 'index must be clean after cancel');
+});
+
 test('two owners randomized: one device lives under at most one owner', async () => {
   function mulberry32(a) {
     return () => {

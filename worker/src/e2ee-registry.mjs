@@ -395,6 +395,8 @@ export class MemoryRegistry {
     if (!this._isLive(r, actorDid)) throw new RegistryError('actor-not-registered');
     const t = r.devices.get(targetDid);
     if (!t || t.revokedAt || t.released) throw new RegistryError('device-not-found');
+    const dupRevoke = r.pendingRevokes.find((p) => p.targetDid === targetDid && !p.doneAt && !p.cancelledAt);
+    if (dupRevoke) return { status: 'pending', id: dupRevoke.id, effectiveAt: dupRevoke.effectiveAt };
     // Delete-on-revoke only for a live target; others keep their applications.
     for (const p of r.pending) if (p.deviceDid === targetDid && !p.admittedAt) this._cancelApplication(r, p, now);
     if (this._liveDevices(r).length === 1) {
@@ -441,6 +443,11 @@ export class MemoryRegistry {
     this._settle(r, now);
     if (!r.registrationDid || r.registrationDid !== registrationDid) throw new RegistryError('registration-key-mismatch');
     if (!r.devices.has(deviceDid)) throw new RegistryError('device-not-found');
+    // Releasing a dead terminal is an idempotent no-op.
+    const cur = r.devices.get(deviceDid);
+    if (cur.released) return { status: 'already-released', did: deviceDid };
+    const dupRelease = r.pendingReleases.find((p) => p.deviceDid === deviceDid && !p.doneAt && !p.cancelledAt);
+    if (dupRelease) return { status: 'pending', id: dupRelease.id, effectiveAt: dupRelease.effectiveAt };
     for (const p of [...r.pending]) if (p.deviceDid === deviceDid && !p.admittedAt) this._cancelApplication(r, p, now);
     if (this._liveDevices(r).length === 1 && !r.devices.get(deviceDid).revokedAt) {
       const id = r.nextId++;
