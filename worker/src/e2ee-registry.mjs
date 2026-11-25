@@ -174,6 +174,8 @@ export class MemoryRegistry {
         r.devices.set(p.deviceDid, { did: p.deviceDid, approvedBy: p.approverDid, kind: p.kind,
           approvedAt: e.t, appliedAt: p.appliedAt, revokedAt: 0, released: false, releasedAt: 0,
           generation: (old?.generation ?? 0) + 1 });
+        // Admission always (re)claims the index: an earlier cancel may have freed it.
+        if (!this.deviceIndex.has(p.deviceDid)) this.deviceIndex.set(p.deviceDid, r.owner);
         if (p.kind === 'seed') r.cancelsUsed = 0;
       }
     }
@@ -234,6 +236,9 @@ export class MemoryRegistry {
     if (kind !== 'seed' && kind !== 'existing-device') throw new RegistryError('bad-registration-kind');
     // An existing-device application for an unknown owner fails before any record.
     if (kind === 'existing-device' && !this._get(owner)) throw new RegistryError('approver-not-registered');
+    // Settle first: a due batch/revoke may free the index before the claim decision.
+    const prior = this._get(owner);
+    if (prior) this._settle(prior, this.now());
     const mapped = this.deviceIndex.get(deviceDid);
     if (mapped && mapped !== owner) throw new RegistryError('device-registered-elsewhere');
     const claimed = !mapped;
@@ -250,22 +255,27 @@ export class MemoryRegistry {
     const r = this._rec(owner); const now = this.now();
     this._settle(r, now);
     const existing = r.devices.get(deviceDid);
+    // Permission first, even for already-registered terminals.
+    if (kind === 'existing-device') {
+      if (!this._isLive(r, approverDid)) throw new RegistryError('approver-not-registered');
+      if (r.batchRevokes.some((b) => !b.appliedAt)) throw new RegistryError('batch-revoke-pending');
+    }
     if (existing && !existing.revokedAt && !existing.released) return { status: 'admitted', repeated: true };
     // A revoked/released device may only come back via a seed application (new generation).
     if ((existing?.revokedAt || existing?.released) && kind !== 'seed') throw new RegistryError('device-revoked-seed-only');
     const lane = kind === 'seed' ? 'seed' : 'existing';
     if (r.appTimes[lane].length >= MAX_APPLICATIONS_PER_LANE_PER_HOUR) throw new RegistryError('registration-rate');
-    r.appTimes[lane].push(now);
     if (kind === 'seed') {
       checkOwnerBinding(owner, approverDid);
       if (r.registrationDid && r.registrationDid !== approverDid) throw new RegistryError('registration-key-mismatch');
       // A new seed application supersedes any pending one for the same device.
-      for (const p of r.pending) if (p.deviceDid === deviceDid && !p.cancelledAt && !p.admittedAt) p.cancelledAt = now;
+      for (const p of r.pending) if (p.deviceDid === deviceDid && !p.cancelledAt && !p.admittedAt) this._cancelApplication(r, p, now);
       const lanePending = r.pending.filter((p) => p.kind === 'seed' && !p.cancelledAt && !p.admittedAt).length;
       if (lanePending >= MAX_PENDING_PER_LANE) throw new RegistryError('too-many-pending');
-    } else {
-      if (!this._isLive(r, approverDid)) throw new RegistryError('approver-not-registered');
-      if (r.batchRevokes.some((b) => !b.appliedAt)) throw new RegistryError('batch-revoke-pending');
+    }
+    // Count only applications that passed every validation.
+    r.appTimes[lane].push(now);
+    if (kind === 'existing-device') {
       r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now,
         appliedAt: now, revokedAt: 0, released: false, releasedAt: 0, generation: (existing?.generation ?? 0) + 1 });
       // Entry via this path ends any other application for the device.
@@ -276,6 +286,7 @@ export class MemoryRegistry {
       r.registrationDid = approverDid;
       r.devices.set(deviceDid, { did: deviceDid, approvedBy: approverDid, kind, approvedAt: now,
         appliedAt: now, revokedAt: 0, released: false, releasedAt: 0, generation: (existing?.generation ?? 0) + 1 });
+      if (!this.deviceIndex.has(deviceDid)) this.deviceIndex.set(deviceDid, owner);
       r.cancelsUsed = 0;
       return { status: 'admitted', repeated: false };
     }

@@ -329,6 +329,7 @@ export async function handleE2eeHead(request, headNameHex, env, deps) {
     if (v.error) return reply(v.error[0], { error: v.error[1] });
     const owner = await registry.ownerOfDevice(v.did);
     if (!owner) return reply(404, { error: 'head-not-found' });
+    if (!ownerAllowlisted(env, owner)) return reply(403, { error: 'owner-not-allowlisted' });
     const head = await registry.getHead({ owner });
     if (!head || head.headName !== headNameHex) return reply(404, { error: 'head-not-found' });
     return reply(200, head);
