@@ -216,8 +216,9 @@ function exhaustiveActions(w) {
     const ing = ow._intent(EX_TID);
     const rec = ow.core.get(o.owner);
     const live = rec ? Boolean(ow.core.isLive(rec, EX_TID)) : false;
+    const plans = ow.storage.get(`seq/${EX_TID}`) ?? 0; // do-model scope: 2 plans
     const tag = o.owner.slice(0, 4);
-    if (!ing) add(`begin ${tag}`, (c) => c.owners.get(o.owner).beginRegistration({
+    if (!ing && plans < 2) add(`begin ${tag}`, (c) => c.owners.get(o.owner).beginRegistration({
       owner: o.owner, deviceDid: EX_TID, approverDid: o.registration.did, kind: 'seed', transport: c.transport }));
     if (ing) {
       add(`claim ${tag}`, (c) => c.claim(o.owner, EX_TID, c.owners.get(o.owner)._intent(EX_TID)));
