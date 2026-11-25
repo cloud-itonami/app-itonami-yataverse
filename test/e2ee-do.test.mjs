@@ -56,7 +56,7 @@ class World {
     this.claims = [];         // every claim ever sent (for late/replayed arrival)
     this.redeliveryErrors = []; // an accepted claim whose identical retry failed
     for (const o of [A, B]) {
-      this.owners.set(o.owner, new OwnerRegistryDO(new MapStorage(), { owner: o.owner, now: () => this.now, transport: this.transport }));
+      this.owners.set(o.owner, new OwnerRegistryDO(new MapStorage(), { owner: o.owner, now: () => this.now, transport: this.transport, testPhases: true }));
     }
   }
   reg(o, t) {
@@ -65,11 +65,13 @@ class World {
   }
   claim(owner, tid, intent) {
     const key = `${owner}/${intent.generation}`;
+    const pair = { owner, deviceDid: tid, generation: intent.generation, seq: intent.seq,
+      incarnation: intent.incarnation, transport: this.transport };
     try {
-      this.transport.claim(tid, owner, intent.generation, intent.seq, intent.incarnation);
+      this.owners.get(owner).claimRegistration(pair);
       this.acks.set(key, 'ok');
       // The design promises an idempotent retry of the same pair while held.
-      try { this.transport.claim(tid, owner, intent.generation, intent.seq, intent.incarnation); }
+      try { this.owners.get(owner).claimRegistration(pair); }
       catch (e) { this.redeliveryErrors.push(e.code ?? e.message); }
     } catch (e) { this.acks.set(key, e.code ?? e.message); }
     const row = { owner, tid, gen: intent.generation, seq: intent.seq, inc: intent.incarnation };
@@ -141,7 +143,7 @@ class World {
       return [k, idx];
     }));
     w.owners = new Map([...this.owners.entries()].map(([k, v]) => {
-      const o = new OwnerRegistryDO(new MapStorage(), { owner: k, now: () => w.now, transport: w.transport });
+      const o = new OwnerRegistryDO(new MapStorage(), { owner: k, now: () => w.now, transport: w.transport, testPhases: true });
       o.storage.m = new Map(structuredClone([...v.storage.m.entries()]));
       o._load();
       return [k, o];
@@ -255,20 +257,30 @@ function exploreExhaustive({ cap = Number(process.env.EX_CAP ?? 0) || 120_000, r
   try {
     const init = new World();
     const seen = new Map([[init.serialize(), null]]);
-    let queue = [init], explored = 0, filled = 0, violations = [];
+    let queue = [init], explored = 0, filled = 0, violations = [], violationCount = 0;
+    const deadline = Date.now() + (Number(process.env.EX_DEADLINE_MS ?? 0) || 150_000);
     while (queue.length && explored < cap) {
       const nextQ = [];
       for (const w of queue) {
         for (const [label, c] of exhaustiveActions(w)) {
           explored++;
+          // A synchronous runaway is not interruptible by the runner's
+          // timeout; this deadline turns it into a recorded test failure.
+          if ((explored & 1023) === 0 && Date.now() > deadline) {
+            throw new Error(`exhaustive exploration exceeded its time budget (states=${seen.size}, explored=${explored})`);
+          }
           const key = c.serialize();
           if (seen.has(key)) continue;
           seen.set(key, label);
           const bad = c.checkInvariants();
           bad.push(...c.checkQuiet().problems.map((x) => `quiet:${x}`));
           if (bad.length) {
-            violations.push({ label, bad });
-            if (stopOnViolation) return { states: seen.size, explored, filled, violations };
+            violationCount++;
+            // Keep only a few examples: a broken rule can produce tens of
+            // thousands, and a full assert diff of those aborts the file
+            // (observed with an early claim rule) instead of failing the test.
+            if (violations.length < 5) violations.push({ label, bad });
+            if (stopOnViolation) return { states: seen.size, explored, filled, violations, violationCount };
             continue;
           }
           if (c.anyIndex()) filled++;
@@ -278,14 +290,14 @@ function exploreExhaustive({ cap = Number(process.env.EX_CAP ?? 0) || 120_000, r
       queue = nextQ;
       if (process.env.EX_DEBUG) console.error(`exhaustive: states=${seen.size} explored=${explored} queue=${queue.length}`);
     }
-    return { states: seen.size, explored, filled, violations };
+    return { states: seen.size, explored, filled, violations, violationCount };
   } finally { restore(); }
 }
 
-test('exhaustive (real classes): 1 terminal x 2 owners, begin/claim/finish, release letters, time', () => {
+test('exhaustive (real classes): 1 terminal x 2 owners, begin/claim/finish, release letters, time', { timeout: 150_000 }, () => {
   const r = exploreExhaustive();
-  console.log(`exhaustive counts: states=${r.states} explored=${r.explored} indexFilled=${r.filled} violations=${r.violations.length}`);
-  assert.deepEqual(r.violations, [], 'no invariant violations');
+  console.log(`exhaustive counts: states=${r.states} explored=${r.explored} indexFilled=${r.filled} violations=${r.violationCount}`);
+  assert.equal(r.violationCount, 0, `no invariant violations: ${JSON.stringify(r.violations)}`);
   assert.ok(r.states > 100_000, `state space must be real (got ${r.states})`);
   assert.ok(r.filled > 100, `the index must actually be populated (got ${r.filled})`);
 });
@@ -382,6 +394,84 @@ test('repro: same-claim redelivery succeeds; only release advances closed', () =
   assert.throws(() => idx.claimByGeneration('t', 'o', 'g', 1, 0), (e) => e.code === 'stale-claim');
 });
 
+// ---- finish gate: four fixed rejections (each one dies if the guard goes) ----
+// The finish guard is the only place a stale/expired/replaced intent is
+// refused after its claim. Each case claims first (so `claimed` is recorded
+// and cannot mask the failure) and then breaks exactly one premise.
+const beginSeed = (w, tid) => w.owners.get(A.owner).beginRegistration({
+  owner: A.owner, deviceDid: tid, approverDid: A.registration.did, kind: 'seed' });
+const finishSeed = (w, tid, b) => w.owners.get(A.owner).finishRegistration({
+  owner: A.owner, deviceDid: tid, approverDid: A.registration.did, kind: 'seed',
+  generation: b.generation, seq: b.seq, incarnation: b.incarnation });
+
+test('finish rejects an expired intent', async () => {
+  const w = new World();
+  const tid = T[0].did;
+  const b = beginSeed(w, tid);
+  assert.equal(w.claim(A.owner, tid, b), 'ok');
+  w.now += INTENT_TTL_MS + 1;
+  assert.throws(() => finishSeed(w, tid, b), (e) => e.code === 'intent-gone');
+  assert.equal(w.owners.get(A.owner).isLiveDevice({ owner: A.owner, did: tid }), false);
+  // The refused apply leaves only the claim; expiry releases it.
+  assert.equal(w.transport.lookup(tid)?.gen, b.generation);
+  w.owners.get(A.owner).alarm(w.now);
+  await w.transport.deliverAll();
+  assert.equal(w.transport.lookup(tid), null);
+});
+
+test('finish rejects an older generation after a newer intent replaced it', () => {
+  const w = new World();
+  const tid = T[0].did;
+  const b1 = beginSeed(w, tid);
+  assert.equal(w.claim(A.owner, tid, b1), 'ok');
+  w.owners.get(A.owner).clearIntent({ owner: A.owner, deviceDid: tid });
+  const b2 = beginSeed(w, tid);
+  assert.equal(w.claim(A.owner, tid, b2), 'ok');
+  assert.throws(() => finishSeed(w, tid, b1), (e) => e.code === 'intent-gone');
+  assert.equal(w.owners.get(A.owner).isLiveDevice({ owner: A.owner, did: tid }), false);
+});
+
+test("finish rejects another terminal's generation", () => {
+  const w = new World();
+  const t1 = T[0].did, t2 = T[1].did;
+  const b1 = beginSeed(w, t1);
+  assert.equal(w.claim(A.owner, t1, b1), 'ok');
+  const b2 = beginSeed(w, t2);
+  assert.equal(w.claim(A.owner, t2, b2), 'ok');
+  assert.throws(() => finishSeed(w, t1, b2), (e) => e.code === 'intent-gone');
+  assert.equal(w.owners.get(A.owner).isLiveDevice({ owner: A.owner, did: t1 }), false);
+});
+
+test('finish rejects an intent that is gone', () => {
+  const w = new World();
+  const tid = T[0].did;
+  const b = beginSeed(w, tid);
+  assert.equal(w.claim(A.owner, tid, b), 'ok');
+  w.owners.get(A.owner).clearIntent({ owner: A.owner, deviceDid: tid });
+  assert.throws(() => finishSeed(w, tid, b), (e) => e.code === 'intent-gone');
+  assert.equal(w.owners.get(A.owner).isLiveDevice({ owner: A.owner, did: tid }), false);
+});
+
+// Repro: a finish with no claim admitted a live terminal with no index entry
+// (claim-less finish: admitted, live true, index null). The owner now records
+// the device DO's claim response on the intent in a separate sync step, and
+// finish requires that record; the production entry is one async call.
+test('fixed: a finish without the owner-recorded claim is rejected (repro: claim-less finish)', async () => {
+  const w = new World();
+  const o = w.owners.get(A.owner);
+  const tid = T[0].did;
+  const b = beginSeed(w, tid);
+  assert.throws(() => finishSeed(w, tid, b), (e) => e.code === 'intent-unclaimed');
+  assert.equal(o.isLiveDevice({ owner: A.owner, did: tid }), false);
+  assert.equal(w.transport.lookup(tid), null, 'a refused finish leaves no index entry');
+  o.clearIntent({ owner: A.owner, deviceDid: tid });
+  const out = await o.register({ owner: A.owner, deviceDid: tid, approverDid: A.registration.did,
+    kind: 'seed', transport: w.transport });
+  assert.equal(out.status, 'admitted');
+  assert.equal(o.isLiveDevice({ owner: A.owner, did: tid }), true);
+  assert.equal(w.transport.lookup(tid)?.owner, A.owner, 'the claimed finish has its index entry');
+});
+
 test('device index: (incarnation, seq) pair order, per owner, never reset', () => {
   const idx = new DeviceIndexDO(new MapStorage(), {});
   idx.did = 't';
@@ -429,7 +519,7 @@ test('regression: re-registering a released terminal keeps the pending claim', a
   const DAY = 86_400_000, t0 = 1_700_000_000_000;
   let now = t0;
   const transport = new FakeTransport();
-  const o = new OwnerRegistryDO(new MapStorage(), { owner: A.owner, now: () => now, transport });
+  const o = new OwnerRegistryDO(new MapStorage(), { owner: A.owner, now: () => now, transport, testPhases: true });
   const T0 = T[0].did, T1 = T[1].did;
   const held = () => transport.lookup(T1);
   const call = (deviceDid, kind = 'seed') => o.applyRegistration({ owner: A.owner, deviceDid, approverDid: A.registration.did, kind, transport });
@@ -477,7 +567,7 @@ test('fixed: one dropped release letter is retried until acked (index gone after
   const DAY = 86_400_000, t0 = 1_700_000_000_000;
   let now = t0;
   const transport = new FakeTransport();
-  const o = new OwnerRegistryDO(new MapStorage(), { owner: A.owner, now: () => now, transport });
+  const o = new OwnerRegistryDO(new MapStorage(), { owner: A.owner, now: () => now, transport, testPhases: true });
   const reg = (d) => o.applyRegistration({ owner: A.owner, deviceDid: d, approverDid: A.registration.did, kind: 'seed', transport });
   reg(T[0].did); reg(T[1].did);
   now = t0 + 3 * DAY + 1; o.alarm(now);
@@ -499,7 +589,7 @@ test('fixed: a pending revoke holds a live terminal index until the wait ends', 
   const DAY = 86_400_000, t0 = 1_700_000_000_000;
   let now = t0;
   const transport = new FakeTransport();
-  const o = new OwnerRegistryDO(new MapStorage(), { owner: A.owner, now: () => now, transport });
+  const o = new OwnerRegistryDO(new MapStorage(), { owner: A.owner, now: () => now, transport, testPhases: true });
   const T0 = T[0].did, T1 = T[1].did;
   const reg = (d) => o.applyRegistration({ owner: A.owner, deviceDid: d, approverDid: A.registration.did, kind: 'seed', transport });
   reg(T0);
@@ -535,7 +625,7 @@ test('fixed: a pending revoke holds a live terminal index until the wait ends', 
 const releaseSetup = () => {
   const st = { now: 1_700_000_000_000 };
   st.transport = new FakeTransport();
-  st.o = new OwnerRegistryDO(new MapStorage(), { owner: A.owner, now: () => st.now, transport: st.transport });
+  st.o = new OwnerRegistryDO(new MapStorage(), { owner: A.owner, now: () => st.now, transport: st.transport, testPhases: true });
   st.o.applyRegistration({ owner: A.owner, deviceDid: T[0].did, approverDid: A.registration.did, kind: 'seed', transport: st.transport });
   return st;
 };
@@ -647,7 +737,7 @@ function openPendingIds(ow, owner) {
 }
 function restartOwners(owners, transport, nowFn) {
   for (const [k, ow] of owners) {
-    const fresh = new OwnerRegistryDO(new MapStorage(), { owner: k, now: nowFn, transport });
+    const fresh = new OwnerRegistryDO(new MapStorage(), { owner: k, now: nowFn, transport, testPhases: true });
     fresh.storage.m = ow.storage.m; // same durable storage object
     fresh._load();
     owners.set(k, fresh);
@@ -655,7 +745,7 @@ function restartOwners(owners, transport, nowFn) {
   transport.rebind(owners);
 }
 
-test('randomized: 3000 sequences, device-key actors, delayed delivery, crashes', async () => {
+test('randomized: 3000 sequences, device-key actors, delayed delivery, crashes', { timeout: 150_000 }, async () => {
   const counts = {
     sequences: 0, steps: 0, seed: 0, existing: 0, revoke: 0, release: 0, cancel: 0,
     batch: 0, pack: 0, head: 0, begin: 0, claim: 0, finish: 0,
@@ -678,7 +768,7 @@ test('randomized: 3000 sequences, device-key actors, delayed delivery, crashes',
     const transport = new FakeTransport();
     const oracle = new MemoryRegistry({ now: nowFn });
     const owners = new Map([A, B].map((o) => [o.owner,
-      new OwnerRegistryDO(new MapStorage(), { owner: o.owner, now: nowFn, transport })]));
+      new OwnerRegistryDO(new MapStorage(), { owner: o.owner, now: nowFn, transport, testPhases: true })]));
     const ow = (o) => owners.get(o.owner);
     const view = () => Object.assign(Object.create(World.prototype),
       { owners, transport, acks: new Map(), claims: [], redeliveryErrors: [] });

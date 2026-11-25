@@ -3,11 +3,15 @@
 // - DeviceIndexDO: one instance per deviceDid, separate storage. Per-owner
 //   closed pairs kept forever; only release advances closed; claims accept
 //   lexicographic (incarnation, seq) order > closed and >= held pair.
-// - OwnerRegistryDO: one instance per owner; registration split into begin
-//   (intent) / claim (external await) / finish (apply), heldGens (cap 32,
-//   429 when full), and an ack-based outbox: an alarm retries a release with
-//   ×2 backoff capped at 5 min until the device DO acks; only the ack
-//   deletes the row (tests fake delay/duplicate/reorder/drop/lost ack).
+// - OwnerRegistryDO: one instance per owner; registration exposed as one
+//   async entry, register = begin (intent) / claim (external await) /
+//   finish (apply), with the device DO's claim response recorded on the
+//   intent in a separate sync transaction; finish rejects an intent without
+//   that record (a crashed or absent claim can never be applied). heldGens
+//   (cap 32, 429 when full) and an ack-based outbox: an alarm retries a
+//   release with ×2 backoff capped at 5 min until the device DO acks; only
+//   the ack deletes the row (tests fake delay/duplicate/reorder/drop/lost
+//   ack). The split phases are test-only.
 // - RegistryCore (e2ee-registry-core.mjs) holds the sync owner-state rules;
 //   MemoryRegistry keeps its own untouched implementation (oracle).
 import { randomBytes } from 'node:crypto';
@@ -173,11 +177,12 @@ export class FakeTransport {
 
 /** One owner registry instance (one storage per owner). */
 export class OwnerRegistryDO {
-  constructor(storage, { owner, now = () => Date.now(), transport = null, incarnation = 0 } = {}) {
+  constructor(storage, { owner, now = () => Date.now(), transport = null, incarnation = 0,
+    testPhases = false } = {}) {
     if (!owner) throw new Error('OwnerRegistryDO needs { owner } (one instance per owner)');
     checkOwner(owner);
     this.storage = storage; this.owner = owner; this.now = now; this.transport = transport;
-    this.incarnation = incarnation;
+    this.incarnation = incarnation; this.testPhases = testPhases;
     this.core = new RegistryCore({ now });
     this._stateKey = 'state';
     this._load();
@@ -361,16 +366,25 @@ export class OwnerRegistryDO {
   }
 
   // ---- registration: begin (intent) / claim (external await) / finish ----
-  // begin and finish are each one sync transaction; the claim is the caller's
-  // await between them, so a crash/late/overlapping claim is reproducible
-  // without breaking the sync class (design §5.1 steps 2–4).
+  // The production entry is the async `register` (begin -> claim -> finish).
+  // begin/claim/finish are the split phases; they exist for
+  // crash/late/overlapping-claim tests and are refused unless the instance was
+  // constructed with `testPhases: true`. applyRegistration below is the sync
+  // convenience the rest of this class (and the older tests) still use.
+  _requireTestPhases() {
+    if (!this.testPhases) err('registration-phases-test-only');
+  }
   _validateRegistration({ owner, deviceDid, approverDid, kind }) {
     if (kind !== 'seed' && kind !== 'existing-device') err('bad-registration-kind');
     checkDid(deviceDid); checkDid(approverDid);
     // Binding before anything else: an unbound approver leaves no claim.
     if (kind === 'seed') checkOwnerBinding(owner, approverDid);
   }
-  beginRegistration({ owner, deviceDid, approverDid, kind, incarnation = this.incarnation }) {
+  beginRegistration(a) {
+    this._requireTestPhases();
+    return this._beginRegistration(a);
+  }
+  _beginRegistration({ owner, deviceDid, approverDid, kind, incarnation = this.incarnation }) {
     this._validateRegistration({ owner, deviceDid, approverDid, kind });
     // Pre-consume checks run before the live fast path too: the Worker's gate
     // rejects a live re-registration while the lane is at its cap, so the DO
@@ -406,18 +420,50 @@ export class OwnerRegistryDO {
     const intent = this.createIntent({ owner, deviceDid, incarnation, kind, approverDid });
     return { status: 'intent', ...intent };
   }
+  /**
+   * Separate sync transaction after the external claim await: record that the
+   * device DO accepted THIS intent's exact (generation, seq, incarnation).
+   * A response for any other pair (a replayed letter, another terminal's
+   * generation) leaves the intent unclaimed; finish then refuses it.
+   */
+  _recordClaim(deviceDid, intent, res) {
+    const own = Boolean(res) && res.status === 'claimed' && res.generation === intent.generation &&
+      res.seq === intent.seq && res.inc === intent.incarnation;
+    if (!own) return false;
+    return this.storage.transact(() => {
+      const q = this._intent(deviceDid);
+      if (!q || q.generation !== intent.generation || q.seq !== intent.seq ||
+          q.incarnation !== intent.incarnation) return false;
+      this.storage.put(`intent/${deviceDid}`, { ...q, claimed: true });
+      return true;
+    });
+  }
   /** External await boundary: device DO claim. Idempotent for the same pair. */
-  claimRegistration({ owner, deviceDid, generation, seq, incarnation, transport = this.transport }) {
+  claimRegistration(a) {
+    this._requireTestPhases();
+    return this._claimRegistration(a);
+  }
+  _claimRegistration({ owner, deviceDid, generation, seq, incarnation, transport = this.transport }) {
     const tp = transport ?? this.transport;
     if (!tp?.lookup) throw new Error('no-index-transport');
-    return tp.claim(deviceDid, owner, generation, seq, incarnation);
+    const res = tp.claim(deviceDid, owner, generation, seq, incarnation);
+    this._recordClaim(deviceDid, { generation, seq, incarnation }, res);
+    return res;
   }
-  finishRegistration({ owner, deviceDid, approverDid, kind, generation, seq, incarnation = this.incarnation }) {
+  finishRegistration(a) {
+    this._requireTestPhases();
+    return this._finishRegistration(a);
+  }
+  _finishRegistration({ owner, deviceDid, approverDid, kind, generation, seq, incarnation = this.incarnation }) {
     return this._tx(() => {
       const r = this.core.rec(owner); this.core.settle(r, this.now());
       const open = this._intent(deviceDid);
       if (!open || open.expiresAt <= this.now() || open.generation !== generation || open.seq !== seq)
         err('intent-gone');
+      // No apply without the owner's record of the device DO's claim for this
+      // very intent (the claim is the index write; applying without it leaves
+      // a live terminal with no index entry).
+      if (open.claimed !== true) err('intent-unclaimed');
       if (open.kind && open.kind !== kind) err('intent-gone');
       if (open.approverDid && open.approverDid !== approverDid) err('intent-gone');
       if (open.incarnation !== incarnation) err('intent-gone');
@@ -430,18 +476,36 @@ export class OwnerRegistryDO {
       return res;
     });
   }
-  /** Sync convenience (tests / direct callers): begin → claim → finish. */
-  applyRegistration({ owner, deviceDid, approverDid, kind, incarnation = this.incarnation, transport = this.transport }) {
-    const b = this.beginRegistration({ owner, deviceDid, approverDid, kind, incarnation });
+  /** The one production entry: begin -> claim (recorded) -> finish. */
+  async register({ owner, deviceDid, approverDid, kind, incarnation = this.incarnation, transport = this.transport }) {
+    const b = this._beginRegistration({ owner, deviceDid, approverDid, kind, incarnation });
     if (b.status !== 'intent') return b;
     try {
-      this.claimRegistration({ owner, deviceDid, generation: b.generation, seq: b.seq,
+      this._claimRegistration({ owner, deviceDid, generation: b.generation, seq: b.seq,
         incarnation: b.incarnation, transport });
     } catch (e) {
       this.clearIntent({ owner, deviceDid });
       throw e;
     }
-    return this.finishRegistration({ owner, deviceDid, approverDid, kind,
+    return this._finishRegistration({ owner, deviceDid, approverDid, kind,
+      generation: b.generation, seq: b.seq, incarnation: b.incarnation });
+  }
+  /**
+   * Sync convenience (directory callers and older tests): begin -> claim
+   * (recorded) -> finish in one call. The async `register` is the shape the
+   * Worker uses; this exists because the rest of the class is synchronous.
+   */
+  applyRegistration({ owner, deviceDid, approverDid, kind, incarnation = this.incarnation, transport = this.transport }) {
+    const b = this._beginRegistration({ owner, deviceDid, approverDid, kind, incarnation });
+    if (b.status !== 'intent') return b;
+    try {
+      this._claimRegistration({ owner, deviceDid, generation: b.generation, seq: b.seq,
+        incarnation: b.incarnation, transport });
+    } catch (e) {
+      this.clearIntent({ owner, deviceDid });
+      throw e;
+    }
+    return this._finishRegistration({ owner, deviceDid, approverDid, kind,
       generation: b.generation, seq: b.seq, incarnation: b.incarnation });
   }
   // Release every generation the terminal may hold unless something still
