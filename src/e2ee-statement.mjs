@@ -10,7 +10,7 @@
 // it), so separator ambiguity with DIDs or arguments cannot arise.
 import crypto from 'node:crypto';
 
-export const STATEMENT_VERSION = 'yataverse:e2ee:v2';
+export const STATEMENT_VERSION = 'yataverse:e2ee:v3';
 export const STATEMENT_WINDOW_MS = 300_000;
 
 /** Length-prefixed canonical form: version, domain, aud, op, owner, actor, args count, args, issued, expires, epoch, incarnation. */

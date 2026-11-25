@@ -348,12 +348,15 @@ export async function handleE2eeRegistry(request, action, env, store, deps) {
   }
 }
 
-/** GET status: epoch + incarnation (allowlist-carried); unknown owners get epoch 0, incarnation 0. */
+/** GET status: epoch + incarnation (allowlist-carried). The allowlist is
+ *  consulted before any instance: a non-allowlisted owner gets the same
+ *  shape as an unknown owner and touches no registry (default deny). */
 export async function handleE2eeStatus(request, owner, env, deps) {
   const reply = (status, body) => new Response(JSON.stringify(body),
     { status, headers: { 'content-type': 'application/json', 'cache-control': 'private, no-store' } });
   if (!deps.registry) return reply(503, { error: 'e2ee-registry-not-configured' });
   if (request.method !== 'GET') return reply(405, { error: 'method-not-allowed' });
+  if (!ownerAllowlisted(env, owner)) return reply(200, { epoch: 0, incarnation: 0 });
   const incarnation = ownerIncarnation(env, owner) ?? 0;
   try { return reply(200, { epoch: await deps.registry.epochOf({ owner }), incarnation }); }
   catch (e) { if (e instanceof RegistryError) return reply(400, { error: e.code }); throw e; }

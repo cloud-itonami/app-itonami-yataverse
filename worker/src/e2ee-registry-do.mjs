@@ -3,9 +3,11 @@
 // - DeviceIndexDO: one instance per deviceDid, separate storage. Per-owner
 //   closed pairs kept forever; only release advances closed; claims accept
 //   lexicographic (incarnation, seq) order > closed and >= held pair.
-// - OwnerRegistryDO: one instance per owner; intent-first registration,
-//   heldGens (cap 32, 429 when full), outbox + alarm delivery through an
-//   injected transport (tests fake delay/duplicate/reorder/drop).
+// - OwnerRegistryDO: one instance per owner; registration split into begin
+//   (intent) / claim (external await) / finish (apply), heldGens (cap 32,
+//   429 when full), and an ack-based outbox: an alarm retries a release with
+//   ×2 backoff capped at 5 min until the device DO acks; only the ack
+//   deletes the row (tests fake delay/duplicate/reorder/drop/lost ack).
 // - RegistryCore (e2ee-registry-core.mjs) holds the sync owner-state rules;
 //   MemoryRegistry keeps its own untouched implementation (oracle).
 import { randomBytes } from 'node:crypto';
@@ -105,10 +107,18 @@ export class DeviceIndexDO {
 }
 
 /** Fake inter-DO transport (tests control delivery of releases). Claims are
- *  synchronous request/response; releases go through a queue. Routes to a
- *  per-device DeviceIndexDO map (get-or-create). */
+ *  synchronous request/response; releases go through a queue and are removed
+ *  only when the device DO acks them. Routes to a per-device DeviceIndexDO
+ *  map (get-or-create).
+ *
+ *  Queue entries carry the sending owner instance so delivery can ack the
+ *  exact outbox row: drop = no ack (owner retries), duplicate = deliver
+ *  twice (second ack is a no-op), pick/swap = reordering. */
 export class FakeTransport {
-  constructor() { this.indexes = new Map(); this.q = []; this.dropped = 0; this.duplicated = 0; }
+  constructor() {
+    this.indexes = new Map(); this.q = [];
+    this.dropped = 0; this.duplicated = 0; this.swapped = 0; this.delivered = 0; this.acked = 0;
+  }
   indexFor(tid) {
     if (!this.indexes.has(tid)) this.indexes.set(tid, new DeviceIndexDO(new MapStorage(), {}));
     const idx = this.indexes.get(tid);
@@ -117,17 +127,48 @@ export class FakeTransport {
   }
   claim(tid, owner, gen, seq, inc) { return this.indexFor(tid).claimByGeneration(tid, owner, gen, seq, inc); }
   lookup(tid) { return this.indexFor(tid).lookup(tid); }
-  enqueueRelease(...args) { this.q.push(args); }
+  /** Queue one release for delivery; the outbox row stays until ack. */
+  enqueueRelease(ownerDo, row) { this.q.push({ ownerRef: ownerDo, row: structuredClone(row) }); }
   async queue() { return this.q.length; }
-  // Deliver one message (random index if sequence given via chooser).
+  // Deliver one queued release (pick controls ordering / delay).
   async deliverNext(pick = 0) {
     if (!this.q.length) return null;
     const [m] = this.q.splice(Math.min(pick, this.q.length - 1), 1);
-    return this.indexFor(m[0]).release(...m);
+    const res = this.indexFor(m.row.tid).release(m.row.tid, m.row.owner, m.row.gen, m.row.seq, m.row.inc);
+    if (m.ownerRef?._ackOutbox(m.row.id).acked) this.acked++;
+    this.delivered++;
+    return res;
+  }
+  /** Deliver but lose the ack (owner crashes before its delete commits). */
+  async deliverNextUnacked(pick = 0) {
+    if (!this.q.length) return null;
+    const [m] = this.q.splice(Math.min(pick, this.q.length - 1), 1);
+    const res = this.indexFor(m.row.tid).release(m.row.tid, m.row.owner, m.row.gen, m.row.seq, m.row.inc);
+    this.delivered++;
+    return res;
   }
   async deliverAll() { let n = 0; while (this.q.length) { await this.deliverNext(0); n++; } return n; }
-  dropNext() { this.q.shift(); this.dropped++; }
-  duplicateNext() { if (this.q.length) { this.q.push([...this.q[0]]); this.duplicated++; } }
+  /** Simulated message loss: the letter is gone and never acked. */
+  dropNext() { const m = this.q.shift(); if (m) this.dropped++; return m?.row ?? null; }
+  duplicateNext() {
+    if (!this.q.length) return;
+    const m = this.q[0];
+    this.q.push({ ownerRef: m.ownerRef, row: structuredClone(m.row) });
+    this.duplicated++;
+  }
+  /** Reorder two queued letters (the next delivery order is swapped). */
+  swapNext(i = 0, j = 1) {
+    if (this.q.length < 2) return false;
+    const a = i % this.q.length, b = j % this.q.length;
+    if (a === b) return false;
+    [this.q[a], this.q[b]] = [this.q[b], this.q[a]];
+    this.swapped++;
+    return true;
+  }
+  /** Re-point queued letters after a simulated owner crash/restart. */
+  rebind(owners) {
+    for (const m of this.q) m.ownerRef = owners.get(m.row.owner) ?? m.ownerRef;
+  }
 }
 
 /** One owner registry instance (one storage per owner). */
@@ -174,7 +215,7 @@ export class OwnerRegistryDO {
 
   // ---- intent API ----
   _intent(tid) { return this.storage.get(`intent/${tid}`) ?? null; }
-  createIntent({ owner, deviceDid, incarnation = this.incarnation }) {
+  createIntent({ owner, deviceDid, incarnation = this.incarnation, kind = null, approverDid = null }) {
     return this._tx(() => {
       checkOwner(owner); const r = this.core.rec(owner); this.core.settle(r, this.now());
       const open = this._intent(deviceDid);
@@ -187,7 +228,9 @@ export class OwnerRegistryDO {
       const gen = randomBytes(16).toString('hex');
       const held = this._heldGens(owner, deviceDid);
       if (held.length >= HELD_GENS_CAP) err('held-gens-full');
-      this.storage.put(`intent/${deviceDid}`, { generation: gen, seq, incarnation, expiresAt: this.now() + INTENT_TTL_MS });
+      const now = this.now();
+      this.storage.put(`intent/${deviceDid}`, { generation: gen, seq, incarnation, kind, approverDid,
+        createdAt: now, expiresAt: now + INTENT_TTL_MS });
       this.storage.put(`seq/${deviceDid}`, seq);
       return { generation: gen, seq, incarnation };
     });
@@ -212,66 +255,140 @@ export class OwnerRegistryDO {
     const live = term && !term.revokedAt && !term.released;
     const pend = r && [...r.pending, ...r.pendingReleases, ...r.pendingRevokes].some((p) =>
       (!p.cancelledAt && !p.admittedAt && !p.doneAt) && (p.deviceDid === tid || p.targetDid === tid));
-    if (live || pend) {
-      const held = this._heldGens(owner, tid);
-      if (!held.some((g) => g.gen === q.generation)) held.push({ gen: q.generation, seq: q.seq, inc: q.incarnation });
-      this._setHeldGens(owner, tid, held);
-    } else if (!clearOnly) {
+    if (live || pend) this._holdIntentLocked(owner, tid, q);
+    else if (!clearOnly) {
       this._outboxPush(owner, tid, q.generation, q.seq, q.incarnation);
+      this.storage.del(`intent/${tid}`);
+    } else this.storage.del(`intent/${tid}`);
+  }
+  // A generation whose claim delivery is unknown is remembered, not released.
+  _holdIntentLocked(owner, tid, q) {
+    const held = this._heldGens(owner, tid);
+    if (!held.some((g) => g.gen === q.generation && g.seq === q.seq && g.inc === q.incarnation)) {
+      held.push({ gen: q.generation, seq: q.seq, inc: q.incarnation });
     }
+    this._setHeldGens(owner, tid, held);
     this.storage.del(`intent/${tid}`);
+  }
+  // Terminal op (revoke/release) closing its open intent. A deferred
+  // revoke/release must NOT release: the terminal is still live and its
+  // index entry is what a later effect releases, so the intent generation
+  // joins heldGens until the appointment takes effect.
+  _closeIntentNow(owner, tid) {
+    const q = this._intent(tid);
+    if (!q) return false;
+    const r = this.core.get(owner);
+    const deferred = r && [...r.pendingReleases, ...r.pendingRevokes].some((p) =>
+      !p.cancelledAt && !p.doneAt && (p.deviceDid === tid || p.targetDid === tid) && p.effectiveAt > this.now());
+    if (deferred) return this._holdIntentLocked(owner, tid, q);
+    this._outboxPush(owner, tid, q.generation, q.seq, q.incarnation);
+    this.storage.del(`intent/${tid}`);
+    return true;
   }
   _outboxPush(owner, tid, gen, seq, inc) {
     const n = (this.storage.get('outbox-counter') ?? 0) + 1;
-    this.storage.put(`outbox/${n}`, { id: n, owner, tid, gen, seq, inc, created: this.now() });
+    const now = this.now();
+    this.storage.put(`outbox/${n}`, { id: n, owner, tid, gen, seq, inc, created: now, attempts: 0, nextRetryAt: now });
     this.storage.put('outbox-counter', n);
-    this._setAlarm(this.now());
+    this._setAlarm(now);
   }
   _setAlarm(ts) { this.alarmAt = Math.min(this.alarmAt ?? Infinity, ts); }
+  /** ×2 from 1 s, capped at 5 minutes (design §2.4). */
+  _retryDelay(attempts) { return Math.min(1000 * 2 ** Math.max(0, attempts - 1), 300_000); }
   // alarm handler: expiry + outbox drain (fake clock driven)
   alarm(now) {
     const n = typeof now === 'number' ? () => now : this.now;
     return this.storage.transact(() => {
       this._load();
       for (const rec of this.core.owners.values()) this.core.settle(rec, n());
-      const intents = this.storage.keys('intent/');
-      for (const k of intents) {
+      for (const k of this.storage.keys('intent/')) {
         const q = this.storage.get(k); const tid = k.split('/')[1];
-        if (q.expiresAt <= n()) this._closeIntentLocked(this.owner, tid, q);
+        if (!q) continue;
+        const term = this.core.get(this.owner)?.devices.get(tid);
+        // Close an intent whose terminal ended *after* the intent began (a
+        // revoke/release/batch effect). A re-registration intent created
+        // after the tombstone is a fresh application: it survives until its
+        // TTL or finish, even if an alarm fires meanwhile.
+        const tombAt = Math.max(term?.revokedAt ?? 0, term?.releasedAt ?? 0);
+        const endedAfterIntent = tombAt && tombAt >= (q.createdAt ?? 0);
+        if (q.expiresAt <= n() || endedAfterIntent) this._closeIntentLocked(this.owner, tid, q);
       }
       this._sweepHeldGens(this.owner);
-      const r = this._drainOutbox();
+      const r = this._drainOutbox(n());
       this._save();
       return r;
     });
   }
-  _drainOutbox() {
-    const rows = this.storage.keys('outbox/').sort().map((k) => this.storage.get(k));
-    let delivered = 0;
+  // Hand due rows to the transport. Rows are deleted by ack only; attempts /
+  // nextRetryAt persist so a dropped letter is retried with growing backoff.
+  _drainOutbox(now = this.now()) {
+    const rows = this.storage.keys('outbox/').sort().map((k) => this.storage.get(k)).filter(Boolean);
+    let sent = 0, acked = 0, pending = 0;
     for (const row of rows) {
-      const res = this.transport
-        ? (this.transport.enqueueRelease(row.tid, row.owner, row.gen, row.seq, row.inc), { released: null, queued: true })
-        : this._indexRelease(row);
-      if (res.released) delivered++;
-      this.storage.del(`outbox/${row.id}`);
-      const held = this._heldGens(row.owner, row.tid);
-      this._setHeldGens(row.owner, row.tid, held.filter((g) => !(g.gen === row.gen && g.seq === row.seq)));
+      if ((row.nextRetryAt ?? 0) > now) { pending++; continue; }
+      row.attempts = (row.attempts ?? 0) + 1;
+      row.nextRetryAt = now + this._retryDelay(row.attempts);
+      this.storage.put(`outbox/${row.id}`, row);
+      if (this.transport) { this.transport.enqueueRelease(this, row); sent++; }
+      else {
+        const res = this._indexRelease(row);
+        if (res?.released) acked++;
+        this._ackLocked(row);
+      }
     }
-    return { drained: rows.length, delivered };
+    return { rows: rows.length, sent, acked, pending };
+  }
+  _ackLocked(row) {
+    this.storage.del(`outbox/${row.id}`);
+    const held = this._heldGens(row.owner, row.tid);
+    this._setHeldGens(row.owner, row.tid,
+      held.filter((g) => !(g.gen === row.gen && g.seq === row.seq && g.inc === row.inc)));
+  }
+  /** Device-DO ack: delete the outbox row and prune its held generation. */
+  _ackOutbox(id) {
+    return this.storage.transact(() => {
+      this._load();
+      const row = this.storage.get(`outbox/${id}`);
+      if (!row) { this._save(); return { acked: false }; }
+      this._ackLocked(row);
+      this._save();
+      return { acked: true };
+    });
   }
   _indexRelease(row) {
     // default direct path (transport absent): resolve index via registry
     return this.index.release(row.tid, row.owner, row.gen, row.seq, row.inc);
   }
 
-  // ---- registration (intent-first; live terminals: no intent) ----
-  applyRegistration({ owner, deviceDid, approverDid, kind, incarnation = this.incarnation, transport = this.transport }) {
+  // ---- registration: begin (intent) / claim (external await) / finish ----
+  // begin and finish are each one sync transaction; the claim is the caller's
+  // await between them, so a crash/late/overlapping claim is reproducible
+  // without breaking the sync class (design §5.1 steps 2–4).
+  _validateRegistration({ owner, deviceDid, approverDid, kind }) {
     if (kind !== 'seed' && kind !== 'existing-device') err('bad-registration-kind');
     checkDid(deviceDid); checkDid(approverDid);
-    // Binding/permission first (oracle's applyRegistration wrapper does
-    // this too) — the live fast path below must not bypass it.
+    // Binding before anything else: an unbound approver leaves no claim.
     if (kind === 'seed') checkOwnerBinding(owner, approverDid);
-    // 1) fast path (live terminal): no intent, no index touch
+  }
+  beginRegistration({ owner, deviceDid, approverDid, kind, incarnation = this.incarnation }) {
+    this._validateRegistration({ owner, deviceDid, approverDid, kind });
+    // Pre-consume checks run before the live fast path too: the Worker's gate
+    // rejects a live re-registration while the lane is at its cap, so the DO
+    // must not answer `repeated` past a check the front-end would fail.
+    this._tx(() => {
+      const r = this.core.rec(owner); this.core.settle(r, this.now());
+      if (kind === 'seed') {
+        if (r.registrationDid && r.registrationDid !== approverDid) err('registration-key-mismatch');
+      } else {
+        if (!this.core.isLive(r, approverDid)) err('approver-not-registered');
+        if (r.batchRevokes.some((b) => !b.appliedAt)) err('batch-revoke-pending');
+      }
+      const existing = r.devices.get(deviceDid);
+      if ((existing?.revokedAt || existing?.released) && kind !== 'seed') err('device-revoked-seed-only');
+      this.core.checkRegistrationRates({ owner, kind });
+      this.core.checkRegisterable({ owner, deviceDid, kind });
+    });
+    // Live fast path (repeated registration): no intent, no index touch.
     const live = this._tx(() => {
       const r = this.core.get(owner);
       return r ? this.core.isLive(r, deviceDid) : null;
@@ -283,65 +400,49 @@ export class OwnerRegistryDO {
           if (!this.core.isLive(r, approverDid)) err('approver-not-registered');
           if (r.batchRevokes.some((b) => !b.appliedAt)) err('batch-revoke-pending');
         }
-        return { status: 'admitted', repeated: true };
       });
       return { status: 'admitted', repeated: true };
     }
-    // 2) validate BEFORE intent/claim: binding, approver, kind, caps
-    this._tx(() => {
-      const r = this.core.rec(owner); this.core.settle(r, this.now());
-      if (kind === 'seed') {
-        checkOwnerBinding(owner, approverDid); // throws before any claim
-        if (r.registrationDid && r.registrationDid !== approverDid) err('registration-key-mismatch');
-      } else {
-        if (!this.core.isLive(r, approverDid)) err('approver-not-registered');
-        if (r.batchRevokes.some((b) => !b.appliedAt)) err('batch-revoke-pending');
-      }
-      const existing = r.devices.get(deviceDid);
-      if ((existing?.revokedAt || existing?.released) && kind !== 'seed') err('device-revoked-seed-only');
-      this.core.checkRegistrationRates({ owner, kind });
-      this.core.checkRegisterable({ owner, deviceDid, kind });
-    });
-    // 3) intent (validates first, so a bad approver leaves no claim)
-    const intent = this.createIntent({ owner, deviceDid, incarnation });
-    // 4) claim via transport
+    const intent = this.createIntent({ owner, deviceDid, incarnation, kind, approverDid });
+    return { status: 'intent', ...intent };
+  }
+  /** External await boundary: device DO claim. Idempotent for the same pair. */
+  claimRegistration({ owner, deviceDid, generation, seq, incarnation, transport = this.transport }) {
     const tp = transport ?? this.transport;
+    if (!tp?.lookup) throw new Error('no-index-transport');
+    return tp.claim(deviceDid, owner, generation, seq, incarnation);
+  }
+  finishRegistration({ owner, deviceDid, approverDid, kind, generation, seq, incarnation = this.incarnation }) {
+    return this._tx(() => {
+      const r = this.core.rec(owner); this.core.settle(r, this.now());
+      const open = this._intent(deviceDid);
+      if (!open || open.expiresAt <= this.now() || open.generation !== generation || open.seq !== seq)
+        err('intent-gone');
+      if (open.kind && open.kind !== kind) err('intent-gone');
+      if (open.approverDid && open.approverDid !== approverDid) err('intent-gone');
+      if (open.incarnation !== incarnation) err('intent-gone');
+      const res = this.core.applyRegistration({ owner, deviceDid, approverDid, kind,
+        binding: (o, d) => checkOwnerBinding(o, d) });
+      this.storage.del(`intent/${deviceDid}`);
+      const held = this._heldGens(owner, deviceDid);
+      held.push({ gen: generation, seq, inc: incarnation });
+      this._setHeldGens(owner, deviceDid, held);
+      return res;
+    });
+  }
+  /** Sync convenience (tests / direct callers): begin → claim → finish. */
+  applyRegistration({ owner, deviceDid, approverDid, kind, incarnation = this.incarnation, transport = this.transport }) {
+    const b = this.beginRegistration({ owner, deviceDid, approverDid, kind, incarnation });
+    if (b.status !== 'intent') return b;
     try {
-      const target = tp?.lookup ? tp : null;
-      if (!target) throw new Error('no-index-transport');
-      target.claim(deviceDid, owner, intent.generation, intent.seq, intent.incarnation);
+      this.claimRegistration({ owner, deviceDid, generation: b.generation, seq: b.seq,
+        incarnation: b.incarnation, transport });
     } catch (e) {
       this.clearIntent({ owner, deviceDid });
       throw e;
     }
-    // 5) settle + apply atomically inside the intent
-    try {
-      const out = this._tx(() => {
-        const r = this.core.rec(owner); this.core.settle(r, this.now());
-        const open = this._intent(deviceDid);
-        if (!open || open.expiresAt <= this.now()) err('intent-gone');
-        if (open.generation !== intent.generation) err('intent-gone');
-        const res = this.core.applyRegistration({ owner, deviceDid, approverDid, kind, binding: (o, d) => checkOwnerBinding(o, d) });
-        this.storage.del(`intent/${deviceDid}`);
-        const held = this._heldGens(owner, deviceDid);
-        held.push({ gen: intent.generation, seq: intent.seq, inc: intent.incarnation });
-        this._setHeldGens(owner, deviceDid, held);
-        return res;
-      });
-      return out;
-    } catch (e) {
-      // apply failed: intent already gone (consumed in tx above is rolled
-      // back); expiry path will release via outbox. Clear defensively.
-      this.storage.transact(() => { this._load(); const q = this._intent(deviceDid); if (q) this._closeIntentLocked(owner, deviceDid, q); this._save(); });
-      throw e;
-    }
-  }
-
-  // ---- tombstone ops: immediate tombstone + outbox in the same commit;
-  // delayed tombstone (wait) outboxes when settle makes it effective ----
-  _closeIntentNow(owner, tid) {
-    const q = this._intent(tid);
-    if (q) { this._outboxPush(owner, tid, q.generation, q.seq, q.incarnation); this.storage.del(`intent/${tid}`); }
+    return this.finishRegistration({ owner, deviceDid, approverDid, kind,
+      generation: b.generation, seq: b.seq, incarnation: b.incarnation });
   }
   // Release every generation the terminal may hold unless something still
   // relies on its index entry: a live terminal, or an open application (even

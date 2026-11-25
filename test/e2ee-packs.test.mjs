@@ -203,6 +203,18 @@ test('status endpoint reveals epoch + incarnation; unknown owner gets the same s
   assert.equal(st.status, 200); assert.deepEqual(await st.json(), { epoch: 0, incarnation: 0 });
   const un = await handle(new Request(`https://yataverse.com/awai-drive/v1/e2ee-registry/status/${'f'.repeat(64)}`), envFor(), deps(s, r));
   assert.deepEqual(await un.json(), { epoch: 0, incarnation: 0 });
+  // Allowlist first: a non-allowlisted owner never touches the registry.
+  let calls = 0;
+  const spy = { epochOf: async () => { calls++; return 7; } };
+  const hidden = await handle(new Request(`https://yataverse.com/awai-drive/v1/e2ee-registry/status/${'e'.repeat(64)}`),
+    envFor(`${OWNER}:2`), deps(s, spy));
+  assert.equal(hidden.status, 200);
+  assert.deepEqual(await hidden.json(), { epoch: 0, incarnation: 0 });
+  assert.equal(calls, 0, 'non-allowlisted status must not resolve or read an instance');
+  const allowed = await handle(new Request(`https://yataverse.com/awai-drive/v1/e2ee-registry/status/${OWNER}`),
+    envFor(`${OWNER}:2`), deps(s, spy));
+  assert.deepEqual(await allowed.json(), { epoch: 7, incarnation: 2 });
+  assert.equal(calls, 1);
 });
 
 test('head publish + device-CACAO head read; stranger gets 404', async () => {
