@@ -237,6 +237,13 @@ that runs changed.
   deleted by version at 15:42:45Z (owner approval) and the prefix is empty. No test object from
   the key work remains in the bucket; the two locked files under `retention-test/` from the
   earlier lock experiments (locks until 2026-11-22T06:21:50Z and 06:32:25Z) are still there.
+  Update 2026-11-27T04:15:32Z (Decision approval, item 48): after pre-checking the listing
+  (2 uploads, 50 and 51 bytes, expired `retainUntil`, no legal hold, no hide markers), both
+  versions were deleted by version id without `bypassGovernance`
+  (`4_z3d597f561c90ebaaa1120518_f103dc9f7960d4534_d20261121_m052051_c004_v0402026_t0017_u01795238451725`
+  and `4_z3d597f561c90ebaaa1120518_f102310e508092aad_d20261121_m053226_c004_v0402031_t0034_u01795239146411`),
+  and `b2_list_file_versions` confirmed `retention-test/` is empty (0 entries) at
+  2026-11-27T04:15:32Z.
 - **State of the keys.** All three Yataverse keys are now limited to `yataverse-blocks` and
   `ipld/`:
 
