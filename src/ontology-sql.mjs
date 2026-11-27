@@ -20,6 +20,7 @@ import {
   buildVisibilityFilter,
   resolveBoundedLimits,
   clampLimit,
+  compareCodeUnits,
   FORBIDDEN_OBJECT_KEYS,
 } from './ontology.mjs';
 
@@ -492,7 +493,7 @@ function compareValues(a, b) {
   const na = typeof a === 'number' ? a : (typeof a === 'string' && /^-?\d+(\.\d+)?$/.test(a.trim()) ? Number(a) : NaN);
   const nb = typeof b === 'number' ? b : (typeof b === 'string' && /^-?\d+(\.\d+)?$/.test(b.trim()) ? Number(b) : NaN);
   if (Number.isFinite(na) && Number.isFinite(nb) && typeof a !== typeof b) return na - nb;
-  return String(a).localeCompare(String(b));
+  return compareCodeUnits(a, b);
 }
 
 function likeMatch(value, pattern) {

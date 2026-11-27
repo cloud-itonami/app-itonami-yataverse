@@ -20,6 +20,7 @@ import {
   toDagCborSafe,
   normalizeKeyword,
   clampLimit,
+  compareCodeUnits,
   OntologyError,
 } from './ontology.mjs';
 
@@ -419,13 +420,13 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
     return true;
   };
 
-  // Canonical input ordering (independent of caller array order):
+  // Canonical UTF-16 code-unit input ordering (independent of caller array order & locale):
   // connectors by id, objectTypes by id, facts by (ontology/type, id), joins by name.
-  const sortedConnectors = [...snapshot.registry.connectors].sort((a, b) => String(a.id).localeCompare(String(b.id)));
-  const sortedObjectTypes = [...snapshot.registry.objectTypes].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const sortedConnectors = [...snapshot.registry.connectors].sort((a, b) => compareCodeUnits(a.id, b.id));
+  const sortedObjectTypes = [...snapshot.registry.objectTypes].sort((a, b) => compareCodeUnits(a.id, b.id));
   const sortedFacts = [...snapshot.facts].sort((a, b) => {
-    const t = String(a['ontology/type']).localeCompare(String(b['ontology/type']));
-    return t !== 0 ? t : String(a.id).localeCompare(String(b.id));
+    const t = compareCodeUnits(a['ontology/type'], b['ontology/type']);
+    return t !== 0 ? t : compareCodeUnits(a.id, b.id);
   });
 
   // Layer 1: Connectors
@@ -442,7 +443,7 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
   for (const t of sortedObjectTypes) {
     addNode(`type:${t.id}`, t.id, 'object-type', {
       name: t.name,
-      requiredAttributes: Object.keys(t.attributes).sort(),
+      requiredAttributes: Object.keys(t.attributes).sort(compareCodeUnits),
       key: t.key,
     });
   }
@@ -456,7 +457,7 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
   }
 
   // External join coverage + ObjectType <-> ObjectType join edges
-  const joins = computeJoinCoverage(snapshot).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const joins = computeJoinCoverage(snapshot).sort((a, b) => compareCodeUnits(a.name, b.name));
   for (const j of joins) {
     addEdge(`type:${j.leftType}`, `type:${j.rightType}`, `${j.name} (${j.leftKey}=${j.rightKey})`, 'join', {
       joinName: j.name,
@@ -640,8 +641,12 @@ export function encodeOntologyGraphDagCbor(graph) {
  * Verify a `yataverse.ontology.graph/v1` object against its declared `graphCid` (and/or caller
  * `expectedGraphCid`). Fails closed on missing CID, invalid CID shape/codec, schema mismatch,
  * or digest mismatch (including any array reordering such as `e1, e10, ...` vs `e1, e2, ...`).
+ *
+ * Distinguishes `graphVerification` (verified against canonical DAG-CBOR of the graph body) from
+ * `basisVerification` (the underlying `basisCid` snapshot block closure is NOT verified here
+ * unless the caller separately verified it via `verifyOntologySnapshot` and passes `basisVerified: true`).
  */
-export function verifyOntologyGraphCid(graph, { expectedGraphCid = null } = {}) {
+export function verifyOntologyGraphCid(graph, { expectedGraphCid = null, basisVerified = false } = {}) {
   if (!graph || typeof graph !== 'object' || Array.isArray(graph)) {
     throw new OntologyError('invalid-graph', 'graph must be an object');
   }
@@ -671,7 +676,26 @@ export function verifyOntologyGraphCid(graph, { expectedGraphCid = null } = {}) 
   if (expectedGraphCid && expectedGraphCid !== computedCid) {
     throw new OntologyError('graph-cid-mismatch', `expected ${expectedGraphCid} !== computed ${computedCid}`);
   }
-  return { verified: true, graphCid: computedCid, bytes, graph };
+  return {
+    verified: true,
+    graphCid: computedCid,
+    basisCid: graph.basisCid ?? null,
+    graphVerification: {
+      status: 'verified',
+      graphCid: computedCid,
+      codec: 'dag-cbor',
+      hash: 'sha2-256',
+    },
+    basisVerification: {
+      status: basisVerified ? 'verified' : 'unverified-by-graph-check',
+      basisCid: graph.basisCid ?? null,
+      note: basisVerified
+        ? 'Underlying ontology snapshot closure verified separately via verifyOntologySnapshot.'
+        : 'verifyOntologyGraphCid verifies graphCid over the graph body only; the underlying basisCid snapshot is not verified by this check.',
+    },
+    bytes,
+    graph,
+  };
 }
 
 /**

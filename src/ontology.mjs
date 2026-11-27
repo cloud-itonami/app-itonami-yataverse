@@ -54,6 +54,16 @@ export class OntologyError extends Error {
 
 const bad = (code, detail) => { throw new OntologyError(code, detail); };
 
+/**
+ * Locale-independent UTF-16 code-unit order (a < b ? -1 : a > b ? 1 : 0).
+ * Used for canonical array sorting; distinct from DAG-CBOR map key order (length-first UTF-8 bytes).
+ */
+export function compareCodeUnits(a, b) {
+  const sa = String(a);
+  const sb = String(b);
+  return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+
 /** Reject prototype-polluting object keys (__proto__, constructor, prototype). */
 export function assertSafeKey(key, context = 'object') {
   if (typeof key !== 'string' || FORBIDDEN_OBJECT_KEYS.has(key)) {
@@ -219,8 +229,8 @@ export function createRegistry({ objectTypes = [], connectors = [], includeDefau
   return {
     schema: ONTOLOGY_REGISTRY_SCHEMA,
     version: 1,
-    objectTypes: [...typeMap.values()].sort((a, b) => a.id.localeCompare(b.id)),
-    connectors: [...connectorMap.values()].sort((a, b) => a.id.localeCompare(b.id)),
+    objectTypes: [...typeMap.values()].sort((a, b) => compareCodeUnits(a.id, b.id)),
+    connectors: [...connectorMap.values()].sort((a, b) => compareCodeUnits(a.id, b.id)),
     objectTypesById: typeMap,
     connectorsById: connectorMap,
   };
@@ -723,7 +733,7 @@ function dedupeAndSortQuads(quads) {
     const k = `${rdfTermKey(q.subject)}|${rdfTermKey(q.predicate)}|${rdfTermKey(q.object)}|${rdfTermKey(q.graph)}`;
     if (!seen.has(k)) seen.set(k, q);
   }
-  return [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([, q]) => q);
+  return [...seen.entries()].sort((a, b) => compareCodeUnits(a[0], b[0])).map(([, q]) => q);
 }
 
 function attachProvenance(row, sources, jurisdictions) {
@@ -953,8 +963,8 @@ export function buildOntologySnapshot(input = {}, opts = {}) {
   }
 
   normalizedFacts.sort((a, b) => {
-    const t = String(a['ontology/type']).localeCompare(String(b['ontology/type']));
-    return t !== 0 ? t : String(a.id).localeCompare(String(b.id));
+    const t = compareCodeUnits(a['ontology/type'], b['ontology/type']);
+    return t !== 0 ? t : compareCodeUnits(a.id, b.id);
   });
 
   const explicitQuads = [];
@@ -975,7 +985,7 @@ export function buildOntologySnapshot(input = {}, opts = {}) {
   const typeIds = new Set(registry.objectTypes.map((t) => t.id));
   const joinMappings = rawJoins
     .map((j) => normalizeJoinMapping(j, typeIds))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .sort((a, b) => compareCodeUnits(a.name, b.name));
 
   let parentBasisCid = null;
   if (input.basisCid !== undefined && input.basisCid !== null) {

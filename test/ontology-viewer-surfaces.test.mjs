@@ -13,6 +13,8 @@ import {
   createDefaultOntologySnapshot,
 } from '../src/ontology-viz.mjs';
 import { checkWritableBlock } from '../src/block.mjs';
+import { encodeDagCbor, decodeDagCbor } from '../src/dag-cbor.mjs';
+import { toDagCborSafe, compareCodeUnits } from '../src/ontology.mjs';
 import {
   ONTOLOGY_OPERATIONS,
   NOUN_VERB_PATTERN,
@@ -150,17 +152,24 @@ test('Semantic UI contract: noun.verb operations, schemas, XSS-safe viewer, and 
   const verifiedFixture = verifyOntologyGraphCid(fixture);
   assert.equal(verifiedFixture.verified, true);
   assert.equal(verifiedFixture.graphCid, EXPECTED_FIXTURE_GRAPH_CID);
+  // Kougi condition (2): graphVerification vs basisVerification MUST be distinct
+  assert.equal(verifiedFixture.graphVerification.status, 'verified');
+  assert.equal(verifiedFixture.basisVerification.status, 'unverified-by-graph-check');
+  assert.equal(verifiedFixture.basisVerification.basisCid, fixture.basisCid);
+  assert.equal(verifyOntologyGraphCid(fixture, { basisVerified: true }).basisVerification.status, 'verified');
+
   // Rendering external fixture SVG succeeds when graphCid matches
   const fixtureSvg = renderOntologySvg(fixture);
   assert.match(fixtureSvg, /^<svg /);
 
-  // Negative: reordering edges lexicographically (e1, e10, e11, ..., e2) while keeping stale graphCid MUST fail closed
+  // KotobaSpec v1.0: lexicographically reordered edges (e1, e10, ...) -> exact recalculated CID & fail-closed mismatch
+  const EXPECTED_LEX_REORDERED_CID = 'bafyreid2ie7idv5vljfojdocazd4a4zqixz7di2nshjvvdbkknnitrye2i';
   const lexReorderedFixture = {
     ...fixture,
-    edges: [...fixture.edges].sort((a, b) => a.id.localeCompare(b.id)),
+    edges: [...fixture.edges].sort((a, b) => compareCodeUnits(a.id, b.id)),
   };
   assert.equal(lexReorderedFixture.edges[1].id, 'e10');
-  assert.notEqual(encodeOntologyGraphDagCbor(lexReorderedFixture).cid, EXPECTED_FIXTURE_GRAPH_CID);
+  assert.equal(encodeOntologyGraphDagCbor(lexReorderedFixture).cid, EXPECTED_LEX_REORDERED_CID);
   assert.throws(
     () => verifyOntologyGraphCid(lexReorderedFixture),
     (e) => e.code === 'graph-cid-mismatch',
@@ -173,6 +182,48 @@ test('Semantic UI contract: noun.verb operations, schemas, XSS-safe viewer, and 
     () => verifyOntologyGraphCid({ ...fixture, graphCid: undefined }),
     (e) => e.code === 'missing-graph-cid',
   );
+
+  // KotobaSpec v1.0: $awaiType "decimal" wire encoding vs CBOR integer encoding
+  const decodedFixtureCbor = decodeDagCbor(fromFixture.bytes).value;
+  assert.equal(decodedFixtureCbor.get('version'), 1n);
+  assert.equal(decodedFixtureCbor.get('joins')[0].get('coverageRatio'), 1n);
+  const gepsNode = decodedFixtureCbor.get('nodes').find((n) => n.get('id') === 'fact:tender:geps-2026-042');
+  const confCbor = gepsNode.get('meta').get('ontology/confidence');
+  assert.ok(confCbor instanceof Map);
+  assert.equal(confCbor.get('$awaiType'), 'decimal');
+  assert.equal(confCbor.get('value'), '0.92');
+  assert.throws(() => toDagCborSafe({ x: Number.NaN }), (e) => e.code === 'non-finite-number');
+  assert.throws(() => toDagCborSafe({ x: Infinity }), (e) => e.code === 'non-finite-number');
+
+  // KotobaSpec v1.0: filtered/projected graph issues fresh graphCid & preserves standard 3 layers even at nodeCount=0
+  const emptyLayersGraph = buildOntologyGraph(seededSnap, { activeLayers: [] });
+  assert.deepEqual(
+    emptyLayersGraph.layers.map((l) => [l.id, l.nodeCount]),
+    [['connector', 0], ['object-type', 0], ['fact', 0]],
+  );
+  const emptyCid = encodeOntologyGraphDagCbor(emptyLayersGraph).cid;
+  assert.notEqual(emptyCid, EXPECTED_FIXTURE_GRAPH_CID);
+  assert.equal(verifyOntologyGraphCid({ ...emptyLayersGraph, graphCid: emptyCid }).graphVerification.status, 'verified');
+
+  // Kougi condition (1): UTF-16 code-unit array order (U+10000 before U+E000)
+  // vs DAG-CBOR map key order (U+E000 [3 UTF-8 bytes] before U+10000 [4 UTF-8 bytes])
+  const u10000 = '\u{10000}';
+  const uE000 = '\uE000';
+  assert.equal(compareCodeUnits(u10000, uE000), -1);
+  const unicodeSnap = buildOntologySnapshot({
+    id: 'unicode-order-fixture',
+    facts: [
+      { id: uE000, connectorId: 'jp.kkj', status: 'open', jurisdiction: uE000 },
+      { id: u10000, connectorId: 'jp.kkj', status: 'open', jurisdiction: u10000 },
+    ],
+  });
+  const unicodeGraph = buildOntologyGraph(unicodeSnap);
+  const factNodeIds = unicodeGraph.nodes.filter((n) => n.layer === 'fact').map((n) => n.id);
+  assert.deepEqual(factNodeIds, [`fact:tender:${u10000}`, `fact:tender:${uE000}`]);
+  const unicodeCbor = decodeDagCbor(encodeDagCbor(toDagCborSafe({ [u10000]: 1, [uE000]: 2 }))).value;
+  assert.deepEqual([...unicodeCbor.keys()], [uE000, u10000]);
+  const decodedUnicodeGraph = decodeDagCbor(encodeOntologyGraphDagCbor(unicodeGraph).bytes).value;
+  assert.deepEqual([...decodedUnicodeGraph.get('coverage').get('byJurisdiction').keys()], [uE000, u10000]);
   assert.deepEqual(
     ONTOLOGY_OPERATIONS.map((o) => o.operation).sort(),
     [

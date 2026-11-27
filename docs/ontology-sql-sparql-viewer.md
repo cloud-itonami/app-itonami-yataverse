@@ -51,27 +51,39 @@ Reference fixture: [`test/fixtures/ontology-graph-v1.json`](../test/fixtures/ont
 | `joins` | `array` | External join coverage `{ name, leftType, rightType, leftKey, rightKey, kind, leftCount, rightCount, matchedLeft, matchedRows, coverageRatio }` |
 | `coverage` | `object` | `{ byConnector, byObjectType, byJurisdiction, totalJoins, totalMatchedJoinRows }` |
 
-### Canonical Array Ordering & `graphCid` Verification Contract
+### Canonical Array Ordering & `graphCid` Verification Contract (KotobaSpec v1.0, 2026-11-27)
 
-`graphCid` is the **CIDv1 (`dag-cbor` `0x71`, `sha2-256`)** of the canonical DAG-CBOR encoding of the `yataverse.ontology.graph/v1` body (excluding the outer `graphCid` field itself). Because DAG-CBOR encodes arrays in exact element order, **the array ordering of `layers`, `nodes`, `edges`, and `joins` is cryptographically bound into `graphCid`**:
+`graphCid` is the **CIDv1 (`dag-cbor` `0x71`, `sha2-256`)** of the canonical DAG-CBOR encoding of the `yataverse.ontology.graph/v1` body (excluding the outer `graphCid` field itself).
 
-1. **`layers`**: fixed ascending `order`: `connector` (`0`), `object-type` (`1`), `fact` (`2`), optional `rdf-subject` (`3`).
-2. **`nodes`**: grouped by layer order:
-   - `connector`: sorted lexicographically by connector `id`
-   - `object-type`: sorted lexicographically by object type `id`
-   - `fact`: sorted by `(ontology/type, id)`
+**Numeric / Type Normalization (`toDagCborSafe`)**:
+- Safe integers (e.g. `version: 1`, `coverageRatio: 1`) encode as CBOR integers.
+- Non-integer finite decimals (e.g. `ontology/confidence: 0.92`, `0.96`, `coverageRatio: 0.5`) NEVER encode as CBOR floats; they encode as `{"$awaiType": "decimal", "value": "<canonical-decimal-string>"}` (`NaN` / `±Infinity` refused).
+
+**String Ordering Distinction**:
+- **Array element sorting** uses locale-independent **UTF-16 code-unit order** (`a < b ? -1 : a > b ? 1 : 0`, `compareCodeUnits`): e.g. `U+10000` (`0xD800 0xDC00`) sorts **before** `U+E000` (`0xE000`).
+- **DAG-CBOR map key sorting** uses RFC 8949 / IPLD DAG-CBOR **length-first UTF-8 byte order**: e.g. `U+E000` (3 UTF-8 bytes) sorts **before** `U+10000` (4 UTF-8 bytes).
+
+Because DAG-CBOR encodes arrays in exact element order, **the array ordering of `layers`, `nodes`, `edges`, and `joins` is cryptographically bound into `graphCid`**:
+
+1. **`layers`**: fixed ascending `order`: `connector` (`0`), `object-type` (`1`), `fact` (`2`), optional `rdf-subject` (`3`). The 3 standard layers (`connector`, `object-type`, `fact`) are preserved even when `nodeCount: 0`.
+2. **`nodes`**: grouped by layer `order`:
+   - `connector`: sorted in UTF-16 code-unit ascending order by connector `id`
+   - `object-type`: sorted in UTF-16 code-unit ascending order by object type `id`
+   - `fact`: sorted in UTF-16 code-unit ascending order by `(ontology/type, id)`
    - `rdf-subject` (optional): encounter order of sorted snapshot quads
 3. **`edges`**: sequential numeric IDs `e1`, `e2`, ..., `eN` (integer order matching array index `i + 1`, **never** lexicographical `e1, e10, ...`):
    - Connector provenance edges (`connector -> object-type`, `produces`) in connector `id` order
    - Schema join edges (`object-type -> object-type`, `join`) in `joinMappings` `name` order
    - Fact edges (`fact -> object-type` `instance`, immediately followed by `fact -> connector` `provenance`) in fact `(ontology/type, id)` order
    - Fact-to-fact `join-instance` edges in `joinMappings` `name` order, then included left-fact order, then included right-fact order
-4. **`joins`**: sorted lexicographically by join `name`.
+4. **`joins`**: sorted in UTF-16 code-unit ascending order by join `name`.
 
-**Fail-closed verification (`verifyOntologyGraphCid`)**:
+**Fail-closed verification & `graphVerification` vs `basisVerification` (`verifyOntologyGraphCid`)**:
 - Any external consumer/renderer receiving a `yataverse.ontology.graph/v1` payload carrying `graphCid` MUST verify that `encodeOntologyGraphDagCbor(graph).cid === graph.graphCid` (automatically enforced by `verifyOntologyGraphCid` and `renderOntologySvg`).
 - Reordering any array (for example sorting `edges` lexicographically as `e1, e10, e11, ..., e2`) while retaining the original `graphCid` MUST fail closed with `OntologyError('graph-cid-mismatch')`.
-- Reference fixture `test/fixtures/ontology-graph-v1.json` binds `basisCid = bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em` to `graphCid = bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq`.
+- Any transform/filter/projection output MUST recompute a fresh `graphCid` from the output body and never reuse an input `graphCid`.
+- `verifyOntologyGraphCid` explicitly separates `graphVerification` (`status: 'verified'`) from `basisVerification` (`status: 'unverified-by-graph-check'` by default): verifying `graphCid` authenticates the graph payload only and does NOT imply that the underlying `basisCid` snapshot block closure was verified (which requires `verifyOntologySnapshot`).
+- Reference fixture `test/fixtures/ontology-graph-v1.json` binds `basisCid = bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em` to `graphCid = bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq` (lexicographically reordered `e1,e10,...` graph hashes to `bafyreid2ie7idv5vljfojdocazd4a4zqixz7di2nshjvvdbkknnitrye2i`).
 
 Standalone SVG output (`renderOntologySvg` with default `interactive: false`) omits `role="button"` and `tabindex` on static graph nodes; interactive keyboard/button roles are emitted only inside the interactive Viewer HTML (`interactive: true`).
 

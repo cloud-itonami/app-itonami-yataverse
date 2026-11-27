@@ -12,7 +12,7 @@
 import {
   DEFAULT_BASE_IRI, RDF_TYPE, XSD_NS,
   iriTerm, literalTerm, bnodeTerm, rdfTermKey, rdfTermsEqual,
-  buildVisibilityFilter, resolveBoundedLimits, clampLimit,
+  buildVisibilityFilter, resolveBoundedLimits, clampLimit, compareCodeUnits,
   factSubjectIri, FORBIDDEN_OBJECT_KEYS,
 } from './ontology.mjs';
 
@@ -1289,8 +1289,8 @@ function compareTerms(a, b) {
   if (!b) return 1;
   const na = numericValue(a), nb = numericValue(b);
   if (na !== null && nb !== null) return na - nb;
-  if (a.rdfType !== b.rdfType) return a.rdfType.localeCompare(b.rdfType);
-  return String(a.value).localeCompare(String(b.value));
+  if (a.rdfType !== b.rdfType) return compareCodeUnits(a.rdfType, b.rdfType);
+  return compareCodeUnits(a.value, b.value);
 }
 
 function getCompiledRegex(pat, flags, state) {
