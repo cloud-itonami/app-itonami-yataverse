@@ -1,0 +1,791 @@
+// Reusable zero-dependency IPLD / Ontology Visualization Library.
+//
+// Builds a canonical layered graph model (nodes, edges, layers, joins, coverage) from:
+// - Verified IPLD / DAG-CBOR OntologySnapshots (src/ontology.mjs)
+// - kotoba.ontology / kotoba.ontology.connector provenance metadata
+// - EAVT / RDF quads and external join mappings
+//
+// Renders:
+// - Canonical JSON graph model & canonical DAG-CBOR graph encoding (CIDv1 sha2-256)
+// - Standalone deterministic, XSS-safe SVG graph
+// - Interactive Semantic HTML5 Ontology Viewer (SVG + Node Inspector + SQL/SPARQL Console + Join Coverage)
+// - Yataverse root landing page with immediate Ontology Viewer entry
+//
+// Zero external UI frameworks; pure semantic HTML5 + minimal inline CSS/JS; read-only & fail-closed.
+
+import { cidFor, CODEC_DAG_CBOR } from './cid.mjs';
+import { encodeDagCbor } from './dag-cbor.mjs';
+import {
+  buildOntologySnapshot,
+  toDagCborSafe,
+  normalizeKeyword,
+} from './ontology.mjs';
+
+export const ONTOLOGY_GRAPH_SCHEMA = 'yataverse.ontology.graph/v1';
+
+/** XML / HTML attribute and text escaping for XSS-safe SVG and HTML rendering. */
+export function escapeXml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** Escape JSON embedded inside <script type="application/json">. */
+function safeJsonScript(obj) {
+  return JSON.stringify(obj).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+}
+
+/**
+ * Deterministic seeded default ontology snapshot using kotoba.ontology (:tender)
+ * and kotoba.ontology.connector (:jp.kkj, :jp.geps) + agency external join mapping.
+ */
+let cachedDefaultSnapshot = null;
+export function createDefaultOntologySnapshot() {
+  if (cachedDefaultSnapshot) return cachedDefaultSnapshot;
+  cachedDefaultSnapshot = buildOntologySnapshot({
+    id: 'yataverse-seeded-kotoba-ontology',
+    createdAt: '2026-11-27T00:00:00Z',
+    objectTypes: [
+      {
+        id: 'agency',
+        name: 'Procurement Agency',
+        attributes: { name: 'string', jurisdiction: 'keyword' },
+        key: ['name'],
+      },
+    ],
+    connectors: [
+      {
+        id: 'jp.agencies',
+        name: 'Japan Public Agency Registry',
+        objectType: 'agency',
+        status: 'implemented',
+      },
+    ],
+    facts: [
+      {
+        id: 'kkj-2026-001',
+        connectorId: 'jp.kkj',
+        status: 'open',
+        title: 'Content-Addressed Archive Gateway Pilot',
+        agency_id: 'ag-digital',
+        jurisdiction: 'jp-national',
+        amount: 12000000,
+        'ontology/fetched-at': '2026-11-27T00:00:00Z',
+        'ontology/confidence': 0.96,
+      },
+      {
+        id: 'geps-2026-042',
+        connectorId: 'jp.geps',
+        status: 'awarded',
+        title: 'Municipal Open-Data Catalog Federation',
+        agency_id: 'ag-tokyo',
+        jurisdiction: 'jp-tokyo',
+        amount: 8500000,
+        'ontology/fetched-at': '2026-11-27T00:00:00Z',
+        'ontology/confidence': 0.92,
+      },
+      {
+        id: 'ag-digital',
+        connectorId: 'jp.agencies',
+        name: 'Digital Agency',
+        jurisdiction: 'jp-national',
+      },
+      {
+        id: 'ag-tokyo',
+        connectorId: 'jp.agencies',
+        name: 'Tokyo Metropolitan Government',
+        jurisdiction: 'jp-tokyo',
+      },
+    ],
+    joinMappings: [
+      {
+        name: 'tender_with_agency',
+        leftType: 'tender',
+        rightType: 'agency',
+        leftKey: 'agency_id',
+        rightKey: 'id',
+        kind: 'inner',
+      },
+    ],
+  });
+  return cachedDefaultSnapshot;
+}
+
+/**
+ * Compute external join coverage rows and summary statistics for a snapshot.
+ */
+export function computeJoinCoverage(snapshot) {
+  const joins = [];
+  for (const j of snapshot.joinMappings ?? []) {
+    const leftRows = snapshot.tables?.get(j.leftType.toLowerCase())?.rows ?? [];
+    const rightRows = snapshot.tables?.get(j.rightType.toLowerCase())?.rows ?? [];
+    const lk = j.leftKey.replace(/[./-]/g, '_');
+    const rk = j.rightKey.replace(/[./-]/g, '_');
+    const rightKeys = new Set();
+    for (const r of rightRows) {
+      if (r[rk] !== undefined && r[rk] !== null) rightKeys.add(String(r[rk]));
+    }
+    let matchedLeft = 0;
+    let matchedRows = 0;
+    const rightCounts = new Map();
+    for (const r of rightRows) {
+      if (r[rk] !== undefined && r[rk] !== null) {
+        const k = String(r[rk]);
+        rightCounts.set(k, (rightCounts.get(k) ?? 0) + 1);
+      }
+    }
+    for (const l of leftRows) {
+      if (l[lk] !== undefined && l[lk] !== null && rightKeys.has(String(l[lk]))) {
+        matchedLeft += 1;
+        matchedRows += rightCounts.get(String(l[lk])) ?? 0;
+      }
+    }
+    const coverageRatio = leftRows.length > 0 ? Math.round((matchedLeft / leftRows.length) * 1000) / 1000 : 0;
+    joins.push({
+      name: j.name,
+      leftType: j.leftType,
+      rightType: j.rightType,
+      leftKey: j.leftKey,
+      rightKey: j.rightKey,
+      kind: j.kind,
+      leftCount: leftRows.length,
+      rightCount: rightRows.length,
+      matchedLeft,
+      matchedRows,
+      coverageRatio,
+    });
+  }
+  return joins;
+}
+
+/**
+ * Build the canonical layered ontology graph model (`nodes`, `edges`, `layers`, `joins`, `coverage`).
+ * Pure function, deterministic ordering, bounded by `maxNodes`.
+ */
+export function buildOntologyGraph(snapshot, { maxNodes = 64, includeRdfSubjects = false } = {}) {
+  const nodes = [];
+  const edges = [];
+  const nodeMap = new Map();
+
+  const addNode = (id, label, layer, meta = {}) => {
+    if (nodeMap.has(id) || nodes.length >= maxNodes) return false;
+    const node = { id, label, kind: layer, layer, meta };
+    nodeMap.set(id, node);
+    nodes.push(node);
+    return true;
+  };
+
+  let edgeSeq = 0;
+  const addEdge = (from, to, label, kind, meta = {}) => {
+    if (!nodeMap.has(from) || !nodeMap.has(to)) return;
+    edges.push({ id: `e${++edgeSeq}`, from, to, label, kind, meta });
+  };
+
+  // Layer 1: Connectors (external-data provenance sources)
+  for (const c of snapshot.registry.connectors) {
+    addNode(`connector:${c.id}`, c.id, 'connector', {
+      name: c.name,
+      objectType: c.objectType,
+      status: c.status,
+      ...(c.repo ? { repo: c.repo } : {}),
+    });
+  }
+
+  // Layer 2: Object Types (kotoba.ontology schema)
+  for (const t of snapshot.registry.objectTypes) {
+    addNode(`type:${t.id}`, t.id, 'object-type', {
+      name: t.name,
+      requiredAttributes: Object.keys(t.attributes).sort(),
+      key: t.key,
+    });
+  }
+
+  // Connector -> ObjectType provenance edges
+  for (const c of snapshot.registry.connectors) {
+    addEdge(`connector:${c.id}`, `type:${c.objectType}`, 'produces', 'provenance', {
+      connectorId: c.id,
+      objectType: c.objectType,
+    });
+  }
+
+  // External join coverage + ObjectType <-> ObjectType join edges
+  const joins = computeJoinCoverage(snapshot);
+  for (const j of joins) {
+    addEdge(`type:${j.leftType}`, `type:${j.rightType}`, `${j.name} (${j.leftKey}=${j.rightKey})`, 'join', {
+      joinName: j.name,
+      kind: j.kind,
+      matchedRows: j.matchedRows,
+      coverageRatio: j.coverageRatio,
+    });
+  }
+
+  // Layer 3: Facts (provenance-tagged entities)
+  const factNodeByTypeId = new Map();
+  for (const f of snapshot.facts) {
+    const typeId = f['ontology/type'];
+    const nid = `fact:${typeId}:${f.id}`;
+    factNodeByTypeId.set(`${typeId}:${f.id}`, nid);
+    const added = addNode(nid, `${typeId}:${f.id}`, 'fact', {
+      id: f.id,
+      'ontology/type': typeId,
+      'ontology/source': f['ontology/source'],
+      ...(f['ontology/fetched-at'] ? { 'ontology/fetched-at': f['ontology/fetched-at'] } : {}),
+      ...(f['ontology/confidence'] !== undefined ? { 'ontology/confidence': f['ontology/confidence'] } : {}),
+      ...(f.status !== undefined ? { status: f.status } : {}),
+      ...(f.title !== undefined ? { title: f.title } : {}),
+      ...(f.name !== undefined ? { name: f.name } : {}),
+      ...(f.jurisdiction !== undefined ? { jurisdiction: f.jurisdiction } : {}),
+      ...(f.amount !== undefined ? { amount: f.amount } : {}),
+    });
+    if (added) {
+      addEdge(nid, `type:${typeId}`, 'ontology/type', 'instance', { source: f['ontology/source'] });
+      addEdge(nid, `connector:${f['ontology/source']}`, 'ontology/source', 'provenance', { source: f['ontology/source'] });
+    }
+  }
+
+  // Fact-to-fact join instance edges (for declared joinMappings)
+  for (const j of joins) {
+    const leftFacts = snapshot.facts.filter((f) => f['ontology/type'] === j.leftType);
+    const rightByKey = new Map();
+    for (const rf of snapshot.facts) {
+      if (rf['ontology/type'] !== j.rightType) continue;
+      const val = rf[j.rightKey];
+      if (val !== undefined && val !== null) {
+        const k = String(val);
+        const list = rightByKey.get(k) ?? [];
+        list.push(rf);
+        rightByKey.set(k, list);
+      }
+    }
+    for (const lf of leftFacts) {
+      const val = lf[j.leftKey];
+      if (val === undefined || val === null) continue;
+      const matches = rightByKey.get(String(val)) ?? [];
+      for (const rf of matches) {
+        addEdge(
+          `fact:${j.leftType}:${lf.id}`,
+          `fact:${j.rightType}:${rf.id}`,
+          j.name,
+          'join-instance',
+          { leftKey: j.leftKey, rightKey: j.rightKey },
+        );
+      }
+    }
+  }
+
+  // Optional Layer 4: Standalone RDF quad subjects not projected from facts
+  if (includeRdfSubjects) {
+    const basePrefix = `${snapshot.baseIri}entity/`;
+    const seenSubj = new Set();
+    for (const q of snapshot.quads) {
+      if (nodes.length >= maxNodes) break;
+      const sv = q.subject.value;
+      if (sv.startsWith(basePrefix) || seenSubj.has(sv)) continue;
+      seenSubj.add(sv);
+      addNode(`rdf:${sv}`, sv.split(/[#/:]/).filter(Boolean).slice(-1)[0] || sv, 'rdf-subject', {
+        iri: sv,
+        rdfType: q.subject.rdfType,
+      });
+    }
+  }
+
+  // Provenance & coverage summary
+  const byConnector = {};
+  const byObjectType = {};
+  const byJurisdiction = {};
+  for (const f of snapshot.facts) {
+    const src = normalizeKeyword(f['ontology/source']) ?? 'unknown';
+    const tp = normalizeKeyword(f['ontology/type']) ?? 'unknown';
+    byConnector[src] = (byConnector[src] ?? 0) + 1;
+    byObjectType[tp] = (byObjectType[tp] ?? 0) + 1;
+    if (f.jurisdiction) {
+      const jur = normalizeKeyword(String(f.jurisdiction)) ?? String(f.jurisdiction);
+      byJurisdiction[jur] = (byJurisdiction[jur] ?? 0) + 1;
+    }
+  }
+
+  const layerCounts = { connector: 0, 'object-type': 0, fact: 0, 'rdf-subject': 0 };
+  for (const n of nodes) layerCounts[n.layer] = (layerCounts[n.layer] ?? 0) + 1;
+
+  const layers = [
+    { id: 'connector', label: 'Connectors', order: 0, nodeCount: layerCounts.connector },
+    { id: 'object-type', label: 'Object Types', order: 1, nodeCount: layerCounts['object-type'] },
+    { id: 'fact', label: 'Facts (Provenance-Tagged)', order: 2, nodeCount: layerCounts.fact },
+    ...(layerCounts['rdf-subject'] > 0
+      ? [{ id: 'rdf-subject', label: 'RDF Subjects', order: 3, nodeCount: layerCounts['rdf-subject'] }]
+      : []),
+  ];
+
+  const totalCandidates = snapshot.registry.objectTypes.length + snapshot.registry.connectors.length + snapshot.facts.length;
+  return {
+    schema: ONTOLOGY_GRAPH_SCHEMA,
+    version: 1,
+    basisCid: snapshot.basisCid,
+    id: snapshot.id,
+    stats: snapshot.stats,
+    layers,
+    nodes,
+    edges,
+    joins,
+    coverage: {
+      byConnector,
+      byObjectType,
+      byJurisdiction,
+      totalJoins: joins.length,
+      totalMatchedJoinRows: joins.reduce((s, j) => s + j.matchedRows, 0),
+    },
+    truncated: totalCandidates > nodes.length,
+  };
+}
+
+/** Encode a canonical OntologyGraph to canonical DAG-CBOR bytes and compute its CIDv1 (sha2-256). */
+export function encodeOntologyGraphDagCbor(graph) {
+  const bytes = encodeDagCbor(toDagCborSafe(graph));
+  const cid = cidFor(bytes, CODEC_DAG_CBOR);
+  return { cid, bytes };
+}
+
+/** Deterministic, standalone, XSS-safe SVG graph renderer for an OntologySnapshot or OntologyGraph. */
+export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64 } = {}) {
+  const graph = snapshotOrGraph?.schema === ONTOLOGY_GRAPH_SCHEMA
+    ? snapshotOrGraph
+    : buildOntologyGraph(snapshotOrGraph, { maxNodes });
+
+  const cols = { connector: 120, 'object-type': 420, fact: 740, 'rdf-subject': 1020 };
+  const hasRdfLayer = graph.nodes.some((n) => n.layer === 'rdf-subject');
+  const width = hasRdfLayer ? 1160 : 900;
+  const rowsByLayer = { connector: 0, 'object-type': 0, fact: 0, 'rdf-subject': 0 };
+  const positions = new Map();
+
+  for (const n of graph.nodes) {
+    const row = rowsByLayer[n.layer] ?? 0;
+    rowsByLayer[n.layer] = row + 1;
+    positions.set(n.id, { x: cols[n.layer] ?? 420, y: 74 + row * 68 });
+  }
+
+  const maxRows = Math.max(1, ...Object.values(rowsByLayer));
+  const height = Math.max(240, 100 + maxRows * 68);
+
+  const palette = {
+    connector: { bg: '#e8f4f8', stroke: '#1d6f8a' },
+    'object-type': { bg: '#eef7ea', stroke: '#2f6f3e' },
+    fact: { bg: '#f7f3e9', stroke: '#8a6220' },
+    'rdf-subject': { bg: '#f3eefd', stroke: '#6d28d9' },
+  };
+
+  const parts = [
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Ontology Graph for ${escapeXml(graph.basisCid)}" data-basis-cid="${escapeXml(graph.basisCid)}">`,
+    '<defs><marker id="yv-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#5c6670"/></marker></defs>',
+    `<rect x="0" y="0" width="${width}" height="${height}" fill="#fafbfc" rx="8"/>`,
+  ];
+
+  for (const layer of graph.layers) {
+    const lx = (cols[layer.id] ?? 420) - 90;
+    parts.push(`<text x="${lx}" y="30" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="600" fill="#334155">${escapeXml(layer.label)} (${layer.nodeCount})</text>`);
+  }
+
+  for (const e of graph.edges) {
+    const a = positions.get(e.from);
+    const b = positions.get(e.to);
+    if (!a || !b) continue;
+    let x1 = a.x;
+    let y1 = a.y;
+    let x2 = b.x;
+    let y2 = b.y;
+    if (a.x < b.x) { x1 += 92; x2 -= 92; }
+    else if (a.x > b.x) { x1 -= 92; x2 += 92; }
+    else { y1 += a.y < b.y ? 20 : -20; y2 += a.y < b.y ? -20 : 20; }
+    const mx = (x1 + x2) / 2;
+    const my = (y1 + y2) / 2 - 5;
+    const isJoin = e.kind === 'join' || e.kind === 'join-instance';
+    const stroke = isJoin ? '#2563eb' : '#64748b';
+    const dash = isJoin ? ' stroke-dasharray="5,3"' : '';
+    parts.push(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-width="1.5"${dash} marker-end="url(#yv-arrow)" data-edge-id="${escapeXml(e.id)}" data-edge-kind="${escapeXml(e.kind)}"/>`);
+    parts.push(`<text x="${mx}" y="${my}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#475569">${escapeXml(e.label)}</text>`);
+  }
+
+  for (const n of graph.nodes) {
+    const p = positions.get(n.id);
+    const st = palette[n.layer] ?? { bg: '#ffffff', stroke: '#334155' };
+    const text = n.label.length > 24 ? `${n.label.slice(0, 21)}...` : n.label;
+    parts.push(`<g class="yv-node" tabindex="0" role="button" aria-label="${escapeXml(n.label)}" data-node-id="${escapeXml(n.id)}" data-node-kind="${escapeXml(n.kind)}" data-layer="${escapeXml(n.layer)}">`);
+    parts.push(`<rect x="${p.x - 92}" y="${p.y - 20}" width="184" height="40" rx="6" fill="${st.bg}" stroke="${st.stroke}" stroke-width="1.5"/>`);
+    parts.push(`<text x="${p.x}" y="${p.y + 4}" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#0f172a">${escapeXml(text)}</text>`);
+    parts.push('</g>');
+  }
+
+  parts.push('</svg>');
+  return parts.join('\n');
+}
+
+/**
+ * Render the interactive, self-contained Semantic HTML5 Ontology Viewer.
+ * Includes SVG graph, clickable node detail inspector, SQL/SPARQL query consoles,
+ * external join coverage table, CID loader, and embedded noun.verb Semantic UI schema.
+ */
+export function renderOntologyHtml(snapshot, {
+  title,
+  maxNodes = 64,
+  apiBase = '/ontology/v1',
+  sqlEndpoint = '/ontology/sql',
+  sparqlEndpoint = '/ontology/sparql',
+  viewerPath = '/ontology/viewer',
+  graphEndpoint = '/ontology/graph',
+  schema,
+  inspection,
+  isSeededDefault = false,
+} = {}) {
+  const graph = buildOntologyGraph(snapshot, { maxNodes });
+  const svg = renderOntologySvg(graph, { maxNodes });
+  const safeTitle = title ?? `Yataverse Ontology Viewer — ${snapshot.id}`;
+  const defaultSqlTable = snapshot.registry.objectTypes[0]?.id ?? 'ontology_facts';
+  const defaultSql = `SELECT * FROM ${defaultSqlTable} LIMIT 25`;
+  const defaultSparql = 'SELECT ?s ?p ?o WHERE { ?s ?p ?o . } LIMIT 25';
+
+  const typeRows = snapshot.registry.objectTypes.map((t) =>
+    `<tr><td><code>${escapeXml(t.id)}</code></td><td>${escapeXml(t.name)}</td><td><code>${escapeXml(Object.keys(t.attributes).join(', '))}</code></td></tr>`
+  ).join('\n');
+
+  const connectorRows = snapshot.registry.connectors.map((c) =>
+    `<tr><td><code>${escapeXml(c.id)}</code></td><td>${escapeXml(c.name)}</td><td><code>${escapeXml(c.objectType)}</code></td><td>${escapeXml(c.status)}</td></tr>`
+  ).join('\n');
+
+  const joinRows = graph.joins.length
+    ? graph.joins.map((j) =>
+      `<tr><td><code>${escapeXml(j.name)}</code></td><td><code>${escapeXml(j.leftType)}.${escapeXml(j.leftKey)}</code></td><td><code>${escapeXml(j.rightType)}.${escapeXml(j.rightKey)}</code></td><td>${escapeXml(j.kind)}</td><td>${j.leftCount} / ${j.rightCount}</td><td>${j.matchedRows}</td><td>${Math.round(j.coverageRatio * 100)}%</td></tr>`
+    ).join('\n')
+    : '<tr><td colspan="7">No join mappings declared on this snapshot.</td></tr>';
+
+  const tablesList = inspection?.tables ?? [...snapshot.tables.values()].map((t) => ({
+    name: t.name,
+    rowCount: t.rows.length,
+    columns: t.rows[0] ? Object.keys(t.rows[0]) : [],
+  }));
+  const tableRows = tablesList.map((t) =>
+    `<tr><td><code>${escapeXml(t.name)}</code></td><td>${t.rowCount}</td><td><code>${escapeXml(t.columns.join(', '))}</code></td></tr>`
+  ).join('\n');
+
+  const opsList = schema?.operations ?? [];
+  const opRows = opsList.map((op) =>
+    `<tr><td><code>${escapeXml(op.operation)}</code></td><td>${escapeXml(op.noun)}</td><td>${escapeXml(op.verb)}</td><td>${op.readOnly ? 'read-only' : 'write'}</td><td>${escapeXml(op.summary)}</td></tr>`
+  ).join('\n');
+
+  const graphUrl = isSeededDefault
+    ? graphEndpoint
+    : `${graphEndpoint}?cid=${encodeURIComponent(snapshot.basisCid)}`;
+  const graphCborUrl = isSeededDefault
+    ? `${graphEndpoint}?format=dag-cbor`
+    : `${graphEndpoint}?cid=${encodeURIComponent(snapshot.basisCid)}&format=dag-cbor`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeXml(safeTitle)}</title>
+  <style>
+    :root { --yv-bg: #f8fafc; --yv-surface: #ffffff; --yv-border: #cbd5e1; --yv-ink: #0f172a; --yv-muted: #475569; --yv-accent: #1d4ed8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--yv-bg); color: var(--yv-ink); line-height: 1.5; }
+    header, main { max-width: 1180px; margin: 0 auto; padding: 1rem 1.25rem; }
+    header { border-bottom: 1px solid var(--yv-border); background: var(--yv-surface); }
+    h1 { margin: 0 0 0.25rem 0; font-size: 1.4rem; }
+    h2 { margin: 0 0 0.75rem 0; font-size: 1.1rem; }
+    h3 { margin: 1rem 0 0.4rem 0; font-size: 0.98rem; }
+    .yv-meta { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.84rem; color: var(--yv-muted); word-break: break-all; }
+    .yv-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; margin: 1rem 0; }
+    .yv-card { background: var(--yv-surface); border: 1px solid var(--yv-border); border-radius: 8px; padding: 0.75rem 1rem; }
+    .yv-card strong { display: block; font-size: 1.35rem; }
+    .yv-split { display: grid; grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr); gap: 1rem; align-items: start; }
+    @media (max-width: 860px) { .yv-split { grid-template-columns: 1fr; } }
+    section, aside { background: var(--yv-surface); border: 1px solid var(--yv-border); border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+    .yv-split section, .yv-split aside { margin: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--yv-border); vertical-align: top; }
+    th { background: #f1f5f9; }
+    textarea, input[type="text"] { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88rem; padding: 0.5rem; border: 1px solid var(--yv-border); border-radius: 6px; }
+    textarea { min-height: 5.5rem; }
+    .yv-inline-form { display: flex; gap: 0.5rem; margin-top: 0.6rem; flex-wrap: wrap; }
+    .yv-inline-form input[type="text"] { flex: 1 1 320px; }
+    button { padding: 0.45rem 0.9rem; border: 1px solid var(--yv-accent); background: var(--yv-accent); color: #ffffff; border-radius: 6px; cursor: pointer; font-weight: 600; }
+    pre { background: #0f172a; color: #e2e8f0; padding: 0.75rem; border-radius: 6px; overflow: auto; font-size: 0.8rem; max-height: 320px; }
+    .yv-graph { overflow-x: auto; }
+    .yv-node { cursor: pointer; }
+    .yv-node:hover rect, .yv-node[data-selected="true"] rect { stroke-width: 3; }
+    nav { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 0.5rem; font-size: 0.9rem; }
+    nav a { color: var(--yv-accent); text-decoration: none; }
+    .yv-console-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 1rem; }
+    .yv-result-table { margin-top: 0.6rem; overflow-x: auto; }
+  </style>
+</head>
+<body data-basis-cid="${escapeXml(snapshot.basisCid)}" data-schema="${escapeXml(snapshot.schema)}">
+  <header>
+    <h1>${escapeXml(safeTitle)}</h1>
+    <div class="yv-meta">basisCid: <code>${escapeXml(snapshot.basisCid)}</code> · schema: <code>${escapeXml(snapshot.schema)}</code> · read-only${isSeededDefault ? ' · seeded kotoba.ontology demo' : ' · verified IPLD block closure'}</div>
+    <nav aria-label="Viewer navigation">
+      <a href="/">Home</a>
+      <a href="#graph">Graph &amp; Inspector</a>
+      <a href="#consoles">SQL &amp; SPARQL Console</a>
+      <a href="#joins">External Joins</a>
+      <a href="#registry">Registry &amp; Tables</a>
+      <a href="#operations">Semantic Operations</a>
+      <a href="${escapeXml(graphUrl)}">Graph JSON</a>
+      <a href="${escapeXml(graphCborUrl)}">Graph DAG-CBOR</a>
+    </nav>
+    <form class="yv-inline-form" method="get" action="${escapeXml(viewerPath)}" data-operation="ontology.view">
+      <label for="yv-cid-input" style="position:absolute;width:1px;height:1px;overflow:hidden;">Load Ontology CID</label>
+      <input id="yv-cid-input" name="cid" type="text" placeholder="bafyrei... (load a verified DAG-CBOR ontology snapshot CID from Yataverse)" value="${isSeededDefault ? '' : escapeXml(snapshot.basisCid)}">
+      <button type="submit">Inspect CID</button>
+    </form>
+  </header>
+
+  <main>
+    <div class="yv-grid" aria-label="Snapshot summary">
+      <article class="yv-card"><span>Object Types</span><strong>${snapshot.stats.objectTypes}</strong></article>
+      <article class="yv-card"><span>Connectors</span><strong>${snapshot.stats.connectors}</strong></article>
+      <article class="yv-card"><span>Facts</span><strong>${snapshot.stats.facts}</strong></article>
+      <article class="yv-card"><span>RDF Quads</span><strong>${snapshot.stats.quads}</strong></article>
+      <article class="yv-card"><span>Join Mappings</span><strong>${snapshot.stats.joins}</strong></article>
+    </div>
+
+    <div class="yv-split" id="graph">
+      <section aria-labelledby="graph-heading" data-operation="ontology.graph">
+        <h2 id="graph-heading">Ontology Graph (Click a node to inspect)</h2>
+        <div class="yv-graph">${svg}</div>
+      </section>
+      <aside aria-labelledby="inspector-heading" id="yv-node-inspector" data-operation="ontology.inspect">
+        <h2 id="inspector-heading">Node Detail Inspector</h2>
+        <p class="yv-meta" id="yv-inspector-summary">Select any connector, object type, or fact node in the graph.</p>
+        <pre id="yv-inspector-json">{}</pre>
+      </aside>
+    </div>
+
+    <div class="yv-console-grid" id="consoles">
+      <section aria-labelledby="sql-heading">
+        <h2 id="sql-heading">SQL Query Console (Read-Only)</h2>
+        <form data-operation="ontology.query_sql" id="yv-sql-form">
+          <label for="yv-sql-input">SQL SELECT (pinned to basisCid)</label>
+          <textarea id="yv-sql-input" name="query">${escapeXml(defaultSql)}</textarea>
+          <button type="submit">Run ontology.query_sql</button>
+        </form>
+        <div class="yv-result-table" id="yv-sql-table"></div>
+        <pre id="yv-sql-out" aria-live="polite">Submit a SQL SELECT query against ${escapeXml(snapshot.basisCid)}.</pre>
+      </section>
+
+      <section aria-labelledby="sparql-heading">
+        <h2 id="sparql-heading">SPARQL Query Console (Read-Only)</h2>
+        <form data-operation="ontology.query_sparql" id="yv-sparql-form">
+          <label for="yv-sparql-input">SPARQL (SELECT / ASK / CONSTRUCT / DESCRIBE)</label>
+          <textarea id="yv-sparql-input" name="query">${escapeXml(defaultSparql)}</textarea>
+          <button type="submit">Run ontology.query_sparql</button>
+        </form>
+        <div class="yv-result-table" id="yv-sparql-table"></div>
+        <pre id="yv-sparql-out" aria-live="polite">Submit a SPARQL query against ${escapeXml(snapshot.basisCid)}.</pre>
+      </section>
+    </div>
+
+    <section id="joins" aria-labelledby="joins-heading">
+      <h2 id="joins-heading">External Join Coverage</h2>
+      <table>
+        <thead><tr><th>Join</th><th>Left</th><th>Right</th><th>Kind</th><th>Left / Right Rows</th><th>Matched</th><th>Coverage</th></tr></thead>
+        <tbody>${joinRows}</tbody>
+      </table>
+    </section>
+
+    <section id="registry" aria-labelledby="registry-heading" data-operation="ontology.inspect">
+      <h2 id="registry-heading">Vocabulary Registry &amp; Relational Tables</h2>
+      <h3>Object Types</h3>
+      <table><thead><tr><th>ID</th><th>Name</th><th>Required Attributes</th></tr></thead><tbody>${typeRows}</tbody></table>
+      <h3>Registered Connectors</h3>
+      <table><thead><tr><th>ID</th><th>Name</th><th>Object Type</th><th>Status</th></tr></thead><tbody>${connectorRows}</tbody></table>
+      <h3>Projected Tables</h3>
+      <table><thead><tr><th>Table</th><th>Rows</th><th>Columns</th></tr></thead><tbody>${tableRows}</tbody></table>
+    </section>
+
+    <section id="operations" aria-labelledby="ops-heading">
+      <h2 id="ops-heading">Semantic UI Operations (noun.verb Contract)</h2>
+      <table><thead><tr><th>Operation</th><th>Noun</th><th>Verb</th><th>Mode</th><th>Summary</th></tr></thead><tbody>${opRows}</tbody></table>
+    </section>
+  </main>
+
+  <script type="application/json" id="yataverse-semantic-schema">${safeJsonScript({
+    basisCid: snapshot.basisCid,
+    isSeededDefault,
+    apiBase,
+    sqlEndpoint,
+    sparqlEndpoint,
+    graphEndpoint,
+    schema,
+    graph,
+  })}</script>
+  <script>
+    (function () {
+      var meta = JSON.parse(document.getElementById('yataverse-semantic-schema').textContent);
+      var nodesById = {};
+      (meta.graph.nodes || []).forEach(function (n) { nodesById[n.id] = n; });
+      var edges = meta.graph.edges || [];
+
+      function showNode(id) {
+        var n = nodesById[id];
+        if (!n) return;
+        document.querySelectorAll('.yv-node').forEach(function (el) {
+          el.setAttribute('data-selected', el.getAttribute('data-node-id') === id ? 'true' : 'false');
+        });
+        var rel = edges.filter(function (e) { return e.from === id || e.to === id; });
+        document.getElementById('yv-inspector-summary').textContent = n.layer + ' · ' + n.label + ' (' + rel.length + ' edges)';
+        document.getElementById('yv-inspector-json').textContent = JSON.stringify({ node: n, edges: rel }, null, 2);
+      }
+
+      document.querySelectorAll('.yv-node').forEach(function (el) {
+        el.addEventListener('click', function () { showNode(el.getAttribute('data-node-id')); });
+        el.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); showNode(el.getAttribute('data-node-id')); }
+        });
+      });
+      if (meta.graph.nodes && meta.graph.nodes.length > 0) showNode(meta.graph.nodes[0].id);
+
+      function renderResultTable(container, columns, rows) {
+        container.textContent = '';
+        if (!Array.isArray(rows) || rows.length === 0) return;
+        var cols = Array.isArray(columns) && columns.length ? columns : Object.keys(rows[0]);
+        var table = document.createElement('table');
+        var thead = document.createElement('thead');
+        var trHead = document.createElement('tr');
+        cols.forEach(function (c) { var th = document.createElement('th'); th.textContent = c; trHead.appendChild(th); });
+        thead.appendChild(trHead);
+        table.appendChild(thead);
+        var tbody = document.createElement('tbody');
+        rows.slice(0, 100).forEach(function (r) {
+          var tr = document.createElement('tr');
+          cols.forEach(function (c) {
+            var td = document.createElement('td');
+            td.textContent = r[c] === null || r[c] === undefined ? '' : String(r[c]);
+            tr.appendChild(td);
+          });
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        container.appendChild(table);
+      }
+
+      function bindConsole(formId, inputId, tableId, outId, endpoint, op) {
+        var form = document.getElementById(formId);
+        var input = document.getElementById(inputId);
+        var tableEl = document.getElementById(tableId);
+        var out = document.getElementById(outId);
+        if (!form) return;
+        form.addEventListener('submit', async function (ev) {
+          ev.preventDefault();
+          out.textContent = 'Running ' + op + '...';
+          try {
+            var payload = { query: input.value };
+            if (!meta.isSeededDefault) payload.basisCid = meta.basisCid;
+            var res = await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+            var data = await res.json();
+            if (data && data.result && Array.isArray(data.result.rows)) {
+              renderResultTable(tableEl, data.result.columns || data.result.variables, data.result.rows);
+            } else {
+              tableEl.textContent = '';
+            }
+            out.textContent = JSON.stringify(data, null, 2);
+          } catch (err) {
+            out.textContent = 'Error: ' + String(err);
+          }
+        });
+      }
+
+      bindConsole('yv-sql-form', 'yv-sql-input', 'yv-sql-table', 'yv-sql-out', meta.sqlEndpoint, 'ontology.query_sql');
+      bindConsole('yv-sparql-form', 'yv-sparql-input', 'yv-sparql-table', 'yv-sparql-out', meta.sparqlEndpoint, 'ontology.query_sparql');
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+/**
+ * Render the Yataverse root landing page (`GET /`) with immediate Ontology Viewer access,
+ * CID lookup form, bytes-plane endpoints overview, and live SVG preview.
+ */
+export function renderYataverseHomeHtml(defaultSnapshot, { schema } = {}) {
+  const graph = buildOntologyGraph(defaultSnapshot, { maxNodes: 24 });
+  const previewSvg = renderOntologySvg(graph, { maxNodes: 24 });
+  const ops = schema?.operations ?? [];
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Yataverse — Verified Bytes Plane &amp; IPLD Ontology Viewer</title>
+  <style>
+    :root { --yv-bg: #f8fafc; --yv-surface: #ffffff; --yv-border: #cbd5e1; --yv-ink: #0f172a; --yv-muted: #475569; --yv-accent: #1d4ed8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--yv-bg); color: var(--yv-ink); line-height: 1.55; }
+    header, main { max-width: 1080px; margin: 0 auto; padding: 1.25rem; }
+    header { background: var(--yv-surface); border-bottom: 1px solid var(--yv-border); }
+    h1 { margin: 0 0 0.3rem 0; font-size: 1.55rem; }
+    p.lead { margin: 0; color: var(--yv-muted); }
+    section { background: var(--yv-surface); border: 1px solid var(--yv-border); border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; }
+    .yv-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.9rem; }
+    .yv-btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; font-weight: 600; border: 1px solid var(--yv-accent); background: var(--yv-accent); color: #ffffff; }
+    .yv-btn-secondary { background: #ffffff; color: var(--yv-accent); }
+    form.yv-inline { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.75rem; }
+    input[type="text"] { flex: 1 1 320px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9rem; padding: 0.5rem; border: 1px solid var(--yv-border); border-radius: 6px; }
+    button { padding: 0.5rem 1rem; border-radius: 6px; border: 1px solid var(--yv-accent); background: var(--yv-accent); color: #ffffff; font-weight: 600; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--yv-border); }
+    th { background: #f1f5f9; }
+    .yv-graph { overflow-x: auto; }
+  </style>
+</head>
+<body data-service="yataverse-bytes" data-default-basis-cid="${escapeXml(defaultSnapshot.basisCid)}">
+  <header>
+    <h1>Yataverse</h1>
+    <p class="lead">Verified content-addressed IPLD bytes plane (CIDv1 / DAG-CBOR / CARv1-v2 / signed storage receipts) and read-only Ontology SQL/SPARQL Viewer.</p>
+    <div class="yv-actions">
+      <a class="yv-btn" href="/ontology/viewer" data-operation="ontology.view">Open Interactive Ontology Viewer</a>
+      <a class="yv-btn yv-btn-secondary" href="/ontology/graph" data-operation="ontology.graph">Canonical Graph JSON</a>
+      <a class="yv-btn yv-btn-secondary" href="/ontology/v1/schema">Semantic UI Schema</a>
+      <a class="yv-btn yv-btn-secondary" href="/health">Health</a>
+    </div>
+    <form class="yv-inline" method="get" action="/ontology/viewer" data-operation="ontology.view">
+      <label for="yv-home-cid" style="position:absolute;width:1px;height:1px;overflow:hidden;">Ontology Snapshot CID</label>
+      <input id="yv-home-cid" name="cid" type="text" placeholder="bafyrei... (enter a stored DAG-CBOR ontology snapshot CID)">
+      <button type="submit">Visualize CID</button>
+    </form>
+  </header>
+
+  <main>
+    <section aria-labelledby="preview-heading">
+      <h2 id="preview-heading">Seeded Ontology Preview (<code>${escapeXml(defaultSnapshot.id)}</code>)</h2>
+      <div class="yv-graph">${previewSvg}</div>
+    </section>
+
+    <section aria-labelledby="routes-heading">
+      <h2 id="routes-heading">Public Endpoints</h2>
+      <table>
+        <thead><tr><th>Route</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET /ontology</code>, <code>GET /ontology/viewer[?cid=...]</code></td><td>Interactive Ontology Viewer HTML (SVG graph, Node Inspector, SQL/SPARQL consoles, Join coverage)</td></tr>
+          <tr><td><code>GET /ontology/graph[?cid=...&amp;format=json|dag-cbor]</code></td><td>Canonical layered graph model (JSON or canonical DAG-CBOR with CIDv1 ETag)</td></tr>
+          <tr><td><code>POST /ontology/sql</code></td><td>Bounded, read-only, basis-pinned SQL SELECT engine (<code>ontology.query_sql</code>)</td></tr>
+          <tr><td><code>POST /ontology/sparql</code></td><td>Bounded, read-only, basis-pinned SPARQL &amp; EDN algebra engine (<code>ontology.query_sparql</code>)</td></tr>
+          <tr><td><code>GET /ontology/v1/schema</code></td><td>Machine-readable Semantic UI <code>noun.verb</code> catalog (${ops.length} operations)</td></tr>
+          <tr><td><code>GET|PUT /ipfs/&lt;cid&gt;</code>, <code>POST /ipfs/</code></td><td>Verified raw/DAG-CBOR/UnixFS blocks and CARv1/CARv2 import with signed storage receipts</td></tr>
+          <tr><td><code>GET /.well-known/yataverse-receipt-keys.json</code></td><td>Published Ed25519 receipt verification keys</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script type="application/json" id="yataverse-semantic-schema">${safeJsonScript({ service: 'yataverse-bytes', defaultBasisCid: defaultSnapshot.basisCid, schema })}</script>
+</body>
+</html>`;
+}

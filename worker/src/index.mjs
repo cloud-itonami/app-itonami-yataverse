@@ -74,7 +74,7 @@ import { signV4, regionFromEndpoint } from './sigv4.mjs';
 import { isCacao, verifyCacao, issueNonce, blockResource, carResource, claimedCarDigest } from './cacao-auth.mjs';
 import { isNameHost, underNameSuffix, handleName } from './names.mjs';
 import { readDenied, readDenyActive, DENY_HEADERS, READ_DENIED_HEADER } from './read-deny.mjs';
-import { handleOntology, ONTOLOGY_PREFIX } from './ontology.mjs';
+import { handleOntology, isOntologyRoute } from './ontology.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
 // Each imported block costs two store subrequests (PUT, readback GET) and each exported block
@@ -798,7 +798,7 @@ async function handleCore(request, env, deps = {}) {
     }
     catch (e) { return storeFailure(e); }
   }
-  if (url.pathname.startsWith(ONTOLOGY_PREFIX)) {
+  if (isOntologyRoute(url.pathname)) {
     try {
       const store = b2(env, deps);
       return await handleOntology(request, url, {

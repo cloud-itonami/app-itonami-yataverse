@@ -71,6 +71,8 @@ export const TOOLS = [
     inputSchema: { type: 'object', properties: { car_base64: str('Base64-encoded CARv1/CARv2 ontology snapshot'), basis_cid: str('Optional expected root CIDv1') }, required: ['car_base64'], additionalProperties: false } },
   { name: 'yataverse_ontology_inspect', description: 'Execute Semantic UI operation ontology.inspect on a verified CAR snapshot (base64) or gateway basis_cid.',
     inputSchema: { type: 'object', properties: { car_base64: str('Base64-encoded CARv1/CARv2 ontology snapshot (or omit to fetch basis_cid from gateway)'), basis_cid: str('Pinned root CIDv1 (dag-cbor, sha2-256)') }, additionalProperties: false } },
+  { name: 'yataverse_ontology_graph', description: 'Execute Semantic UI operation ontology.graph to return the canonical layered graph (nodes, edges, layers, joins, coverage) and its DAG-CBOR graphCid.',
+    inputSchema: { type: 'object', properties: { car_base64: str('Base64-encoded CAR snapshot'), basis_cid: str('Pinned root CIDv1'), max_nodes: { type: 'integer', description: 'Optional max nodes (default 64)' } }, additionalProperties: false } },
   { name: 'yataverse_ontology_query_sql', description: 'Execute Semantic UI operation ontology.query_sql (bounded, read-only SQL SELECT on a pinned ontology basis_cid).',
     inputSchema: { type: 'object', properties: { query: str('Read-only SQL SELECT query'), car_base64: str('Base64-encoded CAR snapshot'), basis_cid: str('Pinned root CIDv1'), jurisdiction: str('Optional jurisdiction visibility filter'), allowed_sources: str('Optional comma-separated connector source IDs'), max_scan_rows: { type: 'integer', description: 'Optional scan row limit' }, max_result_rows: { type: 'integer', description: 'Optional result row limit' } }, required: ['query'], additionalProperties: false } },
   { name: 'yataverse_ontology_query_sparql', description: 'Execute Semantic UI operation ontology.query_sparql (bounded, read-only SPARQL or EDN algebra on a pinned ontology basis_cid). Remote SERVICE is refused.',
@@ -151,6 +153,12 @@ export async function callTool(name, a, deps = {}) {
       };
       const ctx = { loadSnapshot: loadFromGateway };
       if (name === 'yataverse_ontology_inspect') return j(await invokeOntologyOperation('ontology.inspect', baseInput, ctx));
+      if (name === 'yataverse_ontology_graph') {
+        return j(await invokeOntologyOperation('ontology.graph', {
+          ...baseInput,
+          ...(a.max_nodes !== undefined ? { maxNodes: a.max_nodes } : {}),
+        }, ctx));
+      }
       if (name === 'yataverse_ontology_query_sql') {
         const limits = {};
         if (a.max_scan_rows !== undefined) limits.maxScanRows = a.max_scan_rows;

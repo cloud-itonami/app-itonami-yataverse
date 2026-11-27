@@ -30,12 +30,15 @@ Every ontology snapshot is stored as a content-addressed 5-block DAG-CBOR graph:
 - **EDN / JSON Algebra Bridge**: `algebraToEdn` and `ednToAlgebra` interoperate with `kotoba.sparql` (`:sparql/op :bgp | :filter | :join | :union | :optional | :group | :project | :distinct | :order-by | :slice`).
 - **Refused (Fail-Closed)**: `SERVICE`, `FROM` / `FROM NAMED`, SPARQL Update verbs (`INSERT`, `DELETE`, `LOAD`, `CLEAR`, `DROP`, `CREATE`, `ADD`, `MOVE`, `COPY`), unsupported clauses (`BIND`, `VALUES`, `MINUS`, nested `SELECT`), unallowlisted filter functions, ReDoS-prone nested quantifiers, `basisCid` mismatch, and `maxScanSteps` / `maxSolutions` / `maxOutputBytes` overflows.
 
-## 4. Semantic UI (`noun.verb`) Viewer & Surfaces
+## 4. Reusable Visualization Library (`src/ontology-viz.mjs`) & Semantic UI (`noun.verb`) Viewer
+
+Visualization logic is factored into a standalone, zero-dependency ESM module (`src/ontology-viz.mjs`) that constructs a canonical layered graph model (`yataverse.ontology.graph/v1` with `nodes`, `edges`, `layers`, `joins`, and `coverage`), encodes it to canonical DAG-CBOR (`encodeOntologyGraphDagCbor`), and renders standalone SVG and interactive Semantic HTML5 viewers (SVG graph, clickable node detail inspector, SQL/SPARQL consoles, and external join coverage table).
 
 All viewer and API actions follow the `noun.verb` contract with machine-readable JSON Schemas (`src/ontology-viewer.mjs`):
 
 | Operation | Mode | Description |
 |---|---|---|
+| `ontology.graph` | read-only | Project snapshot into canonical layered graph (`nodes/edges/layers/joins/coverage`) + DAG-CBOR `graphCid` |
 | `ontology.build` | read-only | Build & verify canonical DAG-CBOR snapshot + CARv1 |
 | `ontology.verify` | read-only | Verify CARv1/CARv2 snapshot CIDs, closure, and provenance |
 | `ontology.inspect` | read-only | Inspect object types, connectors, tables, joins, and block CIDs |
@@ -50,6 +53,8 @@ yataverse ontology schema
 yataverse ontology build spec.json -o snapshot.car
 yataverse ontology verify snapshot.car --basis bafyrei...
 yataverse ontology inspect snapshot.car
+yataverse ontology graph snapshot.car --format json
+yataverse ontology graph snapshot.car --format dag-cbor -o graph.cbor
 yataverse ontology sql snapshot.car --query "SELECT id, status FROM tender ORDER BY id"
 yataverse ontology sparql snapshot.car --query "SELECT ?s ?p ?o WHERE { ?s ?p ?o . } LIMIT 10"
 yataverse ontology view snapshot.car --format html -o viewer.html
@@ -58,6 +63,7 @@ yataverse ontology view snapshot.car --format html -o viewer.html
 ### MCP Tools
 
 - `yataverse_ontology_schema`
+- `yataverse_ontology_graph`
 - `yataverse_ontology_build`
 - `yataverse_ontology_verify`
 - `yataverse_ontology_inspect`
@@ -65,10 +71,15 @@ yataverse ontology view snapshot.car --format html -o viewer.html
 - `yataverse_ontology_query_sparql`
 - `yataverse_ontology_view`
 
-### Worker HTTP Routes (`/ontology/v1/`)
+### Worker HTTP Routes (`https://yataverse.com/`)
 
-Snapshots are stored with existing verified block/CAR routes (`POST /ipfs/` with storage receipts) and queried read-only via:
+Snapshots are stored with existing verified block/CAR routes (`POST /ipfs/` with storage receipts) and visualized/queried read-only via:
 
+- `GET /` — Yataverse landing page + immediate Ontology Viewer entry (with `?cid=<bafy...>`, loads & renders that verified DAG-CBOR snapshot)
+- `GET /ontology`, `GET /ontology/viewer[?cid=<bafy...>&format=html|svg|json]` — Interactive Ontology Viewer (SVG graph, Node Detail Inspector, SQL/SPARQL console, external join coverage)
+- `GET /ontology/graph[?cid=<bafy...>&format=json|dag-cbor]` — Canonical layered graph model as JSON or canonical DAG-CBOR (`yataverse-graph-cid` header & CIDv1 ETag)
+- `POST /ontology/sql` — Bounded read-only SQL SELECT (`{ query, cid|basisCid|carBase64 }`)
+- `POST /ontology/sparql` — Bounded read-only SPARQL / EDN algebra (`{ query|algebraEdn|algebra, cid|basisCid|carBase64 }`)
 - `GET /ontology/v1/schema`
 - `GET /ontology/v1/inspect/<basisCid>`
 - `GET /ontology/v1/view/<basisCid>?format=html|svg|json`

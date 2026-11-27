@@ -26,7 +26,7 @@ import { canonicalAssetManifest } from './asset-manifest.mjs';
 import { assetDidRecord } from './asset-did.mjs';
 import { canonicalTrainingRunManifest } from './training-run-manifest.mjs';
 import { buildOntologySnapshot, verifyOntologySnapshot } from './ontology.mjs';
-import { getOntologySchema, invokeOntologyOperation } from './ontology-viewer.mjs';
+import { getOntologySchema, invokeOntologyOperation, buildOntologyGraph, encodeOntologyGraphDagCbor } from './ontology-viewer.mjs';
 
 /** The admin key is read only when the configured mode signs with it. */
 const cacaoDeps = (cfg) => (cfg.authMode === 'cacao' ? { cacaoKey: loadKey() } : {});
@@ -94,6 +94,8 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
                                        verify CAR ontology snapshot CIDs, DAG-CBOR, closure & provenance
   yataverse ontology inspect <snapshot.car|-> [--basis <cid>]
                                        inspect object types, connectors, tables, joins & CID links
+  yataverse ontology graph <snapshot.car|-> [--format json|dag-cbor] [-o out] [--basis <cid>]
+                                       export canonical layered graph (nodes, edges, layers, joins, coverage)
   yataverse ontology sql <snapshot.car|-> --query "<SQL>" [--basis <cid>] [--jurisdiction J] [--max-scan N] [--max-rows N]
                                        run bounded read-only SQL SELECT on a pinned ontology snapshot
   yataverse ontology sparql <snapshot.car|-> (--query "<SPARQL>" | --algebra-edn "<EDN>") [--basis <cid>] [--jurisdiction J]
@@ -356,6 +358,30 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
           const snap = verifyOntologySnapshot(carBytes, { expectedBasisCid: f.basis ?? null });
           const res = await invokeOntologyOperation('ontology.inspect', { basisCid: snap.basisCid }, { snapshot: snap });
           out(res);
+          return 0;
+        }
+        if (sub === 'graph') {
+          const format = f.format ?? 'json';
+          const carBytes = readInput(target);
+          const snap = verifyOntologySnapshot(carBytes, { expectedBasisCid: f.basis ?? null });
+          if (format === 'dag-cbor') {
+            const graph = buildOntologyGraph(snap);
+            const { cid, bytes } = encodeOntologyGraphDagCbor(graph);
+            if (f.o) {
+              fs.writeFileSync(f.o, bytes);
+              out({ basisCid: snap.basisCid, graphCid: cid, format: 'dag-cbor', wrote: f.o, bytes: bytes.length });
+            } else {
+              stdout.write(bytes);
+            }
+            return 0;
+          }
+          const res = await invokeOntologyOperation('ontology.graph', { basisCid: snap.basisCid }, { snapshot: snap });
+          if (f.o) {
+            fs.writeFileSync(f.o, JSON.stringify(res, null, 2) + '\n', 'utf8');
+            out({ basisCid: snap.basisCid, graphCid: res.result.graphCid, format: 'json', wrote: f.o });
+          } else {
+            out(res);
+          }
           return 0;
         }
         if (sub === 'sql') {

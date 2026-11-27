@@ -5,6 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { buildOntologySnapshot, DEFAULT_BASE_IRI } from '../src/ontology.mjs';
 import {
+  buildOntologyGraph,
+  encodeOntologyGraphDagCbor,
+  renderYataverseHomeHtml,
+  createDefaultOntologySnapshot,
+} from '../src/ontology-viz.mjs';
+import { checkWritableBlock } from '../src/block.mjs';
+import {
   ONTOLOGY_OPERATIONS,
   NOUN_VERB_PATTERN,
   getOntologySchema,
@@ -93,6 +100,7 @@ test('Semantic UI contract: noun.verb operations, schemas, XSS-safe viewer, and 
     'src/ontology.mjs',
     'src/ontology-sql.mjs',
     'src/ontology-sparql.mjs',
+    'src/ontology-viz.mjs',
     'src/ontology-viewer.mjs',
     'worker/src/ontology.mjs',
     'docs/ontology-sql-sparql-viewer.md',
@@ -100,6 +108,26 @@ test('Semantic UI contract: noun.verb operations, schemas, XSS-safe viewer, and 
     const src = fs.readFileSync(path.resolve(rel), 'utf8');
     assert.ok(!FORBIDDEN_TOKENS.test(src), `${rel} contained a forbidden token`);
   }
+
+  // Reusable src/ontology-viz.mjs canonical graph model + DAG-CBOR CID + home HTML
+  const graph = buildOntologyGraph(snap);
+  assert.equal(graph.schema, 'yataverse.ontology.graph/v1');
+  assert.ok(graph.layers.length >= 3);
+  assert.ok(graph.nodes.length >= 4);
+  assert.ok(graph.edges.length >= 4);
+  assert.equal(graph.joins.length, 1);
+  assert.equal(graph.joins[0].matchedRows, 1);
+  assert.equal(graph.joins[0].coverageRatio, 1);
+  const { cid: graphCid, bytes: graphBytes } = encodeOntologyGraphDagCbor(graph);
+  assert.equal(checkWritableBlock(graphCid, graphBytes), null);
+
+  const graphOp = await invokeOntologyOperation('ontology.graph', { basisCid: snap.basisCid }, { snapshot: snap });
+  assert.equal(graphOp.result.graphCid, graphCid);
+
+  const homeHtml = renderYataverseHomeHtml(createDefaultOntologySnapshot(), { schema });
+  assert.match(homeHtml, /\/ontology\/viewer/);
+  assert.match(homeHtml, /\/ontology\/graph/);
+  assert.ok(!FORBIDDEN_TOKENS.test(homeHtml));
 
   // Unknown operation or unknown input field fails closed
   await assert.rejects(
@@ -139,6 +167,18 @@ test('CLI: ontology schema, build, verify, inspect, sql, sparql, view end-to-end
     assert.equal(JSON.parse(io.out).result.stats.facts, 2);
 
     io = captureIo();
+    assert.equal(await cliMain(['ontology', 'graph', carFile], io), 0);
+    const graphOut = JSON.parse(io.out);
+    assert.equal(graphOut.operation, 'ontology.graph');
+    assert.match(graphOut.result.graphCid, /^bafyrei/);
+
+    const cborFile = path.join(tmpDir, 'graph.cbor');
+    io = captureIo();
+    assert.equal(await cliMain(['ontology', 'graph', carFile, '--format', 'dag-cbor', '-o', cborFile], io), 0);
+    const cborMeta = JSON.parse(io.out);
+    assert.equal(checkWritableBlock(cborMeta.graphCid, fs.readFileSync(cborFile)), null);
+
+    io = captureIo();
     assert.equal(
       await cliMain(['ontology', 'sql', carFile, '--query', 'SELECT id, amount FROM tender WHERE status = \'open\''], io),
       0,
@@ -170,6 +210,7 @@ test('CLI: ontology schema, build, verify, inspect, sql, sparql, view end-to-end
 
 test('MCP: yataverse_ontology_* tools round-trip & credential-like argument refusal', async () => {
   assert.ok(TOOLS.some((t) => t.name === 'yataverse_ontology_schema'));
+  assert.ok(TOOLS.some((t) => t.name === 'yataverse_ontology_graph'));
   assert.ok(TOOLS.some((t) => t.name === 'yataverse_ontology_query_sql'));
   assert.ok(TOOLS.some((t) => t.name === 'yataverse_ontology_query_sparql'));
   assert.ok(TOOLS.some((t) => t.name === 'yataverse_ontology_view'));
@@ -187,6 +228,10 @@ test('MCP: yataverse_ontology_* tools round-trip & credential-like argument refu
   const inspectRes = await callTool('yataverse_ontology_inspect', { car_base64: carBase64, basis_cid: basisCid });
   assert.equal(inspectRes.isError, false);
   assert.equal(JSON.parse(inspectRes.text).result.id, 'viewer-demo');
+
+  const graphRes = await callTool('yataverse_ontology_graph', { car_base64: carBase64, basis_cid: basisCid });
+  assert.equal(graphRes.isError, false);
+  assert.equal(JSON.parse(graphRes.text).result.joins.length, 1);
 
   const sqlRes = await callTool('yataverse_ontology_query_sql', {
     car_base64: carBase64,
@@ -351,4 +396,176 @@ test('Worker HTTP: CAR import + receipt intact; /ontology/v1 schema, inspect, vi
     deps,
   );
   assert.equal(unknownOp.status, 404);
+});
+
+test('Worker HTTP visualization routes: GET /, /ontology, /ontology/viewer, /ontology/graph, POST /ontology/sql & /ontology/sparql', async () => {
+  const s = fakeStore();
+  const deps = { fetchImpl: s.fetchImpl, now: NOW };
+  const env = { ...ENV, MAX_BLOCK_BYTES: '65536' };
+  const snap = buildOntologySnapshot(demoSpec());
+
+  // Import custom snapshot via existing CAR endpoint first
+  const importRes = await workerHandle(
+    new Request('https://yataverse.com/ipfs/', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/vnd.ipld.car' },
+      body: snap.carBytes,
+    }),
+    env,
+    deps,
+  );
+  assert.equal(importRes.status, 201);
+
+  // 1. GET / -> HTML landing with Ontology Viewer entry (and JSON when Accept: application/json)
+  const homeRes = await workerHandle(new Request('https://yataverse.com/'), env, deps);
+  assert.equal(homeRes.status, 200);
+  assert.match(homeRes.headers.get('content-type'), /text\/html/);
+  const homeBody = await homeRes.text();
+  assert.match(homeBody, /\/ontology\/viewer/);
+  assert.match(homeBody, /\/ontology\/graph/);
+  assert.ok(!FORBIDDEN_TOKENS.test(homeBody));
+
+  const homeJson = await workerHandle(
+    new Request('https://yataverse.com/', { headers: { accept: 'application/json' } }),
+    env,
+    deps,
+  );
+  assert.equal(homeJson.status, 200);
+  assert.equal((await homeJson.json()).routes.viewer, '/ontology/viewer');
+
+  // GET /?cid=<storedCid> loads & renders that verified snapshot
+  const homeCidRes = await workerHandle(new Request(`https://yataverse.com/?cid=${snap.basisCid}`), env, deps);
+  assert.equal(homeCidRes.status, 200);
+  assert.match(await homeCidRes.text(), new RegExp(snap.basisCid));
+
+  // 2. GET /ontology & GET /ontology/viewer (default seeded + ?cid=<storedCid>)
+  const seededViewer = await workerHandle(new Request('https://yataverse.com/ontology'), env, deps);
+  assert.equal(seededViewer.status, 200);
+  const seededHtml = await seededViewer.text();
+  assert.match(seededHtml, /id="yv-node-inspector"/);
+  assert.match(seededHtml, /External Join Coverage/);
+  assert.match(seededHtml, /data-operation="ontology\.query_sql"/);
+  assert.match(seededHtml, /data-operation="ontology\.query_sparql"/);
+  assert.ok(!FORBIDDEN_TOKENS.test(seededHtml));
+
+  const cidViewer = await workerHandle(new Request(`https://yataverse.com/ontology/viewer?cid=${snap.basisCid}`), env, deps);
+  assert.equal(cidViewer.status, 200);
+  const cidViewerHtml = await cidViewer.text();
+  assert.match(cidViewerHtml, /viewer-demo/);
+  assert.ok(!cidViewerHtml.includes('<script>alert("xss")</script>'));
+
+  // 3. GET /ontology/graph (JSON + canonical DAG-CBOR)
+  const graphJsonRes = await workerHandle(new Request(`https://yataverse.com/ontology/graph?cid=${snap.basisCid}`), env, deps);
+  assert.equal(graphJsonRes.status, 200);
+  const graphJson = await graphJsonRes.json();
+  assert.equal(graphJson.operation, 'ontology.graph');
+  assert.equal(graphJson.basisCid, snap.basisCid);
+  assert.equal(graphJson.result.joins[0].name, 'tender_agency');
+
+  const graphCborRes = await workerHandle(
+    new Request(`https://yataverse.com/ontology/graph?cid=${snap.basisCid}&format=dag-cbor`),
+    env,
+    deps,
+  );
+  assert.equal(graphCborRes.status, 200);
+  assert.equal(graphCborRes.headers.get('content-type'), 'application/vnd.ipld.dag-cbor');
+  const graphCid = graphCborRes.headers.get('yataverse-graph-cid');
+  assert.equal(graphCid, graphJson.graphCid);
+  const graphCborBytes = new Uint8Array(await graphCborRes.arrayBuffer());
+  assert.equal(checkWritableBlock(graphCid, graphCborBytes), null);
+
+  // 4. POST /ontology/sql (seeded default & pinned ?cid)
+  const seededSql = await workerHandle(
+    new Request('https://yataverse.com/ontology/sql', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: 'SELECT COUNT(*) AS cnt FROM tender' }),
+    }),
+    env,
+    deps,
+  );
+  assert.equal(seededSql.status, 200);
+  assert.deepEqual((await seededSql.json()).result.rows, [{ cnt: 2 }]);
+
+  const pinnedSql = await workerHandle(
+    new Request('https://yataverse.com/ontology/sql', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cid: snap.basisCid, query: 'SELECT id, amount FROM tender' }),
+    }),
+    env,
+    deps,
+  );
+  assert.equal(pinnedSql.status, 200);
+  assert.deepEqual((await pinnedSql.json()).result.rows, [{ id: 't-1', amount: 500 }]);
+
+  // 5. POST /ontology/sparql (seeded default & pinned cid)
+  const seededSparql = await workerHandle(
+    new Request('https://yataverse.com/ontology/sparql', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: `PREFIX onto: <${DEFAULT_BASE_IRI}> SELECT ?s WHERE { ?s a onto:tender . }` }),
+    }),
+    env,
+    deps,
+  );
+  assert.equal(seededSparql.status, 200);
+  assert.equal((await seededSparql.json()).result.rowCount, 2);
+
+  const pinnedSparql = await workerHandle(
+    new Request('https://yataverse.com/ontology/sparql', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        cid: snap.basisCid,
+        query: `PREFIX onto: <${DEFAULT_BASE_IRI}> SELECT ?a WHERE { ?s onto:amount ?a . }`,
+      }),
+    }),
+    env,
+    deps,
+  );
+  assert.equal(pinnedSparql.status, 200);
+  assert.deepEqual((await pinnedSparql.json()).result.rows, [{ '?a': 500 }]);
+
+  // 6. Negative security & fail-closed checks on new routes
+  const badCid = await workerHandle(new Request('https://yataverse.com/ontology/viewer?cid=not-a-cid'), env, deps);
+  assert.equal(badCid.status, 400);
+
+  const deniedCid = await workerHandle(
+    new Request(`https://yataverse.com/ontology/viewer?cid=${snap.basisCid}`),
+    { ...env, READ_DENY_CIDS: snap.basisCid },
+    deps,
+  );
+  assert.equal(deniedCid.status, 451);
+
+  const deniedGraph = await workerHandle(
+    new Request(`https://yataverse.com/ontology/graph?cid=${snap.basisCid}`),
+    { ...env, READ_DENY_CIDS: snap.basisCid },
+    deps,
+  );
+  assert.equal(deniedGraph.status, 451);
+
+  const writeSql = await workerHandle(
+    new Request('https://yataverse.com/ontology/sql', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: 'DROP TABLE tender' }),
+    }),
+    env,
+    deps,
+  );
+  assert.equal(writeSql.status, 400);
+  assert.equal((await writeSql.json()).error, 'sql-write-refused');
+
+  const remoteService = await workerHandle(
+    new Request('https://yataverse.com/ontology/sparql', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: 'SELECT ?s WHERE { SERVICE <https://example.org/s> { ?s ?p ?o . } }' }),
+    }),
+    env,
+    deps,
+  );
+  assert.equal(remoteService.status, 400);
+  assert.equal((await remoteService.json()).error, 'service-not-allowed');
 });

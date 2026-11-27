@@ -94,7 +94,8 @@ test('routing: health, bad CIDs, unknown paths and methods; store config is requ
   assert.equal(h.status, 200); assert.deepEqual(await h.json(), { ok: true, service: 'yataverse-bytes' });
   assert.equal((await handle(new Request('https://yataverse.com/ipfs/not-a-cid'), ENV, deps)).status, 404);
   assert.equal((await handle(new Request('https://yataverse.com/ipfs/bafkreinotacid'), ENV, deps)).status, 400);
-  assert.equal((await handle(new Request('https://yataverse.com/'), ENV, deps)).status, 404);
+  assert.equal((await handle(new Request('https://yataverse.com/'), ENV, deps)).status, 200);
+  assert.equal((await handle(new Request('https://yataverse.com/no-such-route'), ENV, deps)).status, 404);
   const cid = rawCid(Buffer.from('m'));
   assert.equal((await handle(new Request(`https://yataverse.com/ipfs/${cid}`, { method: 'DELETE' }), ENV, deps)).status, 405);
   assert.equal((await handle(get(cid), { ...ENV, B2_APP_KEY: '' }, deps)).status, 503);
