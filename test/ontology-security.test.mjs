@@ -13,10 +13,12 @@ import {
   DEFAULT_BASE_IRI,
 } from '../src/ontology.mjs';
 import { executeSql, SqlError } from '../src/ontology-sql.mjs';
-import { executeSparql, compileLinearRegex, SparqlError } from '../src/ontology-sparql.mjs';
+import { executeSparql, ednToAlgebra, compileLinearRegex, SparqlError } from '../src/ontology-sparql.mjs';
 import {
   buildOntologyGraph,
   encodeOntologyGraphDagCbor,
+  verifyOntologyGraphCid,
+  renderOntologySvg,
   renderOntologyHtml,
   safeJsonScript,
   createDefaultOntologySnapshot,
@@ -712,4 +714,72 @@ test('G2 activeLayers: [] yields 0 nodes / 0 edges consistently across buildOnto
   const wHtml = await wViewer.text();
   assert.match(wHtml, /data-active-layers=""/);
   assert.ok(!wHtml.includes('class="yv-node"'));
+});
+
+test('R3-1/R3-2/R3-3: __proto__ graphCid bypass refused, null-prototype EDN maps return 400/SparqlError, and SVG layer maps are null-prototype', async () => {
+  // R3-1: JSON.parse('{"__proto__":...}') carrying valid graphCid must NOT silently drop __proto__
+  const seeded = createDefaultOntologySnapshot();
+  const baseGraph = buildOntologyGraph(seeded);
+  const { cid: validGraphCid } = encodeOntologyGraphDagCbor(baseGraph);
+  const wireJson = JSON.stringify({ ...baseGraph, graphCid: validGraphCid });
+  const poisonedWire = JSON.parse(wireJson.replace(/^\{/, '{"__proto__":{"polluted":true},'));
+  assert.equal(Object.hasOwn(poisonedWire, '__proto__'), true);
+  assert.throws(
+    () => verifyOntologyGraphCid(poisonedWire),
+    (e) => e instanceof OntologyError && e.code === 'forbidden-key',
+  );
+  assert.throws(
+    () => renderOntologySvg(poisonedWire),
+    (e) => e instanceof OntologyError && e.code === 'forbidden-key',
+  );
+  assert.throws(
+    () => encodeOntologyGraphDagCbor(poisonedWire),
+    (e) => e instanceof OntologyError && e.code === 'forbidden-key',
+  );
+  assert.equal(({}).polluted, undefined);
+
+  // R3-2: null-prototype EDN maps in map key, :rdf/type, :vars, :desc, :by, :arg, :var -> SparqlError & HTTP 400 (never TypeError -> 502)
+  const s = fakeStore();
+  const deps = { fetchImpl: s.fetchImpl, now: NOW };
+  const r3EdnCases = [
+    { name: 'non-string map key', edn: '{{:a 1} 2}', code: 'edn-invalid-key' },
+    { name: ':rdf/type nested map', edn: '{:sparql/op :bgp :patterns [[?s ?p {:rdf/type {:a 1} :value "x"}]]}', code: 'edn-invalid-term' },
+    { name: 'project :vars nested map', edn: '{:sparql/op :project :vars [{:a 1}] :pattern {:sparql/op :bgp :patterns []}}', code: 'edn-invalid-algebra' },
+    { name: 'order-by :desc nested map', edn: '{:sparql/op :order-by :vars [?x] :desc #{{:a 1}} :pattern {:sparql/op :bgp :patterns []}}', code: 'edn-invalid-algebra' },
+    { name: 'order-by :vars nested map', edn: '{:sparql/op :order-by :vars [{:a 1}] :pattern {:sparql/op :bgp :patterns []}}', code: 'edn-invalid-algebra' },
+    { name: 'group :by nested map', edn: '{:sparql/op :group :by [{:a 1}] :aggregates [] :pattern {:sparql/op :bgp :patterns []}}', code: 'edn-invalid-algebra' },
+    { name: 'group :arg nested map', edn: '{:sparql/op :group :by [] :aggregates [{:fn :count :arg {:a 1} :var ?c}] :pattern {:sparql/op :bgp :patterns []}}', code: 'edn-invalid-algebra' },
+    { name: 'group :var nested map', edn: '{:sparql/op :group :by [] :aggregates [{:fn :count :arg :* :var {:a 1}}] :pattern {:sparql/op :bgp :patterns []}}', code: 'edn-invalid-algebra' },
+  ];
+  for (const tc of r3EdnCases) {
+    assert.throws(
+      () => ednToAlgebra(tc.edn),
+      (e) => e instanceof SparqlError && e.code === tc.code,
+      `expected SparqlError(${tc.code}) for ${tc.name}`,
+    );
+    const res = await workerHandle(
+      new Request('https://yataverse.com/ontology/sparql', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ algebraEdn: tc.edn }),
+      }),
+      ENV,
+      deps,
+    );
+    assert.equal(res.status, 400, `expected HTTP 400 for ${tc.name}: ${tc.edn}`);
+  }
+
+  // R3-3: renderOntologySvg cols/rowsByLayer/palette do not inherit Object.prototype properties
+  const protoLayerGraph = {
+    ...baseGraph,
+    layers: [...baseGraph.layers, { id: 'toString', label: 'toString', nodeCount: 1 }],
+    nodes: [
+      ...baseGraph.nodes,
+      { id: 'custom:1', layer: 'toString', label: 'Custom Node', objectType: null, connectorId: null, jurisdiction: null, meta: {} },
+    ],
+  };
+  const svg = renderOntologySvg(protoLayerGraph);
+  assert.match(svg, /^<svg /);
+  assert.ok(!svg.includes('NaN'), 'SVG layout must not produce NaN for prototype-named layer');
+  assert.ok(!svg.includes('[object Object]'), 'SVG styles must not leak Object.prototype properties');
 });

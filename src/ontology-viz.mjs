@@ -21,6 +21,7 @@ import {
   normalizeKeyword,
   clampLimit,
   compareCodeUnits,
+  assertSafeKey,
   OntologyError,
 } from './ontology.mjs';
 
@@ -614,9 +615,9 @@ function canonicalGraphPayload(graph) {
   if (!graph || typeof graph !== 'object' || Array.isArray(graph)) {
     throw new OntologyError('invalid-graph', 'graph must be an object');
   }
-  if (!Object.hasOwn(graph, 'graphCid')) return graph;
-  const copy = {};
+  const copy = Object.create(null);
   for (const [k, v] of Object.entries(graph)) {
+    assertSafeKey(k, 'graph');
     if (k === 'graphCid') continue;
     copy[k] = v;
   }
@@ -722,27 +723,29 @@ export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64, interactive 
     }
   }
 
-  const cols = { connector: 120, 'object-type': 420, fact: 740, 'rdf-subject': 1020 };
+  const cols = Object.assign(Object.create(null), { connector: 120, 'object-type': 420, fact: 740, 'rdf-subject': 1020 });
   const hasRdfLayer = graph.nodes.some((n) => n.layer === 'rdf-subject');
   const width = hasRdfLayer ? 1160 : 900;
-  const rowsByLayer = { connector: 0, 'object-type': 0, fact: 0, 'rdf-subject': 0 };
+  const rowsByLayer = Object.assign(Object.create(null), { connector: 0, 'object-type': 0, fact: 0, 'rdf-subject': 0 });
   const positions = new Map();
 
   for (const n of graph.nodes) {
-    const row = rowsByLayer[n.layer] ?? 0;
-    rowsByLayer[n.layer] = row + 1;
-    positions.set(n.id, { x: cols[n.layer] ?? 420, y: 74 + row * 68 });
+    const layerKey = typeof n.layer === 'string' ? n.layer : '';
+    const row = Object.hasOwn(rowsByLayer, layerKey) ? rowsByLayer[layerKey] : 0;
+    rowsByLayer[layerKey] = row + 1;
+    const x = Object.hasOwn(cols, layerKey) ? cols[layerKey] : 420;
+    positions.set(n.id, { x, y: 74 + row * 68 });
   }
 
   const maxRows = Math.max(1, ...Object.values(rowsByLayer));
   const height = Math.max(240, 100 + maxRows * 68);
 
-  const palette = {
+  const palette = Object.assign(Object.create(null), {
     connector: { bg: '#e8f4f8', stroke: '#1d6f8a' },
     'object-type': { bg: '#eef7ea', stroke: '#2f6f3e' },
     fact: { bg: '#f7f3e9', stroke: '#8a6220' },
     'rdf-subject': { bg: '#f3eefd', stroke: '#6d28d9' },
-  };
+  });
 
   const parts = [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Ontology Graph for ${escapeXml(graph.basisCid)}" data-basis-cid="${escapeXml(graph.basisCid)}">`,
@@ -751,7 +754,7 @@ export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64, interactive 
   ];
 
   for (const layer of graph.layers) {
-    const lx = (cols[layer.id] ?? 420) - 90;
+    const lx = (Object.hasOwn(cols, layer.id) ? cols[layer.id] : 420) - 90;
     parts.push(`<text x="${lx}" y="30" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="600" fill="#334155">${escapeXml(layer.label)} (${layer.nodeCount})</text>`);
   }
 
@@ -777,7 +780,7 @@ export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64, interactive 
 
   for (const n of graph.nodes) {
     const p = positions.get(n.id);
-    const st = palette[n.layer] ?? { bg: '#ffffff', stroke: '#334155' };
+    const st = Object.hasOwn(palette, n.layer) ? palette[n.layer] : { bg: '#ffffff', stroke: '#334155' };
     const text = n.label.length > 24 ? `${n.label.slice(0, 21)}...` : n.label;
     const interactiveAttrs = interactive
       ? ` tabindex="0" role="button" aria-label="${escapeXml(n.label)}"`

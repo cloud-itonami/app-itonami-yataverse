@@ -1102,7 +1102,9 @@ function parseEdnValue(src) {
       const obj = Object.create(null);
       skipWs();
       while (i < n && src[i] !== '}') {
-        const k = String(read(depth + 1));
+        const rawKey = read(depth + 1);
+        if (typeof rawKey !== 'string') bad('edn-invalid-key', 'EDN map key must be a string or keyword');
+        const k = rawKey;
         if (FORBIDDEN_OBJECT_KEYS.has(k)) bad('edn-forbidden-key', k);
         const v = read(depth + 1);
         obj[k] = v;
@@ -1161,11 +1163,29 @@ function parseEdnValue(src) {
 
 function ednTermToJson(x) {
   if (typeof x === 'string') return x;
-  if (x && typeof x === 'object' && x[':rdf/type']) {
-    const t = String(x[':rdf/type']).replace(/^:/, '');
-    if (t === 'iri') return iriTerm(x[':value']);
-    if (t === 'bnode') return bnodeTerm(x[':value']);
-    if (t === 'literal') return literalTerm(x[':value'], { datatype: x[':datatype'], language: x[':language'] });
+  if (x && typeof x === 'object' && !Array.isArray(x) && typeof x[':rdf/type'] === 'string') {
+    const t = x[':rdf/type'].replace(/^:/, '');
+    if (t === 'iri') {
+      if (typeof x[':value'] !== 'string' || !x[':value'].trim()) bad('edn-invalid-term', 'iri :value must be a non-empty string');
+      return iriTerm(x[':value']);
+    }
+    if (t === 'bnode') {
+      if (typeof x[':value'] !== 'string' || !x[':value'].trim()) bad('edn-invalid-term', 'bnode :value must be a non-empty string');
+      return bnodeTerm(x[':value']);
+    }
+    if (t === 'literal') {
+      const val = x[':value'];
+      if (typeof val !== 'string' && typeof val !== 'number' && typeof val !== 'boolean') {
+        bad('edn-invalid-term', 'literal :value must be a string, number, or boolean');
+      }
+      if (x[':datatype'] !== undefined && typeof x[':datatype'] !== 'string') {
+        bad('edn-invalid-term', 'literal :datatype must be a string');
+      }
+      if (x[':language'] !== undefined && typeof x[':language'] !== 'string') {
+        bad('edn-invalid-term', 'literal :language must be a string');
+      }
+      return literalTerm(val, { datatype: x[':datatype'], language: x[':language'] });
+    }
   }
   bad('edn-invalid-term', JSON.stringify(x));
 }
@@ -1204,6 +1224,10 @@ export function ednToAlgebra(edn, { maxQueryBytes = DEFAULT_SPARQL_LIMITS.maxQue
     if (!Array.isArray(v)) bad('edn-invalid-algebra', `${label} must be a vector`);
     return v;
   };
+  const expectStr = (v, label) => {
+    if (typeof v !== 'string') bad('edn-invalid-algebra', `${label} must be a string or keyword`);
+    return v;
+  };
   function convert(node, depth) {
     if (depth > MAX_DEPTH) bad('edn-too-deep', String(depth));
     if (!node || typeof node !== 'object' || Array.isArray(node) || typeof node[':sparql/op'] !== 'string') {
@@ -1225,20 +1249,27 @@ export function ednToAlgebra(edn, { maxQueryBytes = DEFAULT_SPARQL_LIMITS.maxQue
       case 'optional':
         return { op, left: convert(node[':left'], depth + 1), right: convert(node[':right'], depth + 1) };
       case 'project':
-        return { op: 'project', vars: expectArr(node[':vars'] ?? [], ':vars').map(String), pattern: convert(node[':pattern'], depth + 1) };
+        return {
+          op: 'project',
+          vars: expectArr(node[':vars'] ?? [], ':vars').map((v) => expectStr(v, ':vars[]')),
+          pattern: convert(node[':pattern'], depth + 1),
+        };
       case 'distinct':
         return { op: 'distinct', pattern: convert(node[':pattern'], depth + 1) };
       case 'order-by': {
         const descRaw = node[':desc'] === undefined ? [] : (Array.isArray(node[':desc']?.$ednSet) ? node[':desc'].$ednSet : expectArr(node[':desc'], ':desc'));
-        const descSet = new Set(descRaw.map(String));
+        const descSet = new Set(descRaw.map((v) => expectStr(v, ':desc[]')));
         return {
           op: 'order-by',
-          keys: expectArr(node[':vars'] ?? [], ':vars').map((v) => ({ var: String(v), desc: descSet.has(String(v)) })),
+          keys: expectArr(node[':vars'] ?? [], ':vars').map((v) => {
+            const name = expectStr(v, ':vars[]');
+            return { var: name, desc: descSet.has(name) };
+          }),
           pattern: convert(node[':pattern'], depth + 1),
         };
       }
       case 'group': {
-        const byArr = expectArr(node[':by'] ?? [], ':by').map(String);
+        const byArr = expectArr(node[':by'] ?? [], ':by').map((v) => expectStr(v, ':by[]'));
         const aggsArr = expectArr(node[':aggregates'] ?? [], ':aggregates');
         return {
           op: 'group',
@@ -1247,23 +1278,32 @@ export function ednToAlgebra(edn, { maxQueryBytes = DEFAULT_SPARQL_LIMITS.maxQue
             if (!a || typeof a !== 'object' || Array.isArray(a) || typeof a[':fn'] !== 'string') {
               bad('edn-invalid-algebra', 'aggregate entry must be a map with :fn');
             }
+            const rawArg = expectStr(a[':arg'], ':arg');
+            const rawVar = expectStr(a[':var'], ':var');
             return {
               fn: a[':fn'].replace(/^:/, ''),
-              arg: a[':arg'] === ':*' ? '*' : String(a[':arg']),
-              var: String(a[':var']),
+              arg: rawArg === ':*' ? '*' : rawArg,
+              var: rawVar,
               distinct: Boolean(a[':distinct?']),
             };
           }),
           pattern: convert(node[':pattern'], depth + 1),
         };
       }
-      case 'slice':
+      case 'slice': {
+        if (node[':offset'] !== undefined && typeof node[':offset'] !== 'number') {
+          bad('edn-invalid-algebra', ':offset must be a number');
+        }
+        if (node[':limit'] !== undefined && typeof node[':limit'] !== 'number') {
+          bad('edn-invalid-algebra', ':limit must be a number');
+        }
         return {
           op: 'slice',
-          ...(node[':offset'] !== undefined ? { offset: Number(node[':offset']) } : {}),
-          ...(node[':limit'] !== undefined ? { limit: Number(node[':limit']) } : {}),
+          ...(node[':offset'] !== undefined ? { offset: node[':offset'] } : {}),
+          ...(node[':limit'] !== undefined ? { limit: node[':limit'] } : {}),
           pattern: convert(node[':pattern'], depth + 1),
         };
+      }
       default:
         bad('edn-unsupported-op', op);
     }
