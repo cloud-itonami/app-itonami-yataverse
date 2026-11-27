@@ -13,9 +13,15 @@
 //
 // Refuses: INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, REPLACE, MERGE,
 // GRANT, REVOKE, PRAGMA, ATTACH, EXEC, WITH, UNION, subqueries, multiple statements,
-// arbitrary functions, and scans/results exceeding configured bounds.
+// arbitrary functions, deep expression nesting, prototype-polluting aliases,
+// caller limit escalation, and scans/results exceeding configured bounds.
 
-import { buildVisibilityFilter } from './ontology.mjs';
+import {
+  buildVisibilityFilter,
+  resolveBoundedLimits,
+  clampLimit,
+  FORBIDDEN_OBJECT_KEYS,
+} from './ontology.mjs';
 
 export const DEFAULT_SQL_LIMITS = Object.freeze({
   maxQueryBytes: 16 * 1024,
@@ -23,6 +29,9 @@ export const DEFAULT_SQL_LIMITS = Object.freeze({
   maxResultRows: 1_000,
   maxOutputBytes: 512 * 1024,
 });
+
+const CALLER_SQL_LIMIT_KEYS = Object.freeze(['maxScanRows', 'maxResultRows', 'maxOutputBytes']);
+const MAX_AST_DEPTH = 64;
 
 const WRITE_OR_DDL_KEYWORDS = new Set([
   'INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE', 'TRUNCATE', 'REPLACE',
@@ -48,6 +57,13 @@ export class SqlError extends Error {
 
 const bad = (code, detail) => { throw new SqlError(code, detail); };
 
+function assertSafeSqlIdent(name) {
+  if (typeof name !== 'string' || !name || FORBIDDEN_OBJECT_KEYS.has(name)) {
+    bad('sql-forbidden-identifier', String(name));
+  }
+  return name;
+}
+
 // --- Tokenizer ---
 
 function tokenize(sql) {
@@ -58,19 +74,16 @@ function tokenize(sql) {
   while (i < n) {
     const ch = sql[i];
     if (/\s/.test(ch)) { i += 1; continue; }
-    // Line comments -- ...
     if (ch === '-' && sql[i + 1] === '-') {
       while (i < n && sql[i] !== '\n') i += 1;
       continue;
     }
-    // Block comments /* ... */
     if (ch === '/' && sql[i + 1] === '*') {
       const end = sql.indexOf('*/', i + 2);
       if (end < 0) bad('sql-syntax-error', 'unterminated block comment');
       i = end + 2;
       continue;
     }
-    // Single-quoted string literal
     if (ch === "'") {
       let val = '';
       i += 1;
@@ -86,7 +99,6 @@ function tokenize(sql) {
       tokens.push({ type: 'string', value: val });
       continue;
     }
-    // Double-quoted identifier
     if (ch === '"') {
       let val = '';
       i += 1;
@@ -102,7 +114,6 @@ function tokenize(sql) {
       tokens.push({ type: 'ident', value: val, quoted: true });
       continue;
     }
-    // Number literal
     if (/[0-9]/.test(ch) || (ch === '.' && /[0-9]/.test(sql[i + 1] ?? ''))) {
       let start = i;
       let sawDot = false;
@@ -116,20 +127,17 @@ function tokenize(sql) {
       tokens.push({ type: 'number', value: num });
       continue;
     }
-    // Multi-char operators
     const two = sql.slice(i, i + 2);
     if (two === '!=' || two === '<>' || two === '<=' || two === '>=') {
       tokens.push({ type: 'op', value: two === '<>' ? '!=' : two });
       i += 2;
       continue;
     }
-    // Single-char operators & punctuation
     if ('=<>+-*/(),.;'.includes(ch)) {
       tokens.push({ type: 'punc', value: ch });
       i += 1;
       continue;
     }
-    // Identifier / keyword
     if (/[a-zA-Z_]/.test(ch)) {
       let start = i;
       while (i < n && /[a-zA-Z0-9_]/.test(sql[i])) i += 1;
@@ -143,7 +151,7 @@ function tokenize(sql) {
   return tokens;
 }
 
-// --- Parser ---
+// --- Parser (with bounded recursion depth) ---
 
 export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes } = {}) {
   if (typeof sql !== 'string' || !sql.trim()) bad('sql-empty', 'SQL query must be a non-empty string');
@@ -173,7 +181,6 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
     return next();
   };
 
-  // Leading verb check (fail closed on writes/DDL/unsupported statements)
   const first = peek();
   if (first.type === 'word' && WRITE_OR_DDL_KEYWORDS.has(first.upper)) {
     bad('sql-write-refused', `${first.upper} statements are forbidden (read-only engine)`);
@@ -193,19 +200,24 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
 
   function parseIdent() {
     const t = peek();
-    if (t.type === 'ident' || t.type === 'word') { next(); return t.value; }
+    if (t.type === 'ident' || t.type === 'word') { next(); return assertSafeSqlIdent(t.value); }
     bad('sql-syntax-error', `expected identifier, got ${t.value ?? 'EOF'}`);
   }
 
   function parseOptionalAlias() {
     if (eatWord('AS')) return parseIdent();
     const t = peek();
-    if (t.type === 'ident') { next(); return t.value; }
-    if (t.type === 'word' && !RESERVED_ALIAS.has(t.upper)) { next(); return t.value; }
+    if (t.type === 'ident') { next(); return assertSafeSqlIdent(t.value); }
+    if (t.type === 'word' && !RESERVED_ALIAS.has(t.upper)) { next(); return assertSafeSqlIdent(t.value); }
     return null;
   }
 
-  function parsePrimary() {
+  function checkDepth(depth) {
+    if (depth > MAX_AST_DEPTH) bad('sql-expression-too-deep', `exceeded max nesting depth ${MAX_AST_DEPTH}`);
+  }
+
+  function parsePrimary(depth) {
+    checkDepth(depth);
     const t = peek();
     if (t.type === 'number') { next(); return { kind: 'literal', value: t.value }; }
     if (t.type === 'string') { next(); return { kind: 'literal', value: t.value }; }
@@ -215,16 +227,15 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
     if (isPunc('(')) {
       next();
       if (isWord('SELECT')) bad('sql-unsupported-construct', 'subqueries are not supported');
-      const e = parseOr();
+      const e = parseOr(depth + 1);
       expectPunc(')');
       return e;
     }
     if (isPunc('*')) { next(); return { kind: 'star', table: null }; }
     if (t.type === 'word' || t.type === 'ident') {
-      // Function call?
       if (t.type === 'word' && isPunc('(', 1)) {
         const fn = t.upper;
-        next(); // name
+        next();
         expectPunc('(');
         if (AGGREGATE_FUNCS.has(fn)) {
           const distinct = eatWord('DISTINCT');
@@ -234,7 +245,7 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
             next();
             arg = { kind: 'star', table: null };
           } else {
-            arg = parseAddSub();
+            arg = parseAddSub(depth + 1);
           }
           expectPunc(')');
           if (isWord('OVER')) bad('sql-unsupported-construct', 'window functions (OVER) are not supported');
@@ -243,7 +254,7 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
         if (SCALAR_FUNCS.has(fn)) {
           const args = [];
           if (!isPunc(')')) {
-            do { args.push(parseAddSub()); } while (isPunc(',') && next());
+            do { args.push(parseAddSub(depth + 1)); } while (isPunc(',') && next());
           }
           expectPunc(')');
           return { kind: 'call', fn, args };
@@ -262,32 +273,33 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
     bad('sql-syntax-error', `unexpected token "${t.value ?? 'EOF'}" in expression`);
   }
 
-  function parseUnary() {
-    if (isPunc('-')) { next(); return { kind: 'unary', op: '-', expr: parseUnary() }; }
-    if (isPunc('+')) { next(); return parseUnary(); }
-    return parsePrimary();
+  function parseUnary(depth) {
+    checkDepth(depth);
+    if (isPunc('-')) { next(); return { kind: 'unary', op: '-', expr: parseUnary(depth + 1) }; }
+    if (isPunc('+')) { next(); return parseUnary(depth + 1); }
+    return parsePrimary(depth);
   }
 
-  function parseMulDiv() {
-    let left = parseUnary();
+  function parseMulDiv(depth) {
+    let left = parseUnary(depth);
     while (isPunc('*') || isPunc('/')) {
       const op = next().value;
-      left = { kind: 'binary', op, left, right: parseUnary() };
+      left = { kind: 'binary', op, left, right: parseUnary(depth + 1) };
     }
     return left;
   }
 
-  function parseAddSub() {
-    let left = parseMulDiv();
+  function parseAddSub(depth) {
+    let left = parseMulDiv(depth);
     while (isPunc('+') || isPunc('-')) {
       const op = next().value;
-      left = { kind: 'binary', op, left, right: parseMulDiv() };
+      left = { kind: 'binary', op, left, right: parseMulDiv(depth + 1) };
     }
     return left;
   }
 
-  function parseComparison() {
-    const left = parseAddSub();
+  function parseComparison(depth) {
+    const left = parseAddSub(depth);
     if (eatWord('IS')) {
       const negated = eatWord('NOT');
       expectWord('NULL');
@@ -298,18 +310,18 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
       expectPunc('(');
       if (isWord('SELECT')) bad('sql-unsupported-construct', 'IN (SELECT ...) subqueries are not supported');
       const items = [];
-      do { items.push(parseAddSub()); } while (isPunc(',') && next());
+      do { items.push(parseAddSub(depth + 1)); } while (isPunc(',') && next());
       expectPunc(')');
       return { kind: 'in', expr: left, items, negated };
     }
     if (eatWord('LIKE')) {
-      const pattern = parseAddSub();
+      const pattern = parseAddSub(depth + 1);
       return { kind: 'like', expr: left, pattern, negated };
     }
     if (eatWord('BETWEEN')) {
-      const low = parseAddSub();
+      const low = parseAddSub(depth + 1);
       expectWord('AND');
-      const high = parseAddSub();
+      const high = parseAddSub(depth + 1);
       return { kind: 'between', expr: left, low, high, negated };
     }
     if (negated) bad('sql-syntax-error', 'unexpected NOT after expression');
@@ -317,34 +329,35 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
     const t = peek();
     if ((t.type === 'punc' && (t.value === '=' || t.value === '<' || t.value === '>')) || t.type === 'op') {
       const op = next().value;
-      return { kind: 'binary', op, left, right: parseAddSub() };
+      return { kind: 'binary', op, left, right: parseAddSub(depth + 1) };
     }
     return left;
   }
 
-  function parseNot() {
-    if (eatWord('NOT')) return { kind: 'not', expr: parseNot() };
-    return parseComparison();
+  function parseNot(depth) {
+    checkDepth(depth);
+    if (eatWord('NOT')) return { kind: 'not', expr: parseNot(depth + 1) };
+    return parseComparison(depth);
   }
 
-  function parseAnd() {
-    let left = parseNot();
-    while (eatWord('AND')) left = { kind: 'binary', op: 'AND', left, right: parseNot() };
+  function parseAnd(depth) {
+    let left = parseNot(depth);
+    while (eatWord('AND')) left = { kind: 'binary', op: 'AND', left, right: parseNot(depth + 1) };
     return left;
   }
 
-  function parseOr() {
-    let left = parseAnd();
-    while (eatWord('OR')) left = { kind: 'binary', op: 'OR', left, right: parseAnd() };
+  function parseOr(depth) {
+    checkDepth(depth);
+    let left = parseAnd(depth);
+    while (eatWord('OR')) left = { kind: 'binary', op: 'OR', left, right: parseAnd(depth + 1) };
     return left;
   }
 
   const distinct = eatWord('DISTINCT');
 
-  // SELECT list
   const select = [];
   do {
-    const expr = parseAddSub();
+    const expr = parseAddSub(0);
     if (expr.kind === 'star') {
       select.push({ expr, alias: null });
     } else {
@@ -355,14 +368,12 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
 
   if (isWord('INTO')) bad('sql-write-refused', 'SELECT INTO is forbidden');
 
-  // FROM clause
   expectWord('FROM');
   if (isPunc('(')) bad('sql-unsupported-construct', 'subqueries in FROM are not supported');
   const fromTable = parseIdent();
   const fromAlias = parseOptionalAlias() ?? fromTable;
   const from = { table: fromTable, alias: fromAlias };
 
-  // JOIN clauses
   const joins = [];
   for (;;) {
     let joinKind = null;
@@ -378,33 +389,29 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
     const table = parseIdent();
     const alias = parseOptionalAlias() ?? table;
     expectWord('ON');
-    const on = parseOr();
+    const on = parseOr(0);
     joins.push({ kind: joinKind, table, alias, on });
   }
 
-  // WHERE
   let where = null;
-  if (eatWord('WHERE')) where = parseOr();
+  if (eatWord('WHERE')) where = parseOr(0);
 
-  // GROUP BY
   let groupBy = null;
   if (eatWord('GROUP')) {
     expectWord('BY');
     groupBy = [];
-    do { groupBy.push(parseAddSub()); } while (isPunc(',') && next());
+    do { groupBy.push(parseAddSub(0)); } while (isPunc(',') && next());
   }
 
-  // HAVING
   let having = null;
-  if (eatWord('HAVING')) having = parseOr();
+  if (eatWord('HAVING')) having = parseOr(0);
 
-  // ORDER BY
   let orderBy = null;
   if (eatWord('ORDER')) {
     expectWord('BY');
     orderBy = [];
     do {
-      const expr = parseAddSub();
+      const expr = parseAddSub(0);
       let dir = 'ASC';
       if (eatWord('DESC')) dir = 'DESC';
       else eatWord('ASC');
@@ -412,7 +419,6 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
     } while (isPunc(',') && next());
   }
 
-  // LIMIT / OFFSET
   let limit = null;
   let offset = 0;
   if (eatWord('LIMIT')) {
@@ -436,7 +442,6 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
     offset = o.value;
   }
 
-  // Trailing semicolon allowed only at EOF (reject stacked statements)
   if (isPunc(';')) next();
   if (peek().type !== 'eof') {
     const rem = peek();
@@ -454,20 +459,23 @@ export function parseSql(sql, { maxQueryBytes = DEFAULT_SQL_LIMITS.maxQueryBytes
 
 // --- Evaluator ---
 
-function hasAggregate(expr) {
+function hasAggregate(expr, depth = 0) {
   if (!expr) return false;
+  if (depth > MAX_AST_DEPTH) bad('sql-expression-too-deep', `exceeded max nesting depth ${MAX_AST_DEPTH}`);
   if (expr.kind === 'agg') return true;
-  if (expr.kind === 'binary') return hasAggregate(expr.left) || hasAggregate(expr.right);
-  if (expr.kind === 'unary' || expr.kind === 'not' || expr.kind === 'is_null') return hasAggregate(expr.expr);
-  if (expr.kind === 'call') return expr.args.some(hasAggregate);
-  if (expr.kind === 'in') return hasAggregate(expr.expr) || expr.items.some(hasAggregate);
-  if (expr.kind === 'like') return hasAggregate(expr.expr) || hasAggregate(expr.pattern);
-  if (expr.kind === 'between') return hasAggregate(expr.expr) || hasAggregate(expr.low) || hasAggregate(expr.high);
+  if (expr.kind === 'binary') return hasAggregate(expr.left, depth + 1) || hasAggregate(expr.right, depth + 1);
+  if (expr.kind === 'unary' || expr.kind === 'not' || expr.kind === 'is_null') return hasAggregate(expr.expr, depth + 1);
+  if (expr.kind === 'call') return expr.args.some((a) => hasAggregate(a, depth + 1));
+  if (expr.kind === 'in') return hasAggregate(expr.expr, depth + 1) || expr.items.some((a) => hasAggregate(a, depth + 1));
+  if (expr.kind === 'like') return hasAggregate(expr.expr, depth + 1) || hasAggregate(expr.pattern, depth + 1);
+  if (expr.kind === 'between') {
+    return hasAggregate(expr.expr, depth + 1) || hasAggregate(expr.low, depth + 1) || hasAggregate(expr.high, depth + 1);
+  }
   return false;
 }
 
 function defaultColName(expr, index) {
-  if (expr.kind === 'column') return expr.column;
+  if (expr.kind === 'column') return assertSafeSqlIdent(expr.column);
   if (expr.kind === 'agg') {
     const inner = expr.arg.kind === 'star' ? 'all' : (expr.arg.kind === 'column' ? expr.arg.column : `expr${index}`);
     return `${expr.fn.toLowerCase()}_${inner}`;
@@ -491,7 +499,6 @@ function likeMatch(value, pattern) {
   if (value === null || value === undefined || pattern === null || pattern === undefined) return false;
   const s = String(value);
   const p = String(pattern);
-  // Bounded wildcard DP (avoids ReDoS from converting SQL LIKE to arbitrary regex)
   let si = 0, pi = 0, starIdx = -1, matchIdx = 0;
   while (si < s.length) {
     if (pi < p.length && (p[pi] === '_' || p[pi] === s[si])) { si += 1; pi += 1; }
@@ -513,7 +520,7 @@ function lookupColumn(rowCtx, table, column) {
     }
     return null;
   }
-  if (rowCtx.projected && Object.prototype.hasOwnProperty.call(rowCtx.projected, column)) {
+  if (rowCtx.projected && Object.hasOwn(rowCtx.projected, column)) {
     return rowCtx.projected[column];
   }
   let found = false;
@@ -531,45 +538,46 @@ function lookupColumn(rowCtx, table, column) {
   return value;
 }
 
-function evalExpr(expr, rowCtx, groupRows = null) {
+function evalExpr(expr, rowCtx, groupRows = null, depth = 0) {
+  if (depth > MAX_AST_DEPTH) bad('sql-expression-too-deep', `exceeded max nesting depth ${MAX_AST_DEPTH}`);
   switch (expr.kind) {
     case 'literal': return expr.value;
     case 'column': return lookupColumn(rowCtx, expr.table, expr.column);
     case 'unary': {
-      const v = evalExpr(expr.expr, rowCtx, groupRows);
+      const v = evalExpr(expr.expr, rowCtx, groupRows, depth + 1);
       if (v === null || v === undefined) return null;
       return -Number(v);
     }
-    case 'not': return !evalExpr(expr.expr, rowCtx, groupRows);
+    case 'not': return !evalExpr(expr.expr, rowCtx, groupRows, depth + 1);
     case 'is_null': {
-      const v = evalExpr(expr.expr, rowCtx, groupRows);
+      const v = evalExpr(expr.expr, rowCtx, groupRows, depth + 1);
       const isNull = v === null || v === undefined;
       return expr.negated ? !isNull : isNull;
     }
     case 'in': {
-      const v = evalExpr(expr.expr, rowCtx, groupRows);
+      const v = evalExpr(expr.expr, rowCtx, groupRows, depth + 1);
       const matched = expr.items.some((item) => {
-        const iv = evalExpr(item, rowCtx, groupRows);
+        const iv = evalExpr(item, rowCtx, groupRows, depth + 1);
         return v !== null && iv !== null && compareValues(v, iv) === 0;
       });
       return expr.negated ? !matched : matched;
     }
     case 'like': {
-      const v = evalExpr(expr.expr, rowCtx, groupRows);
-      const p = evalExpr(expr.pattern, rowCtx, groupRows);
+      const v = evalExpr(expr.expr, rowCtx, groupRows, depth + 1);
+      const p = evalExpr(expr.pattern, rowCtx, groupRows, depth + 1);
       const matched = likeMatch(v, p);
       return expr.negated ? !matched : matched;
     }
     case 'between': {
-      const v = evalExpr(expr.expr, rowCtx, groupRows);
-      const lo = evalExpr(expr.low, rowCtx, groupRows);
-      const hi = evalExpr(expr.high, rowCtx, groupRows);
+      const v = evalExpr(expr.expr, rowCtx, groupRows, depth + 1);
+      const lo = evalExpr(expr.low, rowCtx, groupRows, depth + 1);
+      const hi = evalExpr(expr.high, rowCtx, groupRows, depth + 1);
       const matched = v !== null && lo !== null && hi !== null
         && compareValues(v, lo) >= 0 && compareValues(v, hi) <= 0;
       return expr.negated ? !matched : matched;
     }
     case 'call': {
-      const vals = expr.args.map((a) => evalExpr(a, rowCtx, groupRows));
+      const vals = expr.args.map((a) => evalExpr(a, rowCtx, groupRows, depth + 1));
       if (expr.fn === 'LOWER') return vals[0] == null ? null : String(vals[0]).toLowerCase();
       if (expr.fn === 'UPPER') return vals[0] == null ? null : String(vals[0]).toUpperCase();
       if (expr.fn === 'LENGTH') return vals[0] == null ? null : String(vals[0]).length;
@@ -584,7 +592,7 @@ function evalExpr(expr, rowCtx, groupRows = null) {
       if (!groupRows) bad('sql-aggregate-not-allowed-here', expr.fn);
       if (expr.fn === 'COUNT' && expr.arg.kind === 'star') return groupRows.length;
       let vals = groupRows
-        .map((r) => evalExpr(expr.arg, r, null))
+        .map((r) => evalExpr(expr.arg, r, null, depth + 1))
         .filter((v) => v !== null && v !== undefined);
       if (expr.distinct) {
         const seen = new Set();
@@ -608,10 +616,16 @@ function evalExpr(expr, rowCtx, groupRows = null) {
       return null;
     }
     case 'binary': {
-      if (expr.op === 'AND') return Boolean(evalExpr(expr.left, rowCtx, groupRows)) && Boolean(evalExpr(expr.right, rowCtx, groupRows));
-      if (expr.op === 'OR') return Boolean(evalExpr(expr.left, rowCtx, groupRows)) || Boolean(evalExpr(expr.right, rowCtx, groupRows));
-      const l = evalExpr(expr.left, rowCtx, groupRows);
-      const r = evalExpr(expr.right, rowCtx, groupRows);
+      if (expr.op === 'AND') {
+        return Boolean(evalExpr(expr.left, rowCtx, groupRows, depth + 1))
+          && Boolean(evalExpr(expr.right, rowCtx, groupRows, depth + 1));
+      }
+      if (expr.op === 'OR') {
+        return Boolean(evalExpr(expr.left, rowCtx, groupRows, depth + 1))
+          || Boolean(evalExpr(expr.right, rowCtx, groupRows, depth + 1));
+      }
+      const l = evalExpr(expr.left, rowCtx, groupRows, depth + 1);
+      const r = evalExpr(expr.right, rowCtx, groupRows, depth + 1);
       if (expr.op === '+' || expr.op === '-' || expr.op === '*' || expr.op === '/') {
         if (l === null || r === null) return null;
         const ln = Number(l), rn = Number(r);
@@ -638,19 +652,32 @@ function evalExpr(expr, rowCtx, groupRows = null) {
   }
 }
 
+function setSafeProp(obj, key, value) {
+  assertSafeSqlIdent(key);
+  Object.defineProperty(obj, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
 /**
  * Execute a read-only SQL query against a pinned OntologySnapshot.
- * Enforces basisCid equality (when provided), optional visibility filter, and scan/result/output limits.
+ * Enforces basisCid equality, fail-closed visibility filter, and hard upper bounds on limits.
  */
 export function executeSql(snapshot, sql, opts = {}) {
   if (!snapshot || !(snapshot.tables instanceof Map)) bad('invalid-snapshot', 'verified OntologySnapshot required');
   if (opts.basisCid && snapshot.basisCid !== opts.basisCid) {
     bad('basis-cid-mismatch', `expected ${opts.basisCid}, got ${snapshot.basisCid}`);
   }
-  const limits = { ...DEFAULT_SQL_LIMITS, ...opts.limits };
-  if (opts.maxScanRows !== undefined) limits.maxScanRows = opts.maxScanRows;
-  if (opts.maxResultRows !== undefined) limits.maxResultRows = opts.maxResultRows;
-  if (opts.maxOutputBytes !== undefined) limits.maxOutputBytes = opts.maxOutputBytes;
+  // Caller-provided limits can ONLY tighten below hardCaps (never raise them).
+  const hardCaps = { ...DEFAULT_SQL_LIMITS, ...(opts.hardLimits ?? {}) };
+  const limits = resolveBoundedLimits(opts.limits, hardCaps, CALLER_SQL_LIMIT_KEYS, SqlError);
+  if (opts.maxScanRows !== undefined) {
+    limits.maxScanRows = clampLimit(opts.maxScanRows, limits.maxScanRows, hardCaps.maxScanRows, 'maxScanRows', SqlError);
+  }
+  if (opts.maxResultRows !== undefined) {
+    limits.maxResultRows = clampLimit(opts.maxResultRows, limits.maxResultRows, hardCaps.maxResultRows, 'maxResultRows', SqlError);
+  }
+  if (opts.maxOutputBytes !== undefined) {
+    limits.maxOutputBytes = clampLimit(opts.maxOutputBytes, limits.maxOutputBytes, hardCaps.maxOutputBytes, 'maxOutputBytes', SqlError);
+  }
 
   const ast = parseSql(sql, { maxQueryBytes: limits.maxQueryBytes });
   const visible = buildVisibilityFilter(opts);
@@ -669,7 +696,6 @@ export function executeSql(snapshot, sql, opts = {}) {
     }
   };
 
-  // Scan base FROM table with visibility filter
   const baseRows = loadTable(ast.from.table);
   let working = [];
   const baseAlias = ast.from.alias.toLowerCase();
@@ -680,7 +706,6 @@ export function executeSql(snapshot, sql, opts = {}) {
     working.push({ byAlias });
   }
 
-  // Execute JOINs sequentially (bounded)
   for (const j of ast.joins) {
     const rightRows = loadTable(j.table);
     const rightAlias = j.alias.toLowerCase();
@@ -711,15 +736,13 @@ export function executeSql(snapshot, sql, opts = {}) {
     working = nextWorking;
   }
 
-  // WHERE
   if (ast.where) {
     working = working.filter((ctx) => Boolean(evalExpr(ast.where, ctx)));
   }
 
-  // Determine if aggregate query
   const isAggregate = Boolean(ast.groupBy) || ast.select.some((s) => hasAggregate(s.expr)) || hasAggregate(ast.having);
 
-  let outputEntries = []; // [{ projected, ctx, groupRows }]
+  let outputEntries = [];
   let columns = [];
 
   if (isAggregate) {
@@ -733,7 +756,6 @@ export function executeSql(snapshot, sql, opts = {}) {
         bucket.push(ctx);
       }
     } else {
-      // Whole-table aggregate: always yields 1 group (even when working is empty)
       groups.set('__all__', working);
     }
 
@@ -746,7 +768,7 @@ export function executeSql(snapshot, sql, opts = {}) {
         const item = ast.select[i];
         if (item.expr.kind === 'star') bad('sql-syntax-error', 'SELECT * cannot be combined with GROUP BY / aggregates');
         const colName = item.alias ?? defaultColName(item.expr, i);
-        projected[colName] = evalExpr(item.expr, sampleCtx, groupRows);
+        setSafeProp(projected, colName, evalExpr(item.expr, sampleCtx, groupRows));
         cols.push(colName);
       }
       if (columns.length === 0) columns = cols;
@@ -762,20 +784,19 @@ export function executeSql(snapshot, sql, opts = {}) {
           if (item.expr.table) {
             const tObj = ctx.byAlias.get(item.expr.table.toLowerCase());
             if (!tObj) bad('sql-unknown-table-alias', item.expr.table);
-            for (const [k, v] of Object.entries(tObj)) { projected[k] = v; colSet.add(k); }
+            for (const [k, v] of Object.entries(tObj)) { setSafeProp(projected, k, v); colSet.add(k); }
           } else {
             for (const [alias, tObj] of ctx.byAlias.entries()) {
               for (const [k, v] of Object.entries(tObj)) {
-                const key = ctx.byAlias.size > 1 && Object.prototype.hasOwnProperty.call(projected, k)
-                  ? `${alias}_${k}` : k;
-                projected[key] = v;
+                const key = ctx.byAlias.size > 1 && Object.hasOwn(projected, k) ? `${alias}_${k}` : k;
+                setSafeProp(projected, key, v);
                 colSet.add(key);
               }
             }
           }
         } else {
           const colName = item.alias ?? defaultColName(item.expr, i);
-          projected[colName] = evalExpr(item.expr, ctx);
+          setSafeProp(projected, colName, evalExpr(item.expr, ctx));
           colSet.add(colName);
         }
       }
@@ -784,7 +805,6 @@ export function executeSql(snapshot, sql, opts = {}) {
     columns = [...colSet];
   }
 
-  // DISTINCT
   if (ast.distinct) {
     const seen = new Set();
     outputEntries = outputEntries.filter((entry) => {
@@ -795,7 +815,6 @@ export function executeSql(snapshot, sql, opts = {}) {
     });
   }
 
-  // ORDER BY
   if (ast.orderBy && ast.orderBy.length > 0) {
     outputEntries.sort((a, b) => {
       for (const spec of ast.orderBy) {
@@ -808,7 +827,6 @@ export function executeSql(snapshot, sql, opts = {}) {
     });
   }
 
-  // OFFSET & LIMIT + maxResultRows enforcement
   const sliced = ast.offset > 0 ? outputEntries.slice(ast.offset) : outputEntries;
   const limited = ast.limit !== null ? sliced.slice(0, ast.limit) : sliced;
   if (limited.length > limits.maxResultRows) {

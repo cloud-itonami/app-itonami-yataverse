@@ -222,9 +222,9 @@ test('SPARQL negative: fail-closed on SERVICE, FROM, update verbs, unsupported s
     (e) => e instanceof SparqlError && e.code === 'sparql-unsupported-function',
   );
 
-  // Nested quantifier ReDoS refused
+  // Backreference / lookahead patterns refused (linear-time NFA handles (a+)+$ safely in O(n))
   assert.throws(
-    () => executeSparql(snap, 'SELECT ?s WHERE { ?s ?p ?o . FILTER(REGEX(?o, "(a+)+$")) }'),
+    () => executeSparql(snap, 'SELECT ?s WHERE { ?s ?p ?o . FILTER(REGEX(?o, "(a+)\\\\1+")) }'),
     (e) => e instanceof SparqlError && e.code === 'sparql-regex-too-complex',
   );
 

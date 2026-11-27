@@ -384,13 +384,30 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
           }
           return 0;
         }
+        const parsePositiveIntFlag = (raw, flagName) => {
+          if (raw === undefined) return undefined;
+          if (!/^\d+$/.test(String(raw))) {
+            const err = new Error(`${flagName} must be a positive integer`);
+            err.code = 'invalid-limit';
+            throw err;
+          }
+          const n = Number(raw);
+          if (!Number.isSafeInteger(n) || n < 1) {
+            const err = new Error(`${flagName} must be a positive integer`);
+            err.code = 'invalid-limit';
+            throw err;
+          }
+          return n;
+        };
         if (sub === 'sql') {
           if (!f.query) { stderr.write('yataverse: ontology sql needs --query "<SQL>"\n'); return 2; }
           const carBytes = readInput(target);
           const snap = verifyOntologySnapshot(carBytes, { expectedBasisCid: f.basis ?? null });
           const limits = {};
-          if (f.maxScan) limits.maxScanRows = Number(f.maxScan);
-          if (f.maxRows) limits.maxResultRows = Number(f.maxRows);
+          const maxScan = parsePositiveIntFlag(f.maxScan, '--max-scan');
+          const maxRows = parsePositiveIntFlag(f.maxRows, '--max-rows');
+          if (maxScan !== undefined) limits.maxScanRows = maxScan;
+          if (maxRows !== undefined) limits.maxResultRows = maxRows;
           const res = await invokeOntologyOperation('ontology.query_sql', {
             basisCid: f.basis ?? snap.basisCid,
             query: f.query,
@@ -409,8 +426,10 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
           const carBytes = readInput(target);
           const snap = verifyOntologySnapshot(carBytes, { expectedBasisCid: f.basis ?? null });
           const limits = {};
-          if (f.maxScan) limits.maxScanSteps = Number(f.maxScan);
-          if (f.maxRows) limits.maxSolutions = Number(f.maxRows);
+          const maxScan = parsePositiveIntFlag(f.maxScan, '--max-scan');
+          const maxRows = parsePositiveIntFlag(f.maxRows, '--max-rows');
+          if (maxScan !== undefined) limits.maxScanSteps = maxScan;
+          if (maxRows !== undefined) limits.maxSolutions = maxRows;
           const res = await invokeOntologyOperation('ontology.query_sparql', {
             basisCid: f.basis ?? snap.basisCid,
             ...(f.query ? { query: f.query } : { algebraEdn: f.algebraEdn }),
@@ -442,7 +461,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
           }
           return 0;
         }
-        stderr.write('usage: yataverse ontology schema|build|verify|inspect|sql|sparql|view ...\n');
+        stderr.write('usage: yataverse ontology schema|build|verify|inspect|graph|sql|sparql|view ...\n');
         return 2;
       }
       case 'site-pack': {

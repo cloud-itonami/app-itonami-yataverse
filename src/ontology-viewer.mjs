@@ -5,7 +5,7 @@
 //   ontology.graph, ontology.inspect, ontology.query_sql, ontology.query_sparql,
 //   ontology.view, ontology.build, ontology.verify.
 // - Visualization rendering delegated to reusable zero-dependency src/ontology-viz.mjs.
-// - Read-only, basisCid-pinned, bounded, XSS-safe.
+// - Read-only, basisCid-pinned, caller limits can only tighten (never raise hard caps), XSS-safe.
 
 import {
   ONTOLOGY_SNAPSHOT_SCHEMA,
@@ -13,11 +13,15 @@ import {
   buildOntologySnapshot,
   verifyOntologySnapshot,
   normalizeKeyword,
+  clampLimit,
 } from './ontology.mjs';
-import { executeSql } from './ontology-sql.mjs';
-import { executeSparql } from './ontology-sparql.mjs';
+import { executeSql, DEFAULT_SQL_LIMITS } from './ontology-sql.mjs';
+import { executeSparql, DEFAULT_SPARQL_LIMITS } from './ontology-sparql.mjs';
 import {
   ONTOLOGY_GRAPH_SCHEMA,
+  MAX_GRAPH_NODES,
+  VIEWER_CLIENT_SCRIPT,
+  assertSafeEndpointPath,
   buildOntologyGraph,
   encodeOntologyGraphDagCbor,
   renderOntologySvg,
@@ -28,6 +32,8 @@ import {
 
 export {
   ONTOLOGY_GRAPH_SCHEMA,
+  MAX_GRAPH_NODES,
+  VIEWER_CLIENT_SCRIPT,
   buildOntologyGraph,
   encodeOntologyGraphDagCbor,
   renderOntologySvg,
@@ -40,15 +46,23 @@ export const ONTOLOGY_OPERATION_SCHEMA_VERSION = 'yataverse.ontology.operations/
 export const NOUN_VERB_PATTERN = /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/;
 
 const BASIS_CID_PROP = { type: 'string', description: 'Pinned CIDv1 (dag-cbor, sha2-256) root of the ontology snapshot.' };
-const LIMITS_PROP = {
+const SQL_LIMITS_PROP = {
   type: 'object',
-  description: 'Optional execution bounds.',
+  description: 'Optional tightening execution bounds (cannot exceed server hard limits).',
   properties: {
-    maxScanRows: { type: 'integer', minimum: 1 },
-    maxScanSteps: { type: 'integer', minimum: 1 },
-    maxResultRows: { type: 'integer', minimum: 1 },
-    maxSolutions: { type: 'integer', minimum: 1 },
-    maxOutputBytes: { type: 'integer', minimum: 1 },
+    maxScanRows: { type: 'integer', minimum: 1, maximum: DEFAULT_SQL_LIMITS.maxScanRows },
+    maxResultRows: { type: 'integer', minimum: 1, maximum: DEFAULT_SQL_LIMITS.maxResultRows },
+    maxOutputBytes: { type: 'integer', minimum: 1, maximum: DEFAULT_SQL_LIMITS.maxOutputBytes },
+  },
+  additionalProperties: false,
+};
+const SPARQL_LIMITS_PROP = {
+  type: 'object',
+  description: 'Optional tightening execution bounds (cannot exceed server hard limits).',
+  properties: {
+    maxScanSteps: { type: 'integer', minimum: 1, maximum: DEFAULT_SPARQL_LIMITS.maxScanSteps },
+    maxSolutions: { type: 'integer', minimum: 1, maximum: DEFAULT_SPARQL_LIMITS.maxSolutions },
+    maxOutputBytes: { type: 'integer', minimum: 1, maximum: DEFAULT_SPARQL_LIMITS.maxOutputBytes },
   },
   additionalProperties: false,
 };
@@ -67,7 +81,7 @@ export const ONTOLOGY_OPERATIONS = Object.freeze([
       properties: {
         basisCid: BASIS_CID_PROP,
         carBase64: { type: 'string', description: 'Optional base64 CAR when evaluating statelessly.' },
-        maxNodes: { type: 'integer', minimum: 1, maximum: 500, description: 'Maximum graph nodes returned (default 64).' },
+        maxNodes: { type: 'integer', minimum: 1, maximum: MAX_GRAPH_NODES, description: 'Maximum graph nodes returned (default 64, max 500).' },
         includeRdfSubjects: { type: 'boolean', description: 'Include standalone RDF subjects outside fact projections.' },
       },
       additionalProperties: false,
@@ -198,7 +212,7 @@ export const ONTOLOGY_OPERATIONS = Object.freeze([
         query: { type: 'string', description: 'Read-only SQL SELECT statement.' },
         jurisdiction: { description: 'Optional jurisdiction visibility filter (string or string[]).' },
         allowedSources: { type: 'array', description: 'Optional allowed connector source IDs.' },
-        limits: LIMITS_PROP,
+        limits: SQL_LIMITS_PROP,
       },
       additionalProperties: false,
     },
@@ -232,7 +246,7 @@ export const ONTOLOGY_OPERATIONS = Object.freeze([
         algebra: { type: 'object', description: 'Optional JSON SPARQL algebra object.' },
         jurisdiction: { description: 'Optional jurisdiction visibility filter (string or string[]).' },
         allowedSources: { type: 'array', description: 'Optional allowed connector source IDs.' },
-        limits: LIMITS_PROP,
+        limits: SPARQL_LIMITS_PROP,
       },
       additionalProperties: false,
     },
@@ -265,8 +279,8 @@ export const ONTOLOGY_OPERATIONS = Object.freeze([
         carBase64: { type: 'string', description: 'Optional base64 CAR when evaluating statelessly.' },
         format: { type: 'string', enum: ['json', 'svg', 'html', 'all'], description: 'Output representation (default all).' },
         title: { type: 'string', description: 'Optional viewer title.' },
-        maxNodes: { type: 'integer', minimum: 1, maximum: 500, description: 'Maximum graph nodes rendered in SVG/viewModel (default 64).' },
-        apiBase: { type: 'string', description: 'Base URL for interactive viewer operation calls (default /ontology/v1).' },
+        maxNodes: { type: 'integer', minimum: 1, maximum: MAX_GRAPH_NODES, description: 'Maximum graph nodes rendered (default 64, max 500).' },
+        apiBase: { type: 'string', description: 'Relative base path for interactive viewer calls (default /ontology/v1).' },
       },
       additionalProperties: false,
     },
@@ -313,10 +327,10 @@ export function inspectOntology(snapshot) {
       columns: [...colSet],
     });
   }
-  const provenanceSources = {};
+  const provenanceSourcesMap = Object.create(null);
   for (const f of snapshot.facts) {
     const src = normalizeKeyword(f['ontology/source']) ?? 'unknown';
-    provenanceSources[src] = (provenanceSources[src] ?? 0) + 1;
+    provenanceSourcesMap[src] = (provenanceSourcesMap[src] ?? 0) + 1;
   }
   return {
     basisCid: snapshot.basisCid,
@@ -327,7 +341,7 @@ export function inspectOntology(snapshot) {
     parentBasisCid: snapshot.parentBasisCid,
     blockCids: snapshot.blockCids,
     stats: snapshot.stats,
-    provenanceSources,
+    provenanceSources: Object.assign({}, provenanceSourcesMap),
     objectTypes: snapshot.registry.objectTypes,
     connectors: snapshot.registry.connectors,
     joinMappings: snapshot.joinMappings,
@@ -350,8 +364,15 @@ export function renderOntologyViewer(snapshot, {
   if (!['json', 'svg', 'html', 'all'].includes(format)) {
     throw new OntologyError('invalid-view-format', `expected json|svg|html|all, got ${format}`);
   }
+  const boundNodes = clampLimit(maxNodes, 64, MAX_GRAPH_NODES, 'maxNodes', OntologyError);
+  assertSafeEndpointPath(apiBase, 'apiBase');
+  assertSafeEndpointPath(sqlEndpoint, 'sqlEndpoint');
+  assertSafeEndpointPath(sparqlEndpoint, 'sparqlEndpoint');
+  assertSafeEndpointPath(viewerPath, 'viewerPath');
+  assertSafeEndpointPath(graphEndpoint, 'graphEndpoint');
+
   const inspection = inspectOntology(snapshot);
-  const graph = buildOntologyGraph(snapshot, { maxNodes });
+  const graph = buildOntologyGraph(snapshot, { maxNodes: boundNodes });
   const semanticSchema = getOntologySchema();
   const viewModel = {
     basisCid: snapshot.basisCid,
@@ -368,11 +389,11 @@ export function renderOntologyViewer(snapshot, {
     })),
   };
   const out = { basisCid: snapshot.basisCid, semanticSchema, viewModel };
-  if (format === 'svg' || format === 'all') out.svg = renderOntologySvg(graph, { maxNodes });
+  if (format === 'svg' || format === 'all') out.svg = renderOntologySvg(graph, { maxNodes: boundNodes });
   if (format === 'html' || format === 'all') {
     out.html = renderOntologyHtml(snapshot, {
       title,
-      maxNodes,
+      maxNodes: boundNodes,
       apiBase,
       sqlEndpoint,
       sparqlEndpoint,
@@ -388,7 +409,8 @@ export function renderOntologyViewer(snapshot, {
 
 /**
  * Unified Semantic UI noun.verb operation dispatcher.
- * `context` may supply an already-verified `snapshot`, or an async `loadSnapshot(basisCid)` loader.
+ * `context` may supply an already-verified `snapshot`, `loadSnapshot(basisCid)`,
+ * `checkBlockCids(cids)` (e.g. READ_DENY_CIDS check), and hard `sqlLimits`/`sparqlLimits`/`limits`.
  */
 export async function invokeOntologyOperation(operation, input = {}, context = {}) {
   if (typeof operation !== 'string' || !NOUN_VERB_PATTERN.test(operation)) {
@@ -410,7 +432,20 @@ export async function invokeOntologyOperation(operation, input = {}, context = {
   }
 
   if (operation === 'ontology.build') {
+    if (typeof context.checkBlockCids === 'function') {
+      const preCids = [];
+      if (typeof input.basisCid === 'string') preCids.push(input.basisCid);
+      if (input.pinnedContexts && typeof input.pinnedContexts === 'object') {
+        for (const entry of Object.values(input.pinnedContexts)) {
+          if (entry && typeof entry.cid === 'string') preCids.push(entry.cid);
+        }
+      }
+      if (preCids.length) context.checkBlockCids(preCids);
+    }
     const snap = buildOntologySnapshot(input, { limits: context.limits });
+    if (typeof context.checkBlockCids === 'function') {
+      context.checkBlockCids([...snap.blocks.keys()]);
+    }
     return {
       ok: true,
       operation,
@@ -434,10 +469,18 @@ export async function invokeOntologyOperation(operation, input = {}, context = {
     }
     const carBytes = Buffer.from(input.carBase64, 'base64');
     snapshot = verifyOntologySnapshot(carBytes, { expectedBasisCid: input.basisCid ?? null, limits: context.limits });
+    if (typeof context.checkBlockCids === 'function') {
+      const cids = [...snapshot.blocks.keys()];
+      if (snapshot.parentBasisCid) cids.push(snapshot.parentBasisCid);
+      context.checkBlockCids(cids);
+    }
   } else if (context.snapshot) {
     snapshot = context.snapshot;
     if (input.basisCid && snapshot.basisCid !== input.basisCid) {
       throw new OntologyError('basis-cid-mismatch', `expected ${input.basisCid}, got ${snapshot.basisCid}`);
+    }
+    if (typeof context.checkBlockCids === 'function') {
+      context.checkBlockCids([...snapshot.blocks.keys()]);
     }
   } else if (input.basisCid && typeof context.loadSnapshot === 'function') {
     snapshot = await context.loadSnapshot(input.basisCid);
@@ -447,8 +490,9 @@ export async function invokeOntologyOperation(operation, input = {}, context = {
 
   let result;
   if (operation === 'ontology.graph') {
+    const boundNodes = clampLimit(input.maxNodes, 64, MAX_GRAPH_NODES, 'maxNodes', OntologyError);
     const graph = buildOntologyGraph(snapshot, {
-      maxNodes: input.maxNodes ?? 64,
+      maxNodes: boundNodes,
       includeRdfSubjects: Boolean(input.includeRdfSubjects),
     });
     const { cid: graphCid } = encodeOntologyGraphDagCbor(graph);
@@ -465,12 +509,15 @@ export async function invokeOntologyOperation(operation, input = {}, context = {
   } else if (operation === 'ontology.inspect') {
     result = inspectOntology(snapshot);
   } else if (operation === 'ontology.query_sql') {
+    // context.sqlLimits acts as the hard upper bound; input.limits can ONLY tighten below it.
+    const hardLimits = { ...DEFAULT_SQL_LIMITS, ...(context.sqlLimits ?? {}) };
     result = executeSql(snapshot, input.query, {
       basisCid: input.basisCid ?? snapshot.basisCid,
       jurisdiction: input.jurisdiction,
       allowedSources: input.allowedSources,
       visible: context.visible,
-      limits: { ...context.sqlLimits, ...input.limits },
+      hardLimits,
+      limits: input.limits,
     });
   } else if (operation === 'ontology.query_sparql') {
     const hasQuery = typeof input.query === 'string';
@@ -480,18 +527,22 @@ export async function invokeOntologyOperation(operation, input = {}, context = {
       throw new OntologyError('invalid-sparql-arguments', 'provide exactly one of query, algebraEdn, or algebra');
     }
     const q = hasQuery ? input.query : (hasEdn ? { edn: input.algebraEdn } : input.algebra);
+    const hardLimits = { ...DEFAULT_SPARQL_LIMITS, ...(context.sparqlLimits ?? {}) };
     result = executeSparql(snapshot, q, {
       basisCid: input.basisCid ?? snapshot.basisCid,
       jurisdiction: input.jurisdiction,
       allowedSources: input.allowedSources,
       visible: context.visible,
-      limits: { ...context.sparqlLimits, ...input.limits },
+      hardLimits,
+      limits: input.limits,
     });
   } else if (operation === 'ontology.view') {
+    const boundNodes = clampLimit(input.maxNodes, 64, MAX_GRAPH_NODES, 'maxNodes', OntologyError);
+    if (input.apiBase !== undefined) assertSafeEndpointPath(input.apiBase, 'apiBase');
     result = renderOntologyViewer(snapshot, {
       format: input.format ?? 'all',
       title: input.title,
-      maxNodes: input.maxNodes ?? 64,
+      maxNodes: boundNodes,
       apiBase: input.apiBase ?? '/ontology/v1',
     });
   }

@@ -15,15 +15,26 @@
 //   GET  /ontology/v1/view/<cid>         -> Semantic UI HTML/SVG/JSON viewer (?format=html|svg|json)
 //   POST /ontology/v1/ops/<operation>    -> invoke noun.verb operation (read-only)
 //
-// Reads blocks strictly through the Worker's existing readPublicBlock + collectDag pipeline
-// (so READ_DENY_CIDS 451 and SHA2-256 CID verification are always enforced). Never writes to B2.
+// Reads blocks strictly through the Worker's readPublicBlock pipeline (5-block root+children
+// closure matching verifyOntologySnapshot), enforces READ_DENY_CIDS 451 / 503 fail-closed
+// across every route (including seeded & stateless CARs), and enforces strict DoS bounds.
 
+import crypto from 'node:crypto';
 import { parseCid, CODEC_DAG_CBOR, SHA2_256 } from '../../src/cid.mjs';
-import { collectDag, DagError } from '../../src/dag.mjs';
-import { verifyOntologySnapshot, OntologyError } from '../../src/ontology.mjs';
+import { checkWritableBlock } from '../../src/block.mjs';
+import { decodeDagCbor, DagCborError } from '../../src/dag-cbor.mjs';
+import { CarError } from '../../src/car.mjs';
+import {
+  ONTOLOGY_SNAPSHOT_SCHEMA,
+  fromDagCborSafe,
+  extractLinkCid,
+  verifyOntologySnapshot,
+  OntologyError,
+} from '../../src/ontology.mjs';
 import { SqlError } from '../../src/ontology-sql.mjs';
 import { SparqlError } from '../../src/ontology-sparql.mjs';
 import {
+  VIEWER_CLIENT_SCRIPT,
   getOntologySchema,
   getOperationSpec,
   invokeOntologyOperation,
@@ -33,10 +44,37 @@ import {
   renderYataverseHomeHtml,
   createDefaultOntologySnapshot,
 } from '../../src/ontology-viewer.mjs';
+import { DENY_INVALID_ERROR } from './read-deny.mjs';
 
 export const ONTOLOGY_PREFIX = '/ontology/v1/';
-const MAX_OP_BODY_BYTES = 2 * 1024 * 1024;
+export const MAX_OP_BODY_BYTES = 256 * 1024;
 const DAG_CBOR_CT = 'application/vnd.ipld.dag-cbor';
+
+/** Hard upper bounds for unauthenticated public Worker requests (callers can only tighten). */
+export const WORKER_SNAPSHOT_LIMITS = Object.freeze({
+  maxObjectTypes: 64,
+  maxConnectors: 64,
+  maxFacts: 2_000,
+  maxQuads: 10_000,
+  maxJoins: 32,
+  maxJoinedRows: 10_000,
+  maxBlocks: 32,
+  maxBytes: 1 * 1024 * 1024,
+});
+
+export const WORKER_SQL_LIMITS = Object.freeze({
+  maxQueryBytes: 8 * 1024,
+  maxScanRows: 20_000,
+  maxResultRows: 500,
+  maxOutputBytes: 256 * 1024,
+});
+
+export const WORKER_SPARQL_LIMITS = Object.freeze({
+  maxQueryBytes: 8 * 1024,
+  maxScanSteps: 50_000,
+  maxSolutions: 500,
+  maxOutputBytes: 256 * 1024,
+});
 
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
@@ -44,7 +82,11 @@ const JSON_HEADERS = {
   'cache-control': 'no-store',
 };
 
-const HTML_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:;";
+const VIEWER_SCRIPT_SHA256 = crypto.createHash('sha256').update(VIEWER_CLIENT_SCRIPT, 'utf8').digest('base64');
+const BASE_CSP = "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'unsafe-inline'; img-src 'self' data:;";
+export const HOME_CSP = `${BASE_CSP} script-src 'none';`;
+export const VIEWER_CSP = `${BASE_CSP} script-src 'sha256-${VIEWER_SCRIPT_SHA256}'; connect-src 'self';`;
+export const SVG_CSP = "default-src 'none'; base-uri 'none'; frame-ancestors 'none';";
 
 const jsonRes = (status, body, extra = {}) =>
   new Response(JSON.stringify(body), { status, headers: { ...JSON_HEADERS, ...extra } });
@@ -72,40 +114,86 @@ export function isOntologyRoute(pathname) {
     || pathname.startsWith(ONTOLOGY_PREFIX);
 }
 
-async function loadSnapshotFromStore(cid, { readPublicBlock, hasStore, carLimits, denyHeaders }) {
+/** Fail-closed check for a list of CIDs against READ_DENY_CIDS. */
+function assertCidsAllowed(cids, storeCtx) {
+  if (storeCtx.readDenyInvalid) {
+    throw new LoaderHttpError(503, DENY_INVALID_ERROR, storeCtx.denyHeaders);
+  }
+  if (typeof storeCtx.readDenied !== 'function') return;
+  for (const cid of cids) {
+    const denied = storeCtx.readDenied(cid);
+    if (denied) throw new LoaderHttpError(denied[0], denied[1], storeCtx.denyHeaders);
+  }
+}
+
+/**
+ * Load and verify an ontology snapshot root + its 4 required DAG-CBOR child blocks from store.
+ * Consistent with verifyOntologySnapshot closure policy: does NOT traverse external parentBasis
+ * chains, enforces READ_DENY_CIDS on root, all 4 child CIDs, and parentBasis (when declared).
+ */
+async function loadSnapshotFromStore(cid, storeCtx) {
   const parsed = parseCid(cid);
   if (!parsed || parsed.version !== 1 || parsed.codec !== CODEC_DAG_CBOR || parsed.hashCode !== SHA2_256) {
     throw new LoaderHttpError(400, 'invalid-basis-cid');
   }
-  if (!hasStore) throw new LoaderHttpError(503, 'store-not-configured');
-  let blocks;
-  try {
-    blocks = await collectDag(cid, 'all', async (c) => {
-      const r = await readPublicBlock(c);
-      if (r.denied) throw new LoaderHttpError(r.error[0], r.error[1], denyHeaders);
-      if (r.error) throw new LoaderHttpError(r.error[0], r.error[1]);
-      return r.absent ? null : r.bytes;
-    }, carLimits);
-  } catch (e) {
-    if (e instanceof LoaderHttpError) throw e;
-    if (e instanceof DagError) {
-      if (e.code === 'root-not-found') throw new LoaderHttpError(404, 'ontology-snapshot-not-found');
-      if (e.code === 'closure-incomplete') throw new LoaderHttpError(502, `closure-incomplete:${e.message}`);
-      throw new LoaderHttpError(422, e.code);
+  assertCidsAllowed([cid], storeCtx);
+  if (!storeCtx.hasStore) throw new LoaderHttpError(503, 'store-not-configured');
+
+  const fetchOne = async (targetCid, isRoot) => {
+    const r = await storeCtx.readPublicBlock(targetCid);
+    if (r.denied) throw new LoaderHttpError(r.error[0], r.error[1], storeCtx.denyHeaders);
+    if (r.error) throw new LoaderHttpError(r.error[0], r.error[1]);
+    if (r.absent) {
+      throw new LoaderHttpError(isRoot ? 404 : 502, isRoot ? 'ontology-snapshot-not-found' : `closure-incomplete:${targetCid}`);
     }
+    const bad = checkWritableBlock(targetCid, r.bytes);
+    if (bad) throw new LoaderHttpError(400, `invalid-block:${bad}`);
+    return r.bytes;
+  };
+
+  const rootBytes = await fetchOne(cid, true);
+  let rootDecoded;
+  try { rootDecoded = fromDagCborSafe(decodeDagCbor(rootBytes).value); }
+  catch (e) {
+    if (e instanceof DagCborError) throw new LoaderHttpError(400, `not-canonical-dag-cbor:${e.code}`);
     throw e;
   }
-  const map = new Map(blocks.map((b) => [b.cid, b.bytes]));
-  return verifyOntologySnapshot(map, { rootCid: cid, expectedBasisCid: cid });
+  if (!rootDecoded || typeof rootDecoded !== 'object' || rootDecoded.schema !== ONTOLOGY_SNAPSHOT_SCHEMA || rootDecoded.version !== 1) {
+    throw new OntologyError('invalid-snapshot-schema', String(rootDecoded?.schema));
+  }
+
+  const registryCid = extractLinkCid(rootDecoded.registry, 'registry', { requireDagCbor: true });
+  const factsCid = extractLinkCid(rootDecoded.facts, 'facts', { requireDagCbor: true });
+  const quadsCid = extractLinkCid(rootDecoded.quads, 'quads', { requireDagCbor: true });
+  const joinsCid = extractLinkCid(rootDecoded.joins, 'joins', { requireDagCbor: true });
+  const parentBasisCid = rootDecoded.parentBasis ? extractLinkCid(rootDecoded.parentBasis, 'parentBasis', { requireDagCbor: true }) : null;
+
+  const childCids = [...new Set([registryCid, factsCid, quadsCid, joinsCid])];
+  assertCidsAllowed(parentBasisCid ? [...childCids, parentBasisCid] : childCids, storeCtx);
+
+  const blocks = new Map([[cid, rootBytes]]);
+  let totalBytes = rootBytes.length;
+  for (const childCid of childCids) {
+    if (blocks.has(childCid)) continue;
+    const b = await fetchOne(childCid, false);
+    totalBytes += b.length;
+    if (totalBytes > WORKER_SNAPSHOT_LIMITS.maxBytes) {
+      throw new OntologyError('limit-exceeded', `maxBytes (${WORKER_SNAPSHOT_LIMITS.maxBytes})`);
+    }
+    blocks.set(childCid, b);
+  }
+  return verifyOntologySnapshot(blocks, { rootCid: cid, expectedBasisCid: cid, limits: WORKER_SNAPSHOT_LIMITS });
 }
 
-/** Resolve either a stored CID snapshot (when cid is provided) or the seeded default snapshot. */
 async function resolveSnapshotByQuery(cidParam, storeCtx) {
   if (!cidParam) {
-    return { snapshot: createDefaultOntologySnapshot(), isSeededDefault: true };
+    const seeded = createDefaultOntologySnapshot();
+    assertCidsAllowed([...seeded.blocks.keys()], storeCtx);
+    return { snapshot: seeded, isSeededDefault: true };
   }
   const seeded = createDefaultOntologySnapshot();
   if (cidParam === seeded.basisCid && !storeCtx.hasStore) {
+    assertCidsAllowed([...seeded.blocks.keys()], storeCtx);
     return { snapshot: seeded, isSeededDefault: true };
   }
   const snapshot = await loadSnapshotFromStore(cidParam, storeCtx);
@@ -114,6 +202,8 @@ async function resolveSnapshotByQuery(cidParam, storeCtx) {
 
 function errorToResponse(e) {
   if (e instanceof LoaderHttpError) return failRes(e.status, e.code, null, e.headers);
+  if (e instanceof DagCborError) return failRes(400, `dag-cbor-${e.code}`);
+  if (e instanceof CarError) return failRes(400, `car-${e.code}`, e.message);
   if (e instanceof OntologyError || e instanceof SqlError || e instanceof SparqlError) {
     const status = (e.code === 'unknown-operation') ? 404
       : (e.code === 'scan-limit-exceeded' || e.code === 'result-limit-exceeded' || e.code === 'solution-limit-exceeded' || e.code === 'output-size-exceeded' || e.code === 'limit-exceeded') ? 422
@@ -131,7 +221,7 @@ function viewerResponse(rendered, format, snapshot, head, immutable) {
       headers: {
         'content-type': 'text/html; charset=utf-8',
         'x-content-type-options': 'nosniff',
-        'content-security-policy': HTML_CSP,
+        'content-security-policy': VIEWER_CSP,
         'cache-control': cacheControl,
         etag: `"${snapshot.basisCid}.html"`,
       },
@@ -143,7 +233,7 @@ function viewerResponse(rendered, format, snapshot, head, immutable) {
       headers: {
         'content-type': 'image/svg+xml; charset=utf-8',
         'x-content-type-options': 'nosniff',
-        'content-security-policy': "default-src 'none';",
+        'content-security-policy': SVG_CSP,
         'cache-control': cacheControl,
         etag: `"${snapshot.basisCid}.svg"`,
       },
@@ -153,6 +243,17 @@ function viewerResponse(rendered, format, snapshot, head, immutable) {
     status: 200,
     headers: { ...JSON_HEADERS, 'cache-control': cacheControl, etag: `"${snapshot.basisCid}.json"` },
   });
+}
+
+function workerOpContext(storeCtx, extra = {}) {
+  return {
+    limits: WORKER_SNAPSHOT_LIMITS,
+    sqlLimits: WORKER_SQL_LIMITS,
+    sparqlLimits: WORKER_SPARQL_LIMITS,
+    checkBlockCids: (cids) => assertCidsAllowed(cids, storeCtx),
+    loadSnapshot: (cid) => loadSnapshotFromStore(cid, storeCtx),
+    ...extra,
+  };
 }
 
 async function handleDirectQuery(request, operation, storeCtx) {
@@ -166,6 +267,9 @@ async function handleDirectQuery(request, operation, storeCtx) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return failRes(400, 'invalid-operation-input', 'body must be a JSON object');
   }
+  if (body.cid !== undefined && body.basisCid !== undefined && body.cid !== body.basisCid) {
+    return failRes(400, 'conflicting-cid-parameters', 'cid and basisCid must match when both are provided');
+  }
   const opInput = { ...body };
   const requestedCid = opInput.cid ?? opInput.basisCid ?? null;
   delete opInput.cid;
@@ -175,8 +279,8 @@ async function handleDirectQuery(request, operation, storeCtx) {
     const seeded = createDefaultOntologySnapshot();
     const useSeeded = !opInput.carBase64 && (!requestedCid || requestedCid === seeded.basisCid);
     const context = useSeeded
-      ? { snapshot: seeded }
-      : { loadSnapshot: (cid) => loadSnapshotFromStore(cid, storeCtx) };
+      ? workerOpContext(storeCtx, { snapshot: seeded })
+      : workerOpContext(storeCtx);
     const res = await invokeOntologyOperation(operation, opInput, context);
     return jsonRes(200, res);
   } catch (e) {
@@ -185,6 +289,11 @@ async function handleDirectQuery(request, operation, storeCtx) {
 }
 
 export async function handleOntology(request, url, storeCtx) {
+  // Fail-closed on malformed READ_DENY_CIDS across EVERY ontology route (including seeded/schema).
+  if (storeCtx.readDenyInvalid) {
+    return failRes(503, DENY_INVALID_ERROR, null, storeCtx.denyHeaders);
+  }
+
   const pathname = url.pathname;
   const head = request.method === 'HEAD';
 
@@ -206,42 +315,45 @@ export async function handleOntology(request, url, storeCtx) {
         return viewerResponse(rendered, format, snapshot, head, true);
       } catch (e) { return errorToResponse(e); }
     }
-    const seeded = createDefaultOntologySnapshot();
-    const schema = getOntologySchema();
-    const accept = (request.headers.get('accept') ?? '').toLowerCase();
-    if (url.searchParams.get('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))) {
-      const payload = JSON.stringify({
-        ok: true,
-        service: 'yataverse-bytes',
-        defaultBasisCid: seeded.basisCid,
-        routes: {
-          viewer: '/ontology/viewer',
-          graph: '/ontology/graph',
-          sql: '/ontology/sql',
-          sparql: '/ontology/sparql',
-          schema: '/ontology/v1/schema',
-          health: '/health',
-        },
-        schema,
-      });
-      return new Response(head ? null : payload, {
+    try {
+      const seeded = createDefaultOntologySnapshot();
+      assertCidsAllowed([...seeded.blocks.keys()], storeCtx);
+      const schema = getOntologySchema();
+      const accept = (request.headers.get('accept') ?? '').toLowerCase();
+      if (url.searchParams.get('format') === 'json' || (accept.includes('application/json') && !accept.includes('text/html'))) {
+        const payload = JSON.stringify({
+          ok: true,
+          service: 'yataverse-bytes',
+          defaultBasisCid: seeded.basisCid,
+          routes: {
+            viewer: '/ontology/viewer',
+            graph: '/ontology/graph',
+            sql: '/ontology/sql',
+            sparql: '/ontology/sparql',
+            schema: '/ontology/v1/schema',
+            health: '/health',
+          },
+          schema,
+        });
+        return new Response(head ? null : payload, {
+          status: 200,
+          headers: { ...JSON_HEADERS, 'cache-control': 'public, max-age=300' },
+        });
+      }
+      const html = renderYataverseHomeHtml(seeded, { schema });
+      return new Response(head ? null : html, {
         status: 200,
-        headers: { ...JSON_HEADERS, 'cache-control': 'public, max-age=300' },
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          'x-content-type-options': 'nosniff',
+          'content-security-policy': HOME_CSP,
+          'cache-control': 'public, max-age=300',
+        },
       });
-    }
-    const html = renderYataverseHomeHtml(seeded, { schema });
-    return new Response(head ? null : html, {
-      status: 200,
-      headers: {
-        'content-type': 'text/html; charset=utf-8',
-        'x-content-type-options': 'nosniff',
-        'content-security-policy': HTML_CSP,
-        'cache-control': 'public, max-age=300',
-      },
-    });
+    } catch (e) { return errorToResponse(e); }
   }
 
-  // 2. GET /ontology | /ontology/ | /ontology/viewer -> interactive Ontology Viewer HTML/SVG/JSON
+  // 2. GET /ontology | /ontology/ | /ontology/viewer
   if (pathname === '/ontology' || pathname === '/ontology/' || pathname === '/ontology/viewer') {
     if (request.method !== 'GET' && !head) {
       return failRes(405, 'method-not-allowed', null, { allow: 'GET, HEAD' });
@@ -259,7 +371,7 @@ export async function handleOntology(request, url, storeCtx) {
     } catch (e) { return errorToResponse(e); }
   }
 
-  // 3. GET /ontology/graph -> canonical layered graph (JSON or DAG-CBOR)
+  // 3. GET /ontology/graph
   if (pathname === '/ontology/graph') {
     if (request.method !== 'GET' && !head) {
       return failRes(405, 'method-not-allowed', null, { allow: 'GET, HEAD' });
@@ -282,6 +394,7 @@ export async function handleOntology(request, url, storeCtx) {
         includeRdfSubjects: url.searchParams.get('includeRdfSubjects') === 'true',
       });
       const { cid: graphCid, bytes: cborBytes } = encodeOntologyGraphDagCbor(graph);
+      assertCidsAllowed([graphCid], storeCtx);
       const cacheControl = isSeededDefault ? 'public, max-age=300' : 'public, max-age=31536000, immutable';
       if (format === 'dag-cbor') {
         return new Response(head ? null : cborBytes, {
@@ -345,7 +458,7 @@ export async function handleOntology(request, url, storeCtx) {
     }
     try {
       const snapshot = await loadSnapshotFromStore(inspectMatch[1], storeCtx);
-      const res = await invokeOntologyOperation('ontology.inspect', { basisCid: snapshot.basisCid }, { snapshot });
+      const res = await invokeOntologyOperation('ontology.inspect', { basisCid: snapshot.basisCid }, workerOpContext(storeCtx, { snapshot }));
       const body = JSON.stringify(res);
       return new Response(head ? null : body, {
         status: 200,
@@ -383,9 +496,7 @@ export async function handleOntology(request, url, storeCtx) {
     let body;
     try { body = JSON.parse(raw.toString('utf8')); } catch { return failRes(400, 'body-not-json'); }
     try {
-      const res = await invokeOntologyOperation(operation, body, {
-        loadSnapshot: (cid) => loadSnapshotFromStore(cid, storeCtx),
-      });
+      const res = await invokeOntologyOperation(operation, body, workerOpContext(storeCtx));
       return jsonRes(200, res);
     } catch (e) { return errorToResponse(e); }
   }

@@ -73,7 +73,7 @@ import { isServiceAuth, verifyServiceAuth, IMPORT_CAR_LXM } from './service-auth
 import { signV4, regionFromEndpoint } from './sigv4.mjs';
 import { isCacao, verifyCacao, issueNonce, blockResource, carResource, claimedCarDigest } from './cacao-auth.mjs';
 import { isNameHost, underNameSuffix, handleName } from './names.mjs';
-import { readDenied, readDenyActive, DENY_HEADERS, READ_DENIED_HEADER } from './read-deny.mjs';
+import { readDenied, readDenyActive, readDenyList, DENY_HEADERS, READ_DENIED_HEADER } from './read-deny.mjs';
 import { handleOntology, isOntologyRoute } from './ontology.mjs';
 
 export const DEFAULT_MAX_BLOCK_BYTES = 16 * 1024 * 1024;
@@ -805,6 +805,8 @@ async function handleCore(request, env, deps = {}) {
         readCapped,
         hasStore: Boolean(store),
         readPublicBlock: (cid) => readPublicBlock(cid, env, deps, store),
+        readDenied: (cid) => readDenied(cid, env),
+        readDenyInvalid: Boolean(readDenyList(env).invalid),
         carLimits: carLimits(env),
         denyHeaders: DENY_HEADERS,
       });

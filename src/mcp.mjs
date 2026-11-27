@@ -69,16 +69,16 @@ export const TOOLS = [
     inputSchema: { type: 'object', properties: { spec: str('JSON ontology spec ({id, objectTypes, connectors, facts, quads, jsonLd, pinnedContexts, joinMappings})') }, required: ['spec'], additionalProperties: false } },
   { name: 'yataverse_ontology_verify', description: 'Verify a CARv1/CARv2 ontology snapshot (CIDv1 sha2-256 digests, canonical DAG-CBOR, complete closure, provenance). Local, no network.',
     inputSchema: { type: 'object', properties: { car_base64: str('Base64-encoded CARv1/CARv2 ontology snapshot'), basis_cid: str('Optional expected root CIDv1') }, required: ['car_base64'], additionalProperties: false } },
-  { name: 'yataverse_ontology_inspect', description: 'Execute Semantic UI operation ontology.inspect on a verified CAR snapshot (base64) or gateway basis_cid.',
-    inputSchema: { type: 'object', properties: { car_base64: str('Base64-encoded CARv1/CARv2 ontology snapshot (or omit to fetch basis_cid from gateway)'), basis_cid: str('Pinned root CIDv1 (dag-cbor, sha2-256)') }, additionalProperties: false } },
-  { name: 'yataverse_ontology_graph', description: 'Execute Semantic UI operation ontology.graph to return the canonical layered graph (nodes, edges, layers, joins, coverage) and its DAG-CBOR graphCid.',
-    inputSchema: { type: 'object', properties: { car_base64: str('Base64-encoded CAR snapshot'), basis_cid: str('Pinned root CIDv1'), max_nodes: { type: 'integer', description: 'Optional max nodes (default 64)' } }, additionalProperties: false } },
-  { name: 'yataverse_ontology_query_sql', description: 'Execute Semantic UI operation ontology.query_sql (bounded, read-only SQL SELECT on a pinned ontology basis_cid).',
-    inputSchema: { type: 'object', properties: { query: str('Read-only SQL SELECT query'), car_base64: str('Base64-encoded CAR snapshot'), basis_cid: str('Pinned root CIDv1'), jurisdiction: str('Optional jurisdiction visibility filter'), allowed_sources: str('Optional comma-separated connector source IDs'), max_scan_rows: { type: 'integer', description: 'Optional scan row limit' }, max_result_rows: { type: 'integer', description: 'Optional result row limit' } }, required: ['query'], additionalProperties: false } },
-  { name: 'yataverse_ontology_query_sparql', description: 'Execute Semantic UI operation ontology.query_sparql (bounded, read-only SPARQL or EDN algebra on a pinned ontology basis_cid). Remote SERVICE is refused.',
-    inputSchema: { type: 'object', properties: { query: str('Read-only SPARQL query (provide query or algebra_edn)'), algebra_edn: str('Optional kotoba.sparql EDN algebra string'), car_base64: str('Base64-encoded CAR snapshot'), basis_cid: str('Pinned root CIDv1'), jurisdiction: str('Optional jurisdiction visibility filter'), allowed_sources: str('Optional comma-separated connector source IDs'), max_scan_steps: { type: 'integer', description: 'Optional scan step limit' }, max_solutions: { type: 'integer', description: 'Optional solution limit' } }, additionalProperties: false } },
-  { name: 'yataverse_ontology_view', description: 'Execute Semantic UI operation ontology.view to produce viewModel JSON, SVG graph, and/or self-contained HTML5 Ontology Viewer.',
-    inputSchema: { type: 'object', properties: { car_base64: str('Base64-encoded CAR snapshot'), basis_cid: str('Pinned root CIDv1'), format: str('json, svg, html, or all (default json)') }, additionalProperties: false } },
+  { name: 'yataverse_ontology_inspect', description: 'Execute Semantic UI operation ontology.inspect on a verified CAR snapshot (base64). If car_base64 is omitted, fetches the verified CAR for basis_cid from the configured Yataverse gateway over the network.',
+    inputSchema: { type: 'object', properties: { car_base64: str('Base64-encoded CARv1/CARv2 ontology snapshot (omit to fetch basis_cid from gateway)'), basis_cid: str('Pinned root CIDv1 (dag-cbor, sha2-256)') }, additionalProperties: false } },
+  { name: 'yataverse_ontology_graph', description: 'Execute Semantic UI operation ontology.graph to return the canonical layered graph (nodes, edges, layers, joins, coverage) and its DAG-CBOR graphCid. If car_base64 is omitted, fetches basis_cid from the configured gateway over the network.',
+    inputSchema: { type: 'object', properties: { car_base64: str('Base64-encoded CAR snapshot (omit to fetch basis_cid from gateway)'), basis_cid: str('Pinned root CIDv1'), max_nodes: { type: 'integer', description: 'Optional max nodes (1..500, default 64)' } }, additionalProperties: false } },
+  { name: 'yataverse_ontology_query_sql', description: 'Execute Semantic UI operation ontology.query_sql (bounded, read-only SQL SELECT on a pinned ontology basis_cid). If car_base64 is omitted, fetches basis_cid from the configured gateway over the network.',
+    inputSchema: { type: 'object', properties: { query: str('Read-only SQL SELECT query'), car_base64: str('Base64-encoded CAR snapshot (omit to fetch basis_cid from gateway)'), basis_cid: str('Pinned root CIDv1'), jurisdiction: str('Optional jurisdiction visibility filter'), allowed_sources: str('Optional comma-separated connector source IDs'), max_scan_rows: { type: 'integer', description: 'Optional scan row limit (cannot exceed server default)' }, max_result_rows: { type: 'integer', description: 'Optional result row limit (cannot exceed server default)' } }, required: ['query'], additionalProperties: false } },
+  { name: 'yataverse_ontology_query_sparql', description: 'Execute Semantic UI operation ontology.query_sparql (bounded, read-only SPARQL or EDN algebra on a pinned ontology basis_cid). Remote SERVICE is refused. If car_base64 is omitted, fetches basis_cid from the configured gateway over the network.',
+    inputSchema: { type: 'object', properties: { query: str('Read-only SPARQL query (provide query or algebra_edn)'), algebra_edn: str('Optional kotoba.sparql EDN algebra string'), car_base64: str('Base64-encoded CAR snapshot (omit to fetch basis_cid from gateway)'), basis_cid: str('Pinned root CIDv1'), jurisdiction: str('Optional jurisdiction visibility filter'), allowed_sources: str('Optional comma-separated connector source IDs'), max_scan_steps: { type: 'integer', description: 'Optional scan step limit (cannot exceed server default)' }, max_solutions: { type: 'integer', description: 'Optional solution limit (cannot exceed server default)' } }, additionalProperties: false } },
+  { name: 'yataverse_ontology_view', description: 'Execute Semantic UI operation ontology.view to produce viewModel JSON, SVG graph, and/or self-contained HTML5 Ontology Viewer. If car_base64 is omitted, fetches basis_cid from the configured gateway over the network.',
+    inputSchema: { type: 'object', properties: { car_base64: str('Base64-encoded CAR snapshot (omit to fetch basis_cid from gateway)'), basis_cid: str('Pinned root CIDv1'), format: str('json, svg, html, or all (default json)') }, additionalProperties: false } },
 ];
 
 const CONFIRMED = new Set(['yataverse_bootstrap', 'yataverse_put', 'yataverse_admin_login', 'yataverse_tenant_create', 'yataverse_sa_create', 'yataverse_sa_rotate', 'yataverse_sa_revoke']);
@@ -129,17 +129,32 @@ export async function callTool(name, a, deps = {}) {
     }
     if (name === 'yataverse_ontology_schema') return j(getOntologySchema());
     if (name === 'yataverse_ontology_build') {
+      if (Buffer.byteLength(a.spec, 'utf8') > PUT_CAP) {
+        const err = new Error(`spec larger than ${PUT_CAP} bytes`);
+        err.code = 'spec-too-large';
+        throw err;
+      }
       let spec;
       try { spec = JSON.parse(a.spec); } catch { throw new Error('spec must be valid JSON'); }
       return j(await invokeOntologyOperation('ontology.build', spec));
     }
     if (name === 'yataverse_ontology_verify') {
+      if (a.car_base64.length > Math.ceil((PUT_CAP * 4) / 3) + 4) {
+        const err = new Error(`car_base64 larger than ${PUT_CAP} bytes`);
+        err.code = 'car-too-large';
+        throw err;
+      }
       return j(await invokeOntologyOperation('ontology.verify', {
         carBase64: a.car_base64,
         ...(a.basis_cid ? { basisCid: a.basis_cid } : {}),
       }));
     }
     if (name.startsWith('yataverse_ontology_')) {
+      if (a.car_base64 !== undefined && a.car_base64.length > Math.ceil((PUT_CAP * 4) / 3) + 4) {
+        const err = new Error(`car_base64 larger than ${PUT_CAP} bytes`);
+        err.code = 'car-too-large';
+        throw err;
+      }
       const loadFromGateway = async (cid) => {
         const cfg = deps.cfg ?? loadConfig();
         const client = makeClient(cfg, { ...deps.client });

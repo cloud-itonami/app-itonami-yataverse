@@ -24,16 +24,24 @@ export const DEFAULT_BASE_IRI = 'https://awai.network/ns/ontology#';
 export const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 export const XSD_NS = 'http://www.w3.org/2001/XMLSchema#';
 
+export const ROW_PROVENANCE = Symbol('yataverse.ontology.rowProvenance');
+
+export const FORBIDDEN_OBJECT_KEYS = Object.freeze(new Set(['__proto__', 'constructor', 'prototype']));
+
 export const DEFAULT_LIMITS = Object.freeze({
   maxObjectTypes: 256,
   maxConnectors: 256,
   maxFacts: 20_000,
   maxQuads: 100_000,
   maxJoins: 256,
+  maxJoinedRows: 50_000,
   maxBlocks: 256,
   maxBytes: 16 * 1024 * 1024,
   maxJsonLdDepth: 32,
 });
+
+const MAX_DAG_CBOR_DEPTH = 64;
+const MAX_IRI_EXPANSION_DEPTH = 16;
 
 export class OntologyError extends Error {
   constructor(code, detail) {
@@ -45,6 +53,44 @@ export class OntologyError extends Error {
 }
 
 const bad = (code, detail) => { throw new OntologyError(code, detail); };
+
+/** Reject prototype-polluting object keys (__proto__, constructor, prototype). */
+export function assertSafeKey(key, context = 'object') {
+  if (typeof key !== 'string' || FORBIDDEN_OBJECT_KEYS.has(key)) {
+    bad('forbidden-key', `${context}: key "${String(key)}" is forbidden`);
+  }
+  return key;
+}
+
+/** Validate a caller-provided positive integer limit against a hard maximum (fail-closed). */
+export function clampLimit(value, defaultVal, hardMax, name, ErrorCtor = OntologyError) {
+  if (value === undefined) return Math.min(defaultVal, hardMax);
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > hardMax) {
+    throw new ErrorCtor('invalid-limit', `${name} must be an integer between 1 and ${hardMax}`);
+  }
+  return value;
+}
+
+/**
+ * Resolve requested limit overrides against baseline hard limits.
+ * Rejects unknown limit keys and rejects any value < 1, non-integer, or > hardCaps[key].
+ */
+export function resolveBoundedLimits(requested, hardCaps, allowedKeys, ErrorCtor = OntologyError) {
+  const out = { ...hardCaps };
+  if (requested === undefined || requested === null) return out;
+  if (typeof requested !== 'object' || Array.isArray(requested)) {
+    throw new ErrorCtor('invalid-limit', 'limits must be an object');
+  }
+  const keySet = new Set(allowedKeys);
+  for (const [k, v] of Object.entries(requested)) {
+    if (v === undefined) continue;
+    if (!keySet.has(k)) {
+      throw new ErrorCtor('invalid-limit-key', `limit "${k}" cannot be overridden`);
+    }
+    out[k] = clampLimit(v, hardCaps[k], hardCaps[k], k, ErrorCtor);
+  }
+  return out;
+}
 
 /** Normalize EDN-style `:tender` or `:ontology/type` keywords to canonical string keys. */
 export function normalizeKeyword(value) {
@@ -101,6 +147,7 @@ function normalizeObjectType(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) bad('invalid-object-type', 'must be an object');
   const id = normalizeKeyword(raw.id);
   if (!id || !/^[a-zA-Z][a-zA-Z0-9._/-]{0,63}$/.test(id)) bad('invalid-object-type-id', String(raw.id));
+  assertSafeKey(id, 'objectType.id');
   const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : id;
   const attrs = {};
   if (raw.attributes !== undefined) {
@@ -111,6 +158,7 @@ function normalizeObjectType(raw) {
       const nk = normalizeKeyword(k);
       const nv = normalizeKeyword(String(v));
       if (!nk || !nv) bad('invalid-object-type-attribute', `${id}.${k}`);
+      assertSafeKey(nk, `objectType.${id}.attributes`);
       attrs[nk] = nv;
     }
   }
@@ -118,6 +166,7 @@ function normalizeObjectType(raw) {
     ? raw.key.map((k) => {
       const nk = normalizeKeyword(k);
       if (!nk) bad('invalid-object-type-key', id);
+      assertSafeKey(nk, `objectType.${id}.key`);
       return nk;
     })
     : [];
@@ -128,6 +177,7 @@ function normalizeConnector(raw, typeIds) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) bad('invalid-connector', 'must be an object');
   const id = normalizeKeyword(raw.id);
   if (!id || !/^[a-zA-Z][a-zA-Z0-9._/-]{0,63}$/.test(id)) bad('invalid-connector-id', String(raw.id));
+  assertSafeKey(id, 'connector.id');
   const objectType = normalizeKeyword(raw.objectType ?? raw['object-type']);
   if (!objectType) bad('invalid-connector-object-type', id);
   if (typeIds && !typeIds.has(objectType)) bad('unknown-object-type', `${id} -> ${objectType}`);
@@ -176,7 +226,9 @@ function normalizeFactKeys(fact) {
   const out = {};
   for (const [k, v] of Object.entries(fact)) {
     if (v === undefined) continue;
+    assertSafeKey(k, 'fact');
     const nk = normalizeKeyword(k) ?? k;
+    assertSafeKey(nk, 'fact');
     out[nk] = v;
   }
   return out;
@@ -190,7 +242,7 @@ export function conforms(registry, typeId, fact) {
   if (!type) return false;
   const nf = normalizeFactKeys(fact);
   for (const attrKey of Object.keys(type.attributes)) {
-    if (!Object.prototype.hasOwnProperty.call(nf, attrKey)) return false;
+    if (!Object.hasOwn(nf, attrKey)) return false;
   }
   return true;
 }
@@ -242,10 +294,9 @@ export function taggedConforms(registry, connectorId, fact) {
 }
 
 // --- Canonical DAG-CBOR value encoding / decoding helpers ---
-// src/dag-cbor.mjs intentionally refuses floats so integers never silently become floats.
-// Non-integer finite numbers use a versioned typed wrapper {$awaiType:'decimal', value:'...'}.
 
-export function toDagCborSafe(value) {
+export function toDagCborSafe(value, depth = 0) {
+  if (depth > MAX_DAG_CBOR_DEPTH) bad('dag-cbor-too-deep', `exceeded depth ${MAX_DAG_CBOR_DEPTH}`);
   if (value === null || typeof value === 'boolean' || typeof value === 'string') return value;
   if (typeof value === 'bigint') return value;
   if (typeof value === 'number') {
@@ -254,20 +305,22 @@ export function toDagCborSafe(value) {
     return { $awaiType: 'decimal', value: String(value) };
   }
   if (value instanceof Uint8Array) return value;
-  if (Array.isArray(value)) return value.map(toDagCborSafe);
+  if (Array.isArray(value)) return value.map((item) => toDagCborSafe(item, depth + 1));
   if (value && typeof value === 'object') {
     if (Object.keys(value).length === 1 && value.cid instanceof Uint8Array) return value;
     const out = {};
     for (const [k, v] of Object.entries(value)) {
       if (v === undefined) continue;
-      out[k] = toDagCborSafe(v);
+      assertSafeKey(k, 'dag-cbor');
+      out[k] = toDagCborSafe(v, depth + 1);
     }
     return out;
   }
   bad('value-not-dag-cbor-safe', typeof value);
 }
 
-export function fromDagCborSafe(value) {
+export function fromDagCborSafe(value, depth = 0) {
+  if (depth > MAX_DAG_CBOR_DEPTH) bad('dag-cbor-too-deep', `exceeded depth ${MAX_DAG_CBOR_DEPTH}`);
   if (value === null || typeof value === 'boolean' || typeof value === 'string') return value;
   if (typeof value === 'bigint') {
     if (value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -276,7 +329,7 @@ export function fromDagCborSafe(value) {
     return value.toString();
   }
   if (value instanceof Uint8Array) return value;
-  if (Array.isArray(value)) return value.map(fromDagCborSafe);
+  if (Array.isArray(value)) return value.map((item) => fromDagCborSafe(item, depth + 1));
   if (value instanceof Map) {
     if (value.size === 2 && value.get('$awaiType') === 'decimal' && typeof value.get('value') === 'string') {
       const n = Number(value.get('value'));
@@ -284,7 +337,10 @@ export function fromDagCborSafe(value) {
       return n;
     }
     const out = {};
-    for (const [k, v] of value.entries()) out[k] = fromDagCborSafe(v);
+    for (const [k, v] of value.entries()) {
+      assertSafeKey(k, 'dag-cbor');
+      out[k] = fromDagCborSafe(v, depth + 1);
+    }
     return out;
   }
   if (value && typeof value === 'object') {
@@ -295,7 +351,10 @@ export function fromDagCborSafe(value) {
       return n;
     }
     const out = {};
-    for (const [k, v] of Object.entries(value)) out[k] = fromDagCborSafe(v);
+    for (const [k, v] of Object.entries(value)) {
+      assertSafeKey(k, 'dag-cbor');
+      out[k] = fromDagCborSafe(v, depth + 1);
+    }
     return out;
   }
   return value;
@@ -339,7 +398,7 @@ export function normalizeRdfTerm(term, { role = 'object' } = {}) {
     if (t === 'bnode') return bnodeTerm(term.value);
     if (t === 'literal') return literalTerm(term.value, { datatype: term.datatype, language: term.language });
     if (typeof term['@id'] === 'string') return term['@id'].startsWith('_:') ? bnodeTerm(term['@id']) : iriTerm(term['@id']);
-    if (Object.prototype.hasOwnProperty.call(term, '@value')) {
+    if (Object.hasOwn(term, '@value')) {
       return literalTerm(term['@value'], { datatype: term['@type'], language: term['@language'] });
     }
     bad('invalid-rdf-term', JSON.stringify(term).slice(0, 120));
@@ -402,7 +461,6 @@ function resolvePinnedContext(ref, pinnedContexts) {
   }
   const entry = map.get(ref);
   if (!entry || typeof entry !== 'object') bad('invalid-pinned-context', ref);
-  // Optional CID pinning verification for pinned contexts
   if (entry.cid !== undefined) {
     const ctxObj = entry.context ?? entry;
     const bytes = encodeDagCbor(toDagCborSafe(ctxObj));
@@ -415,9 +473,13 @@ function resolvePinnedContext(ref, pinnedContexts) {
   return entry.context && typeof entry.context === 'object' ? entry.context : entry;
 }
 
+function emptyJsonLdCtx() {
+  return { vocab: null, base: null, prefixes: Object.create(null), terms: Object.create(null) };
+}
+
 function mergeContext(baseCtx, rawCtx, pinnedContexts, depth = 0) {
   if (depth > 8) bad('jsonld-context-too-deep', String(depth));
-  if (rawCtx === null) return { vocab: null, base: null, prefixes: {}, terms: {} };
+  if (rawCtx === null) return emptyJsonLdCtx();
   if (Array.isArray(rawCtx)) {
     let cur = baseCtx;
     for (const item of rawCtx) cur = mergeContext(cur, item, pinnedContexts, depth + 1);
@@ -429,25 +491,27 @@ function mergeContext(baseCtx, rawCtx, pinnedContexts, depth = 0) {
   }
   if (typeof rawCtx !== 'object') bad('invalid-jsonld-context', typeof rawCtx);
 
-  const next = {
-    vocab: baseCtx.vocab,
-    base: baseCtx.base,
-    prefixes: { ...baseCtx.prefixes },
-    terms: { ...baseCtx.terms },
-  };
-  if (Object.prototype.hasOwnProperty.call(rawCtx, '@import')) {
+  const prefixes = Object.assign(Object.create(null), baseCtx.prefixes);
+  const terms = Object.assign(Object.create(null), baseCtx.terms);
+  const next = { vocab: baseCtx.vocab, base: baseCtx.base, prefixes, terms };
+
+  if (Object.hasOwn(rawCtx, '@import')) {
     const imp = resolvePinnedContext(rawCtx['@import'], pinnedContexts);
     const mergedImp = mergeContext(next, imp, pinnedContexts, depth + 1);
-    Object.assign(next, mergedImp);
+    next.vocab = mergedImp.vocab;
+    next.base = mergedImp.base;
+    next.prefixes = mergedImp.prefixes;
+    next.terms = mergedImp.terms;
   }
-  if (Object.prototype.hasOwnProperty.call(rawCtx, '@vocab')) {
+  if (Object.hasOwn(rawCtx, '@vocab')) {
     next.vocab = rawCtx['@vocab'] === null ? null : String(rawCtx['@vocab']);
   }
-  if (Object.prototype.hasOwnProperty.call(rawCtx, '@base')) {
+  if (Object.hasOwn(rawCtx, '@base')) {
     next.base = rawCtx['@base'] === null ? null : String(rawCtx['@base']);
   }
   for (const [k, v] of Object.entries(rawCtx)) {
     if (k.startsWith('@')) continue;
+    assertSafeKey(k, 'jsonld.@context');
     if (typeof v === 'string') {
       if (v.endsWith('#') || v.endsWith('/') || v.endsWith(':')) next.prefixes[k] = v;
       next.terms[k] = { id: v, type: null };
@@ -467,19 +531,28 @@ function mergeContext(baseCtx, rawCtx, pinnedContexts, depth = 0) {
   return next;
 }
 
-function expandIri(value, ctx, { vocab = false } = {}) {
+function expandIri(value, ctx, { vocab = false, depth = 0, seen = null } = {}) {
+  if (depth > MAX_IRI_EXPANSION_DEPTH) bad('jsonld-iri-expansion-too-deep', String(depth));
   if (typeof value !== 'string' || !value.trim()) bad('invalid-jsonld-iri', String(value));
   const v = value.trim();
   if (v.startsWith('_:')) return v;
-  if (ctx.terms[v]?.id) return expandIri(ctx.terms[v].id, ctx, { vocab: true });
+  const visited = seen ?? new Set();
+  if (visited.has(v)) bad('jsonld-context-cycle', v);
+  visited.add(v);
+
+  if (Object.hasOwn(ctx.terms, v) && ctx.terms[v]?.id) {
+    return expandIri(ctx.terms[v].id, ctx, { vocab: true, depth: depth + 1, seen: visited });
+  }
   const colon = v.indexOf(':');
   if (colon > 0) {
     const prefix = v.slice(0, colon);
     const suffix = v.slice(colon + 1);
     if (prefix === '_') return v;
-    if (ctx.prefixes[prefix]) return `${ctx.prefixes[prefix]}${suffix}`;
-    if (ctx.terms[prefix]?.id && !suffix.startsWith('//')) return `${ctx.terms[prefix].id}${suffix}`;
-    return v; // full IRI (e.g. https://..., urn:..., did:...)
+    if (Object.hasOwn(ctx.prefixes, prefix)) return `${ctx.prefixes[prefix]}${suffix}`;
+    if (Object.hasOwn(ctx.terms, prefix) && ctx.terms[prefix]?.id && !suffix.startsWith('//')) {
+      return `${ctx.terms[prefix].id}${suffix}`;
+    }
+    return v;
   }
   if (vocab && ctx.vocab) return `${ctx.vocab}${v}`;
   if (!vocab && ctx.base) {
@@ -493,13 +566,19 @@ function expandIri(value, ctx, { vocab = false } = {}) {
  * Remote `@context` URLs are refused unless explicitly supplied in `pinnedContexts`.
  */
 export function ingestJsonLd(input, { pinnedContexts = {}, defaultGraph = null, maxQuads = DEFAULT_LIMITS.maxQuads } = {}) {
-  const doc = typeof input === 'string' ? JSON.parse(input) : input;
+  let doc = input;
+  if (typeof input === 'string') {
+    try { doc = JSON.parse(input); }
+    catch (e) { bad('invalid-jsonld', e.message); }
+  }
   if (!doc || typeof doc !== 'object') bad('invalid-jsonld', 'document must be an object or array');
 
   const quads = [];
   let bnodeCounter = 0;
   const nextBnode = () => bnodeTerm(`_:b${++bnodeCounter}`);
-  const rootCtx = { vocab: null, base: null, prefixes: { rdf: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#', xsd: XSD_NS }, terms: {} };
+  const rootCtx = emptyJsonLdCtx();
+  rootCtx.prefixes.rdf = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
+  rootCtx.prefixes.xsd = XSD_NS;
 
   const pushQuad = (subject, predicate, object, graph) => {
     if (quads.length >= maxQuads) bad('limit-exceeded', `maxQuads (${maxQuads})`);
@@ -513,11 +592,11 @@ export function ingestJsonLd(input, { pinnedContexts = {}, defaultGraph = null, 
       return null;
     }
     if (!node || typeof node !== 'object') bad('invalid-jsonld-node', typeof node);
-    const ctx = Object.prototype.hasOwnProperty.call(node, '@context')
+    const ctx = Object.hasOwn(node, '@context')
       ? mergeContext(parentCtx, node['@context'], pinnedContexts)
       : parentCtx;
 
-    if (Object.prototype.hasOwnProperty.call(node, '@graph')) {
+    if (Object.hasOwn(node, '@graph')) {
       const gTerm = node['@id']
         ? (String(node['@id']).startsWith('_:') ? bnodeTerm(node['@id']) : iriTerm(expandIri(node['@id'], ctx)))
         : graphTerm;
@@ -538,14 +617,15 @@ export function ingestJsonLd(input, { pinnedContexts = {}, defaultGraph = null, 
 
     for (const [k, rawVal] of Object.entries(node)) {
       if (k.startsWith('@')) continue;
+      assertSafeKey(k, 'jsonld.node');
       const predIri = expandIri(k, ctx, { vocab: true });
-      const termDef = ctx.terms[k] ?? null;
+      const termDef = Object.hasOwn(ctx.terms, k) ? ctx.terms[k] : null;
       const pred = iriTerm(predIri);
       const values = Array.isArray(rawVal) ? rawVal : [rawVal];
       for (const val of values) {
         if (val === null || val === undefined) continue;
         if (typeof val === 'object' && !Array.isArray(val)) {
-          if (Object.prototype.hasOwnProperty.call(val, '@value')) {
+          if (Object.hasOwn(val, '@value')) {
             const dt = val['@type'] ? expandIri(val['@type'], ctx, { vocab: true }) : undefined;
             const obj = literalTerm(val['@value'], { datatype: dt, language: val['@language'] });
             pushQuad(subj, pred, obj, graphTerm);
@@ -572,6 +652,14 @@ export function ingestJsonLd(input, { pinnedContexts = {}, defaultGraph = null, 
   return quads;
 }
 
+/** Deterministic subject IRI for a provenance-tagged fact. */
+export function factSubjectIri(fact, baseIri = DEFAULT_BASE_IRI) {
+  if (fact?.iri) return String(fact.iri);
+  const typeId = normalizeKeyword(fact?.['ontology/type']) ?? 'unknown';
+  const entityId = String(fact?.id ?? '');
+  return `${baseIri}entity/${encodeURIComponent(typeId)}/${encodeURIComponent(entityId)}`;
+}
+
 /** Project one normalized, provenance-tagged fact into canonical RDF quads. */
 export function factToQuads(fact, { baseIri = DEFAULT_BASE_IRI, defaultGraph = null } = {}) {
   const nf = normalizeFactKeys(fact);
@@ -579,9 +667,7 @@ export function factToQuads(fact, { baseIri = DEFAULT_BASE_IRI, defaultGraph = n
   if (!typeId) bad('fact-missing-ontology-type', JSON.stringify(nf).slice(0, 120));
   const entityId = nf.id !== undefined ? String(nf.id) : null;
   if (!entityId) bad('fact-missing-id', typeId);
-  const subj = nf.iri
-    ? iriTerm(String(nf.iri))
-    : iriTerm(`${baseIri}entity/${encodeURIComponent(typeId)}/${encodeURIComponent(entityId)}`);
+  const subj = iriTerm(factSubjectIri(nf, baseIri));
   const graph = defaultGraph ? normalizeRdfTerm(defaultGraph, { role: 'graph' }) : null;
   const quads = [
     normalizeQuad({ subject: subj, predicate: iriTerm(RDF_TYPE), object: iriTerm(`${baseIri}${encodeURIComponent(typeId)}`), ...(graph ? { graph } : {}) }),
@@ -593,7 +679,7 @@ export function factToQuads(fact, { baseIri = DEFAULT_BASE_IRI, defaultGraph = n
     for (const item of values) {
       if (item === null || item === undefined) continue;
       let obj;
-      if (typeof item === 'object' && !Array.isArray(item) && (item.rdfType || item['@id'] || Object.prototype.hasOwnProperty.call(item, '@value'))) {
+      if (typeof item === 'object' && !Array.isArray(item) && (item.rdfType || item['@id'] || Object.hasOwn(item, '@value'))) {
         obj = normalizeRdfTerm(item, { role: 'object' });
       } else if (typeof item === 'string' && /^(https?|urn|did|ipfs|ipld):/.test(item)) {
         obj = iriTerm(item);
@@ -612,6 +698,7 @@ function normalizeJoinMapping(raw, typeIds) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) bad('invalid-join-mapping', 'must be an object');
   const name = typeof raw.name === 'string' ? raw.name.trim() : '';
   if (!name || !/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/.test(name)) bad('invalid-join-name', String(raw.name));
+  assertSafeKey(name, 'joinMapping.name');
   const leftType = normalizeKeyword(raw.leftType ?? raw.left_type);
   const rightType = normalizeKeyword(raw.rightType ?? raw.right_type);
   const leftKey = normalizeKeyword(raw.leftKey ?? raw.left_key);
@@ -634,15 +721,38 @@ function dedupeAndSortQuads(quads) {
   return [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([, q]) => q);
 }
 
-/** Project a verified ontology snapshot into read-only relational tables for SQL queries. */
-export function projectTables(snapshot) {
+function attachProvenance(row, sources, jurisdictions) {
+  Object.defineProperty(row, ROW_PROVENANCE, {
+    value: Object.freeze({ sources, jurisdictions }),
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return row;
+}
+
+/**
+ * Project a verified ontology snapshot into read-only relational tables for SQL queries.
+ * Bounds materialized join rows via `maxJoinedRows` and tags every data/quad/join row with
+ * non-enumerable `ROW_PROVENANCE` so visibility policies stay fail-closed across every table.
+ */
+export function projectTables(snapshot, { maxJoinedRows = DEFAULT_LIMITS.maxJoinedRows } = {}) {
   const tables = new Map();
   const addTable = (name, rows) => { tables.set(name.toLowerCase(), { name, rows }); };
+  const baseIri = snapshot.baseIri ?? DEFAULT_BASE_IRI;
 
   const factsByType = new Map();
+  const subjectProvenance = new Map();
   for (const t of snapshot.registry.objectTypes) factsByType.set(t.id, []);
   const allFactRows = [];
+
   for (const f of snapshot.facts) {
+    const src = normalizeKeyword(f['ontology/source']) ?? null;
+    const jur = f.jurisdiction !== undefined && f.jurisdiction !== null
+      ? (normalizeKeyword(String(f.jurisdiction)) ?? String(f.jurisdiction))
+      : null;
+    subjectProvenance.set(factSubjectIri(f, baseIri), { src, jur });
+
     const row = {
       id: f.id,
       ontology_type: f['ontology/type'],
@@ -653,8 +763,10 @@ export function projectTables(snapshot) {
     for (const [k, v] of Object.entries(f)) {
       if (k === 'id' || PROVENANCE_KEYS.has(k)) continue;
       const col = k.replace(/[./-]/g, '_');
+      assertSafeKey(col, 'projected-column');
       row[col] = v;
     }
+    attachProvenance(row, [src], [jur]);
     allFactRows.push(row);
     const list = factsByType.get(f['ontology/type']) ?? [];
     list.push(row);
@@ -668,16 +780,20 @@ export function projectTables(snapshot) {
   }
 
   addTable('ontology_facts', allFactRows);
-  addTable('ontology_quads', snapshot.quads.map((q) => ({
-    subject: q.subject.value,
-    subject_type: q.subject.rdfType,
-    predicate: q.predicate.value,
-    object: q.object.value,
-    object_type: q.object.rdfType,
-    datatype: q.object.datatype ?? null,
-    language: q.object.language ?? null,
-    graph: q.graph?.value ?? null,
-  })));
+  addTable('ontology_quads', snapshot.quads.map((q) => {
+    const prov = subjectProvenance.get(q.subject.value);
+    const row = {
+      subject: q.subject.value,
+      subject_type: q.subject.rdfType,
+      predicate: q.predicate.value,
+      object: q.object.value,
+      object_type: q.object.rdfType,
+      datatype: q.object.datatype ?? null,
+      language: q.object.language ?? null,
+      graph: q.graph?.value ?? null,
+    };
+    return attachProvenance(row, [prov?.src ?? null], [prov?.jur ?? null]);
+  }));
   addTable('ontology_types', snapshot.registry.objectTypes.map((t) => ({
     id: t.id,
     name: t.name,
@@ -700,7 +816,8 @@ export function projectTables(snapshot) {
     kind: j.kind,
   })));
 
-  // Materialize declared join mappings as read-only join views as well.
+  // Materialize declared join mappings with strict total row bound & dual-side provenance
+  let totalJoinedRows = 0;
   for (const j of snapshot.joinMappings) {
     const leftRows = tables.get(j.leftType.toLowerCase())?.rows ?? [];
     const rightRows = tables.get(j.rightType.toLowerCase())?.rows ?? [];
@@ -717,20 +834,30 @@ export function projectTables(snapshot) {
     }
     const joined = [];
     for (const l of leftRows) {
+      const lProv = l[ROW_PROVENANCE] ?? { sources: [null], jurisdictions: [null] };
       const lval = l[lk];
       const matches = lval !== undefined && lval !== null ? (rightIndex.get(String(lval)) ?? []) : [];
       if (matches.length === 0) {
         if (j.kind === 'left') {
+          totalJoinedRows += 1;
+          if (totalJoinedRows > maxJoinedRows) bad('limit-exceeded', `maxJoinedRows (${maxJoinedRows})`);
           const row = {};
           for (const [k, v] of Object.entries(l)) row[`${j.leftType}_${k}`] = v;
-          joined.push(row);
+          joined.push(attachProvenance(row, [...lProv.sources], [...lProv.jurisdictions]));
         }
       } else {
         for (const r of matches) {
+          totalJoinedRows += 1;
+          if (totalJoinedRows > maxJoinedRows) bad('limit-exceeded', `maxJoinedRows (${maxJoinedRows})`);
+          const rProv = r[ROW_PROVENANCE] ?? { sources: [null], jurisdictions: [null] };
           const row = {};
           for (const [k, v] of Object.entries(l)) row[`${j.leftType}_${k}`] = v;
           for (const [k, v] of Object.entries(r)) row[`${j.rightType}_${k}`] = v;
-          joined.push(row);
+          joined.push(attachProvenance(
+            row,
+            [...lProv.sources, ...rProv.sources],
+            [...lProv.jurisdictions, ...rProv.jurisdictions],
+          ));
         }
       }
     }
@@ -748,9 +875,20 @@ function encodeBlock(payload) {
   return { cid, bytes };
 }
 
+function defineLazyCarBytes(target, rootCid, blockList) {
+  let cached = null;
+  Object.defineProperty(target, 'carBytes', {
+    enumerable: true,
+    configurable: false,
+    get() {
+      if (!cached) cached = encodeCarV1([rootCid], blockList);
+      return cached;
+    },
+  });
+}
+
 /**
  * Build a canonical multi-block DAG-CBOR IPLD ontology snapshot with tag-42 CID links.
- * Returns { basisCid, rootCid, id, blocks, blockList, carBytes, registry, facts, quads, joinMappings, tables, stats }.
  */
 export function buildOntologySnapshot(input = {}, opts = {}) {
   const limits = { ...DEFAULT_LIMITS, ...opts.limits };
@@ -796,7 +934,6 @@ export function buildOntologySnapshot(input = {}, opts = {}) {
     factQuads.push(...factToQuads(tagged, { baseIri }));
   }
 
-  // Sort facts deterministically by (ontology/type, id) so identical data yields identical CIDs.
   normalizedFacts.sort((a, b) => {
     const t = String(a['ontology/type']).localeCompare(String(b['ontology/type']));
     return t !== 0 ? t : String(a.id).localeCompare(String(b.id));
@@ -825,11 +962,12 @@ export function buildOntologySnapshot(input = {}, opts = {}) {
   let parentBasisCid = null;
   if (input.basisCid !== undefined && input.basisCid !== null) {
     const p = parseCid(input.basisCid);
-    if (!p || p.version !== 1 || p.hashCode !== SHA2_256) bad('invalid-basis-cid', String(input.basisCid));
+    if (!p || p.version !== 1 || p.codec !== CODEC_DAG_CBOR || p.hashCode !== SHA2_256) {
+      bad('invalid-basis-cid', String(input.basisCid));
+    }
     parentBasisCid = input.basisCid;
   }
 
-  // Encode child DAG-CBOR blocks
   const registryBlock = encodeBlock({
     schema: ONTOLOGY_REGISTRY_SCHEMA,
     version: 1,
@@ -879,10 +1017,10 @@ export function buildOntologySnapshot(input = {}, opts = {}) {
   }
 
   const rootBlock = encodeBlock(rootPayload);
-  const blockList = [rootBlock, registryBlock, factsBlock, quadsBlock, joinsBlock];
+  const blockListRaw = [rootBlock, registryBlock, factsBlock, quadsBlock, joinsBlock];
   const blocks = new Map();
   let totalBytes = 0;
-  for (const b of blockList) {
+  for (const b of blockListRaw) {
     if (!blocks.has(b.cid)) {
       blocks.set(b.cid, b.bytes);
       totalBytes += b.bytes.length;
@@ -891,8 +1029,7 @@ export function buildOntologySnapshot(input = {}, opts = {}) {
   if (blocks.size > limits.maxBlocks) bad('limit-exceeded', `maxBlocks (${limits.maxBlocks})`);
   if (totalBytes > limits.maxBytes) bad('limit-exceeded', `maxBytes (${limits.maxBytes})`);
 
-  const carBytes = encodeCarV1([rootBlock.cid], [...blocks.entries()].map(([cid, bytes]) => ({ cid, bytes })));
-
+  const blockList = [...blocks.entries()].map(([cid, bytes]) => ({ cid, bytes }));
   const snapshot = {
     schema: ONTOLOGY_SNAPSHOT_SCHEMA,
     version: 1,
@@ -910,30 +1047,37 @@ export function buildOntologySnapshot(input = {}, opts = {}) {
       joins: joinsBlock.cid,
     },
     blocks,
-    blockList: [...blocks.entries()].map(([cid, bytes]) => ({ cid, bytes })),
-    carBytes,
+    blockList,
     registry,
     facts: normalizedFacts,
     quads: allQuads,
     joinMappings,
     stats,
   };
-  snapshot.tables = projectTables(snapshot);
+  defineLazyCarBytes(snapshot, rootBlock.cid, blockList);
+  snapshot.tables = projectTables(snapshot, { maxJoinedRows: limits.maxJoinedRows });
   return snapshot;
 }
 
-function extractLinkCid(val, fieldName) {
+export function extractLinkCid(val, fieldName, { requireDagCbor = true } = {}) {
   if (!val || typeof val !== 'object' || !(val.cid instanceof Uint8Array)) {
     bad('missing-cid-link', fieldName);
   }
   const cid = cidFromBytes(val.cid);
   if (!cid) bad('invalid-cid-link', fieldName);
+  const parsed = parseCid(cid);
+  if (!parsed || parsed.version !== 1 || parsed.hashCode !== SHA2_256) {
+    bad('invalid-cid-link', fieldName);
+  }
+  if (requireDagCbor && parsed.codec !== CODEC_DAG_CBOR) {
+    bad('invalid-cid-link-codec', `${fieldName} must link to a dag-cbor CIDv1`);
+  }
   return cid;
 }
 
 /**
  * Verify an IPLD DAG-CBOR ontology snapshot from a CARv1/CARv2 buffer, a Map<cid, bytes>, or [{cid, bytes}].
- * Checks CIDv1 sha2-256 digests, canonical DAG-CBOR, complete closure, schema, and provenance conformance.
+ * Checks CIDv1 sha2-256 digests, canonical DAG-CBOR, complete closure, bounds, schema, and provenance conformance.
  */
 export function verifyOntologySnapshot(blocksOrCar, { expectedBasisCid = null, rootCid = null, limits: customLimits = {} } = {}) {
   const limits = { ...DEFAULT_LIMITS, ...customLimits };
@@ -977,23 +1121,22 @@ export function verifyOntologySnapshot(blocksOrCar, { expectedBasisCid = null, r
   }
   if (!blocks.has(resolvedRoot)) bad('root-block-missing', resolvedRoot);
 
-  // Verify complete DAG closure starting at resolvedRoot (parentBasis is optional external link)
   const rootDecoded = fromDagCborSafe(decodeDagCbor(blocks.get(resolvedRoot)).value);
   if (!rootDecoded || typeof rootDecoded !== 'object' || rootDecoded.schema !== ONTOLOGY_SNAPSHOT_SCHEMA || rootDecoded.version !== 1) {
     bad('invalid-snapshot-schema', String(rootDecoded?.schema));
   }
 
-  const registryCid = extractLinkCid(rootDecoded.registry, 'registry');
-  const factsCid = extractLinkCid(rootDecoded.facts, 'facts');
-  const quadsCid = extractLinkCid(rootDecoded.quads, 'quads');
-  const joinsCid = extractLinkCid(rootDecoded.joins, 'joins');
-  const parentBasisCid = rootDecoded.parentBasis ? extractLinkCid(rootDecoded.parentBasis, 'parentBasis') : null;
+  const registryCid = extractLinkCid(rootDecoded.registry, 'registry', { requireDagCbor: true });
+  const factsCid = extractLinkCid(rootDecoded.facts, 'facts', { requireDagCbor: true });
+  const quadsCid = extractLinkCid(rootDecoded.quads, 'quads', { requireDagCbor: true });
+  const joinsCid = extractLinkCid(rootDecoded.joins, 'joins', { requireDagCbor: true });
+  const parentBasisCid = rootDecoded.parentBasis ? extractLinkCid(rootDecoded.parentBasis, 'parentBasis', { requireDagCbor: true }) : null;
 
   const expectedChildCids = new Set([resolvedRoot, registryCid, factsCid, quadsCid, joinsCid]);
   for (const needed of expectedChildCids) {
     if (!blocks.has(needed)) bad('closure-incomplete', needed);
   }
-  // Ensure every block in the provided set is reachable from root (reject stray blocks).
+
   const reachable = new Set();
   const stack = [resolvedRoot];
   while (stack.length) {
@@ -1014,12 +1157,15 @@ export function verifyOntologySnapshot(blocksOrCar, { expectedBasisCid = null, r
     if (!reachable.has(cid)) bad('block-not-reachable', cid);
   }
 
-  // Validate sub-blocks
   const regDoc = fromDagCborSafe(decodeDagCbor(blocks.get(registryCid)).value);
   if (regDoc?.schema !== ONTOLOGY_REGISTRY_SCHEMA || regDoc.version !== 1) bad('invalid-registry-block', registryCid);
+  const rawTypes = Array.isArray(regDoc.objectTypes) ? regDoc.objectTypes : [];
+  const rawConnectors = Array.isArray(regDoc.connectors) ? regDoc.connectors : [];
+  if (rawTypes.length > limits.maxObjectTypes) bad('limit-exceeded', `maxObjectTypes (${limits.maxObjectTypes})`);
+  if (rawConnectors.length > limits.maxConnectors) bad('limit-exceeded', `maxConnectors (${limits.maxConnectors})`);
   const registry = createRegistry({
-    objectTypes: regDoc.objectTypes ?? [],
-    connectors: regDoc.connectors ?? [],
+    objectTypes: rawTypes,
+    connectors: rawConnectors,
     includeDefaults: false,
   });
 
@@ -1047,11 +1193,11 @@ export function verifyOntologySnapshot(blocksOrCar, { expectedBasisCid = null, r
   if (joinsDoc?.schema !== ONTOLOGY_JOINS_SCHEMA || joinsDoc.version !== 1 || !Array.isArray(joinsDoc.joinMappings)) {
     bad('invalid-joins-block', joinsCid);
   }
+  if (joinsDoc.joinMappings.length > limits.maxJoins) bad('limit-exceeded', `maxJoins (${limits.maxJoins})`);
   const typeIds = new Set(registry.objectTypes.map((t) => t.id));
   const joinMappings = joinsDoc.joinMappings.map((j) => normalizeJoinMapping(j, typeIds));
 
   const blockList = [...blocks.entries()].map(([cid, bytes]) => ({ cid, bytes }));
-  const carBytes = encodeCarV1([resolvedRoot], blockList);
   const snapshot = {
     schema: ONTOLOGY_SNAPSHOT_SCHEMA,
     version: 1,
@@ -1070,7 +1216,6 @@ export function verifyOntologySnapshot(blocksOrCar, { expectedBasisCid = null, r
     },
     blocks,
     blockList,
-    carBytes,
     registry,
     facts: factsDoc.facts,
     quads,
@@ -1083,7 +1228,8 @@ export function verifyOntologySnapshot(blocksOrCar, { expectedBasisCid = null, r
       joins: joinMappings.length,
     },
   };
-  snapshot.tables = projectTables(snapshot);
+  defineLazyCarBytes(snapshot, resolvedRoot, blockList);
+  snapshot.tables = projectTables(snapshot, { maxJoinedRows: limits.maxJoinedRows });
   return snapshot;
 }
 
@@ -1097,6 +1243,7 @@ export function scanQuads(snapshot, pattern, visible, { maxScanned = 100_000, ba
   if (typeof visible !== 'function') {
     bad('visibility-predicate-required', 'scanQuads requires an explicit visible(quad) predicate');
   }
+  const boundScan = clampLimit(maxScanned, 100_000, 100_000, 'maxScanned', OntologyError);
   const [ps, pp, po, pg] = Array.isArray(pattern) ? pattern : [null, null, null, null];
   const matchesTerm = (pat, val) => {
     if (pat === null || pat === undefined) return true;
@@ -1108,7 +1255,7 @@ export function scanQuads(snapshot, pattern, visible, { maxScanned = 100_000, ba
   let scanned = 0;
   for (const q of snapshot.quads) {
     scanned += 1;
-    if (scanned > maxScanned) bad('scan-limit-exceeded', `exceeded maxScanned=${maxScanned}`);
+    if (scanned > boundScan) bad('scan-limit-exceeded', `exceeded maxScanned=${boundScan}`);
     if (!matchesTerm(ps, q.subject)) continue;
     if (!matchesTerm(pp, q.predicate)) continue;
     if (!matchesTerm(po, q.object)) continue;
@@ -1118,23 +1265,51 @@ export function scanQuads(snapshot, pattern, visible, { maxScanned = 100_000, ba
   return results;
 }
 
-/** Build a visibility predicate from declarative policy options (jurisdiction, allowedSources, custom visible). */
+/**
+ * Build a fail-closed visibility predicate from declarative policy options.
+ * - If `allowedSources !== undefined`, every constituent source MUST be non-null and in `allowedSources`
+ *   (passing `[]` denies all records).
+ * - If `jurisdiction !== undefined`, every constituent jurisdiction MUST be non-null and in `jurisdiction`
+ *   (passing `[]` denies all records).
+ * - Checks non-enumerable `ROW_PROVENANCE` on projected fact/quad/join rows so join views and
+ *   `ontology_quads` never bypass policy filters.
+ */
 export function buildVisibilityFilter({ visible, jurisdiction, allowedSources } = {}) {
-  const sourceSet = Array.isArray(allowedSources) && allowedSources.length > 0
-    ? new Set(allowedSources.map((s) => normalizeKeyword(s) ?? String(s)))
-    : null;
-  const jurSet = jurisdiction
-    ? new Set((Array.isArray(jurisdiction) ? jurisdiction : [jurisdiction]).map((j) => normalizeKeyword(j) ?? String(j)))
-    : null;
+  let sourceSet = null;
+  if (allowedSources !== undefined) {
+    if (!Array.isArray(allowedSources)) {
+      bad('invalid-visibility-policy', 'allowedSources must be an array');
+    }
+    sourceSet = new Set(allowedSources.map((s) => normalizeKeyword(String(s)) ?? String(s)));
+  }
+
+  let jurSet = null;
+  if (jurisdiction !== undefined) {
+    const arr = Array.isArray(jurisdiction) ? jurisdiction : [jurisdiction];
+    jurSet = new Set(
+      arr
+        .filter((j) => j !== null && j !== undefined && String(j).trim() !== '')
+        .map((j) => normalizeKeyword(String(j)) ?? String(j)),
+    );
+  }
 
   return (record) => {
-    if (sourceSet) {
-      const src = normalizeKeyword(record?.ontology_source ?? record?.['ontology/source']);
-      if (src && !sourceSet.has(src)) return false;
+    const prov = record && typeof record === 'object' ? record[ROW_PROVENANCE] : null;
+    if (sourceSet !== null) {
+      if (prov) {
+        if (!prov.sources.length || !prov.sources.every((s) => s !== null && sourceSet.has(s))) return false;
+      } else {
+        const src = normalizeKeyword(record?.ontology_source ?? record?.['ontology/source']);
+        if (!src || !sourceSet.has(src)) return false;
+      }
     }
-    if (jurSet) {
-      const j = normalizeKeyword(record?.jurisdiction);
-      if (j && !jurSet.has(j)) return false;
+    if (jurSet !== null) {
+      if (prov) {
+        if (!prov.jurisdictions.length || !prov.jurisdictions.every((j) => j !== null && jurSet.has(j))) return false;
+      } else {
+        const j = normalizeKeyword(record?.jurisdiction);
+        if (!j || !jurSet.has(j)) return false;
+      }
     }
     if (typeof visible === 'function' && !visible(record)) return false;
     return true;

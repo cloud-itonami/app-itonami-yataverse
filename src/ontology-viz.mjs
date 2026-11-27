@@ -19,9 +19,21 @@ import {
   buildOntologySnapshot,
   toDagCborSafe,
   normalizeKeyword,
+  clampLimit,
+  OntologyError,
 } from './ontology.mjs';
 
 export const ONTOLOGY_GRAPH_SCHEMA = 'yataverse.ontology.graph/v1';
+export const MAX_GRAPH_NODES = 500;
+export const ENDPOINT_PATH_PATTERN = /^\/[A-Za-z0-9/_-]*$/;
+
+/** Validate an internal relative endpoint path (prevents open-redirect / javascript: injection). */
+export function assertSafeEndpointPath(pathValue, name) {
+  if (typeof pathValue !== 'string' || !ENDPOINT_PATH_PATTERN.test(pathValue) || pathValue.includes('//')) {
+    throw new OntologyError('invalid-endpoint-path', `${name} must match /^\\/[A-Za-z0-9\\/_-]*$/`);
+  }
+  return pathValue;
+}
 
 /** XML / HTML attribute and text escaping for XSS-safe SVG and HTML rendering. */
 export function escapeXml(value) {
@@ -33,10 +45,104 @@ export function escapeXml(value) {
     .replace(/'/g, '&#39;');
 }
 
-/** Escape JSON embedded inside <script type="application/json">. */
-function safeJsonScript(obj) {
-  return JSON.stringify(obj).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+/** Escape JSON embedded inside <script type="application/json"> (XSS + JS line-separator safe). */
+export function safeJsonScript(obj) {
+  return JSON.stringify(obj)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
+
+/**
+ * Static inline viewer script exported verbatim so HTTP servers can compute its exact
+ * CSP SHA-256 digest (`script-src 'sha256-...'`) without using `'unsafe-inline'`.
+ */
+export const VIEWER_CLIENT_SCRIPT = `
+    (function () {
+      var meta = JSON.parse(document.getElementById('yataverse-semantic-schema').textContent);
+      var nodesById = Object.create(null);
+      (meta.graph.nodes || []).forEach(function (n) { nodesById[n.id] = n; });
+      var edges = meta.graph.edges || [];
+
+      function showNode(id) {
+        var n = Object.prototype.hasOwnProperty.call(nodesById, id) ? nodesById[id] : null;
+        if (!n) return;
+        document.querySelectorAll('.yv-node').forEach(function (el) {
+          el.setAttribute('data-selected', el.getAttribute('data-node-id') === id ? 'true' : 'false');
+        });
+        var rel = edges.filter(function (e) { return e.from === id || e.to === id; });
+        document.getElementById('yv-inspector-summary').textContent = n.layer + ' · ' + n.label + ' (' + rel.length + ' edges)';
+        document.getElementById('yv-inspector-json').textContent = JSON.stringify({ node: n, edges: rel }, null, 2);
+      }
+
+      document.querySelectorAll('.yv-node').forEach(function (el) {
+        el.addEventListener('click', function () { showNode(el.getAttribute('data-node-id')); });
+        el.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); showNode(el.getAttribute('data-node-id')); }
+        });
+      });
+      if (meta.graph.nodes && meta.graph.nodes.length > 0) showNode(meta.graph.nodes[0].id);
+
+      function renderResultTable(container, columns, rows) {
+        container.textContent = '';
+        if (!Array.isArray(rows) || rows.length === 0) return;
+        var cols = Array.isArray(columns) && columns.length ? columns : Object.keys(rows[0]);
+        var table = document.createElement('table');
+        var thead = document.createElement('thead');
+        var trHead = document.createElement('tr');
+        cols.forEach(function (c) { var th = document.createElement('th'); th.textContent = c; trHead.appendChild(th); });
+        thead.appendChild(trHead);
+        table.appendChild(thead);
+        var tbody = document.createElement('tbody');
+        rows.slice(0, 100).forEach(function (r) {
+          var tr = document.createElement('tr');
+          cols.forEach(function (c) {
+            var td = document.createElement('td');
+            td.textContent = r[c] === null || r[c] === undefined ? '' : String(r[c]);
+            tr.appendChild(td);
+          });
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        container.appendChild(table);
+      }
+
+      function bindConsole(formId, inputId, tableId, outId, endpoint, op) {
+        var form = document.getElementById(formId);
+        var input = document.getElementById(inputId);
+        var tableEl = document.getElementById(tableId);
+        var out = document.getElementById(outId);
+        if (!form) return;
+        form.addEventListener('submit', async function (ev) {
+          ev.preventDefault();
+          out.textContent = 'Running ' + op + '...';
+          try {
+            var payload = { query: input.value };
+            if (!meta.isSeededDefault) payload.basisCid = meta.basisCid;
+            var res = await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+            var data = await res.json();
+            if (data && data.result && Array.isArray(data.result.rows)) {
+              renderResultTable(tableEl, data.result.columns || data.result.variables, data.result.rows);
+            } else {
+              tableEl.textContent = '';
+            }
+            out.textContent = JSON.stringify(data, null, 2);
+          } catch (err) {
+            out.textContent = 'Error: ' + String(err);
+          }
+        });
+      }
+
+      bindConsole('yv-sql-form', 'yv-sql-input', 'yv-sql-table', 'yv-sql-out', meta.sqlEndpoint, 'ontology.query_sql');
+      bindConsole('yv-sparql-form', 'yv-sparql-input', 'yv-sparql-table', 'yv-sparql-out', meta.sparqlEndpoint, 'ontology.query_sparql');
+    })();
+  `;
 
 /**
  * Deterministic seeded default ontology snapshot using kotoba.ontology (:tender)
@@ -114,9 +220,7 @@ export function createDefaultOntologySnapshot() {
   return cachedDefaultSnapshot;
 }
 
-/**
- * Compute external join coverage rows and summary statistics for a snapshot.
- */
+/** Compute external join coverage rows and summary statistics for a snapshot. */
 export function computeJoinCoverage(snapshot) {
   const joins = [];
   for (const j of snapshot.joinMappings ?? []) {
@@ -124,12 +228,6 @@ export function computeJoinCoverage(snapshot) {
     const rightRows = snapshot.tables?.get(j.rightType.toLowerCase())?.rows ?? [];
     const lk = j.leftKey.replace(/[./-]/g, '_');
     const rk = j.rightKey.replace(/[./-]/g, '_');
-    const rightKeys = new Set();
-    for (const r of rightRows) {
-      if (r[rk] !== undefined && r[rk] !== null) rightKeys.add(String(r[rk]));
-    }
-    let matchedLeft = 0;
-    let matchedRows = 0;
     const rightCounts = new Map();
     for (const r of rightRows) {
       if (r[rk] !== undefined && r[rk] !== null) {
@@ -137,10 +235,15 @@ export function computeJoinCoverage(snapshot) {
         rightCounts.set(k, (rightCounts.get(k) ?? 0) + 1);
       }
     }
+    let matchedLeft = 0;
+    let matchedRows = 0;
     for (const l of leftRows) {
-      if (l[lk] !== undefined && l[lk] !== null && rightKeys.has(String(l[lk]))) {
-        matchedLeft += 1;
-        matchedRows += rightCounts.get(String(l[lk])) ?? 0;
+      if (l[lk] !== undefined && l[lk] !== null) {
+        const cnt = rightCounts.get(String(l[lk])) ?? 0;
+        if (cnt > 0) {
+          matchedLeft += 1;
+          matchedRows += cnt;
+        }
       }
     }
     const coverageRatio = leftRows.length > 0 ? Math.round((matchedLeft / leftRows.length) * 1000) / 1000 : 0;
@@ -163,15 +266,22 @@ export function computeJoinCoverage(snapshot) {
 
 /**
  * Build the canonical layered ontology graph model (`nodes`, `edges`, `layers`, `joins`, `coverage`).
- * Pure function, deterministic ordering, bounded by `maxNodes`.
+ * Pure function, deterministic ordering, bounded by `maxNodes` (1..500) and `maxEdges = maxNodes * 8`.
  */
-export function buildOntologyGraph(snapshot, { maxNodes = 64, includeRdfSubjects = false } = {}) {
+export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeRdfSubjects = false } = {}) {
+  const boundNodes = clampLimit(maxNodes, 64, MAX_GRAPH_NODES, 'maxNodes', OntologyError);
+  const hardMaxEdges = boundNodes * 8;
+  const boundEdges = maxEdges === undefined
+    ? hardMaxEdges
+    : clampLimit(maxEdges, hardMaxEdges, hardMaxEdges, 'maxEdges', OntologyError);
+
   const nodes = [];
   const edges = [];
   const nodeMap = new Map();
+  let edgesTruncated = false;
 
   const addNode = (id, label, layer, meta = {}) => {
-    if (nodeMap.has(id) || nodes.length >= maxNodes) return false;
+    if (nodeMap.has(id) || nodes.length >= boundNodes) return false;
     const node = { id, label, kind: layer, layer, meta };
     nodeMap.set(id, node);
     nodes.push(node);
@@ -180,11 +290,16 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, includeRdfSubjects
 
   let edgeSeq = 0;
   const addEdge = (from, to, label, kind, meta = {}) => {
-    if (!nodeMap.has(from) || !nodeMap.has(to)) return;
+    if (!nodeMap.has(from) || !nodeMap.has(to)) return false;
+    if (edges.length >= boundEdges) {
+      edgesTruncated = true;
+      return false;
+    }
     edges.push({ id: `e${++edgeSeq}`, from, to, label, kind, meta });
+    return true;
   };
 
-  // Layer 1: Connectors (external-data provenance sources)
+  // Layer 1: Connectors
   for (const c of snapshot.registry.connectors) {
     addNode(`connector:${c.id}`, c.id, 'connector', {
       name: c.name,
@@ -194,7 +309,7 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, includeRdfSubjects
     });
   }
 
-  // Layer 2: Object Types (kotoba.ontology schema)
+  // Layer 2: Object Types
   for (const t of snapshot.registry.objectTypes) {
     addNode(`type:${t.id}`, t.id, 'object-type', {
       name: t.name,
@@ -222,12 +337,12 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, includeRdfSubjects
     });
   }
 
-  // Layer 3: Facts (provenance-tagged entities)
-  const factNodeByTypeId = new Map();
+  // Layer 3: Facts (only keep references to facts actually added into nodeMap)
+  const includedFacts = [];
   for (const f of snapshot.facts) {
+    if (nodes.length >= boundNodes) break;
     const typeId = f['ontology/type'];
     const nid = `fact:${typeId}:${f.id}`;
-    factNodeByTypeId.set(`${typeId}:${f.id}`, nid);
     const added = addNode(nid, `${typeId}:${f.id}`, 'fact', {
       id: f.id,
       'ontology/type': typeId,
@@ -241,16 +356,18 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, includeRdfSubjects
       ...(f.amount !== undefined ? { amount: f.amount } : {}),
     });
     if (added) {
+      includedFacts.push(f);
       addEdge(nid, `type:${typeId}`, 'ontology/type', 'instance', { source: f['ontology/source'] });
       addEdge(nid, `connector:${f['ontology/source']}`, 'ontology/source', 'provenance', { source: f['ontology/source'] });
     }
   }
 
-  // Fact-to-fact join instance edges (for declared joinMappings)
+  // Fact-to-fact join instance edges ONLY between facts already inside nodeMap, capped by boundEdges
   for (const j of joins) {
-    const leftFacts = snapshot.facts.filter((f) => f['ontology/type'] === j.leftType);
+    if (edges.length >= boundEdges) { edgesTruncated = true; break; }
+    const leftFacts = includedFacts.filter((f) => f['ontology/type'] === j.leftType);
     const rightByKey = new Map();
-    for (const rf of snapshot.facts) {
+    for (const rf of includedFacts) {
       if (rf['ontology/type'] !== j.rightType) continue;
       const val = rf[j.rightKey];
       if (val !== undefined && val !== null) {
@@ -261,27 +378,30 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, includeRdfSubjects
       }
     }
     for (const lf of leftFacts) {
+      if (edges.length >= boundEdges) { edgesTruncated = true; break; }
       const val = lf[j.leftKey];
       if (val === undefined || val === null) continue;
       const matches = rightByKey.get(String(val)) ?? [];
       for (const rf of matches) {
-        addEdge(
+        if (!addEdge(
           `fact:${j.leftType}:${lf.id}`,
           `fact:${j.rightType}:${rf.id}`,
           j.name,
           'join-instance',
           { leftKey: j.leftKey, rightKey: j.rightKey },
-        );
+        )) {
+          break;
+        }
       }
     }
   }
 
-  // Optional Layer 4: Standalone RDF quad subjects not projected from facts
+  // Optional Layer 4: Standalone RDF quad subjects
   if (includeRdfSubjects) {
     const basePrefix = `${snapshot.baseIri}entity/`;
     const seenSubj = new Set();
     for (const q of snapshot.quads) {
-      if (nodes.length >= maxNodes) break;
+      if (nodes.length >= boundNodes) break;
       const sv = q.subject.value;
       if (sv.startsWith(basePrefix) || seenSubj.has(sv)) continue;
       seenSubj.add(sv);
@@ -292,20 +412,21 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, includeRdfSubjects
     }
   }
 
-  // Provenance & coverage summary
-  const byConnector = {};
-  const byObjectType = {};
-  const byJurisdiction = {};
+  // Null-prototype accumulators (prototype-pollution safe) converted to clean plain objects
+  const byConnectorMap = Object.create(null);
+  const byObjectTypeMap = Object.create(null);
+  const byJurisdictionMap = Object.create(null);
   for (const f of snapshot.facts) {
     const src = normalizeKeyword(f['ontology/source']) ?? 'unknown';
     const tp = normalizeKeyword(f['ontology/type']) ?? 'unknown';
-    byConnector[src] = (byConnector[src] ?? 0) + 1;
-    byObjectType[tp] = (byObjectType[tp] ?? 0) + 1;
-    if (f.jurisdiction) {
+    byConnectorMap[src] = (byConnectorMap[src] ?? 0) + 1;
+    byObjectTypeMap[tp] = (byObjectTypeMap[tp] ?? 0) + 1;
+    if (f.jurisdiction !== undefined && f.jurisdiction !== null) {
       const jur = normalizeKeyword(String(f.jurisdiction)) ?? String(f.jurisdiction);
-      byJurisdiction[jur] = (byJurisdiction[jur] ?? 0) + 1;
+      byJurisdictionMap[jur] = (byJurisdictionMap[jur] ?? 0) + 1;
     }
   }
+  const toPlain = (nullProto) => Object.assign({}, nullProto);
 
   const layerCounts = { connector: 0, 'object-type': 0, fact: 0, 'rdf-subject': 0 };
   for (const n of nodes) layerCounts[n.layer] = (layerCounts[n.layer] ?? 0) + 1;
@@ -331,13 +452,14 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, includeRdfSubjects
     edges,
     joins,
     coverage: {
-      byConnector,
-      byObjectType,
-      byJurisdiction,
+      byConnector: toPlain(byConnectorMap),
+      byObjectType: toPlain(byObjectTypeMap),
+      byJurisdiction: toPlain(byJurisdictionMap),
       totalJoins: joins.length,
       totalMatchedJoinRows: joins.reduce((s, j) => s + j.matchedRows, 0),
     },
-    truncated: totalCandidates > nodes.length,
+    truncated: totalCandidates > nodes.length || edgesTruncated,
+    edgesTruncated,
   };
 }
 
@@ -421,11 +543,7 @@ export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64 } = {}) {
   return parts.join('\n');
 }
 
-/**
- * Render the interactive, self-contained Semantic HTML5 Ontology Viewer.
- * Includes SVG graph, clickable node detail inspector, SQL/SPARQL query consoles,
- * external join coverage table, CID loader, and embedded noun.verb Semantic UI schema.
- */
+/** Render the interactive, self-contained Semantic HTML5 Ontology Viewer. */
 export function renderOntologyHtml(snapshot, {
   title,
   maxNodes = 64,
@@ -438,6 +556,12 @@ export function renderOntologyHtml(snapshot, {
   inspection,
   isSeededDefault = false,
 } = {}) {
+  assertSafeEndpointPath(apiBase, 'apiBase');
+  assertSafeEndpointPath(sqlEndpoint, 'sqlEndpoint');
+  assertSafeEndpointPath(sparqlEndpoint, 'sparqlEndpoint');
+  assertSafeEndpointPath(viewerPath, 'viewerPath');
+  assertSafeEndpointPath(graphEndpoint, 'graphEndpoint');
+
   const graph = buildOntologyGraph(snapshot, { maxNodes });
   const svg = renderOntologySvg(graph, { maxNodes });
   const safeTitle = title ?? `Yataverse Ontology Viewer — ${snapshot.id}`;
@@ -621,98 +745,12 @@ export function renderOntologyHtml(snapshot, {
     schema,
     graph,
   })}</script>
-  <script>
-    (function () {
-      var meta = JSON.parse(document.getElementById('yataverse-semantic-schema').textContent);
-      var nodesById = {};
-      (meta.graph.nodes || []).forEach(function (n) { nodesById[n.id] = n; });
-      var edges = meta.graph.edges || [];
-
-      function showNode(id) {
-        var n = nodesById[id];
-        if (!n) return;
-        document.querySelectorAll('.yv-node').forEach(function (el) {
-          el.setAttribute('data-selected', el.getAttribute('data-node-id') === id ? 'true' : 'false');
-        });
-        var rel = edges.filter(function (e) { return e.from === id || e.to === id; });
-        document.getElementById('yv-inspector-summary').textContent = n.layer + ' · ' + n.label + ' (' + rel.length + ' edges)';
-        document.getElementById('yv-inspector-json').textContent = JSON.stringify({ node: n, edges: rel }, null, 2);
-      }
-
-      document.querySelectorAll('.yv-node').forEach(function (el) {
-        el.addEventListener('click', function () { showNode(el.getAttribute('data-node-id')); });
-        el.addEventListener('keydown', function (ev) {
-          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); showNode(el.getAttribute('data-node-id')); }
-        });
-      });
-      if (meta.graph.nodes && meta.graph.nodes.length > 0) showNode(meta.graph.nodes[0].id);
-
-      function renderResultTable(container, columns, rows) {
-        container.textContent = '';
-        if (!Array.isArray(rows) || rows.length === 0) return;
-        var cols = Array.isArray(columns) && columns.length ? columns : Object.keys(rows[0]);
-        var table = document.createElement('table');
-        var thead = document.createElement('thead');
-        var trHead = document.createElement('tr');
-        cols.forEach(function (c) { var th = document.createElement('th'); th.textContent = c; trHead.appendChild(th); });
-        thead.appendChild(trHead);
-        table.appendChild(thead);
-        var tbody = document.createElement('tbody');
-        rows.slice(0, 100).forEach(function (r) {
-          var tr = document.createElement('tr');
-          cols.forEach(function (c) {
-            var td = document.createElement('td');
-            td.textContent = r[c] === null || r[c] === undefined ? '' : String(r[c]);
-            tr.appendChild(td);
-          });
-          tbody.appendChild(tr);
-        });
-        table.appendChild(tbody);
-        container.appendChild(table);
-      }
-
-      function bindConsole(formId, inputId, tableId, outId, endpoint, op) {
-        var form = document.getElementById(formId);
-        var input = document.getElementById(inputId);
-        var tableEl = document.getElementById(tableId);
-        var out = document.getElementById(outId);
-        if (!form) return;
-        form.addEventListener('submit', async function (ev) {
-          ev.preventDefault();
-          out.textContent = 'Running ' + op + '...';
-          try {
-            var payload = { query: input.value };
-            if (!meta.isSeededDefault) payload.basisCid = meta.basisCid;
-            var res = await fetch(endpoint, {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify(payload),
-            });
-            var data = await res.json();
-            if (data && data.result && Array.isArray(data.result.rows)) {
-              renderResultTable(tableEl, data.result.columns || data.result.variables, data.result.rows);
-            } else {
-              tableEl.textContent = '';
-            }
-            out.textContent = JSON.stringify(data, null, 2);
-          } catch (err) {
-            out.textContent = 'Error: ' + String(err);
-          }
-        });
-      }
-
-      bindConsole('yv-sql-form', 'yv-sql-input', 'yv-sql-table', 'yv-sql-out', meta.sqlEndpoint, 'ontology.query_sql');
-      bindConsole('yv-sparql-form', 'yv-sparql-input', 'yv-sparql-table', 'yv-sparql-out', meta.sparqlEndpoint, 'ontology.query_sparql');
-    })();
-  </script>
+  <script>${VIEWER_CLIENT_SCRIPT}</script>
 </body>
 </html>`;
 }
 
-/**
- * Render the Yataverse root landing page (`GET /`) with immediate Ontology Viewer access,
- * CID lookup form, bytes-plane endpoints overview, and live SVG preview.
- */
+/** Render the Yataverse root landing page (`GET /`) — zero executable script tags. */
 export function renderYataverseHomeHtml(defaultSnapshot, { schema } = {}) {
   const graph = buildOntologyGraph(defaultSnapshot, { maxNodes: 24 });
   const previewSvg = renderOntologySvg(graph, { maxNodes: 24 });
