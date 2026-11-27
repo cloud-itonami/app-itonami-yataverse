@@ -25,6 +25,8 @@ import { keygen, adminStatus, makeAdmin, loadKey, AdminError } from './admin.mjs
 import { canonicalAssetManifest } from './asset-manifest.mjs';
 import { assetDidRecord } from './asset-did.mjs';
 import { canonicalTrainingRunManifest } from './training-run-manifest.mjs';
+import { buildOntologySnapshot, verifyOntologySnapshot } from './ontology.mjs';
+import { getOntologySchema, invokeOntologyOperation } from './ontology-viewer.mjs';
 
 /** The admin key is read only when the configured mode signs with it. */
 const cacaoDeps = (cfg) => (cfg.authMode === 'cacao' ? { cacaoKey: loadKey() } : {});
@@ -85,6 +87,19 @@ const USAGE = `yataverse — CLI for the yataverse bytes plane (formerly kotobas
   yataverse asset-did <cid> [--domain host]  derive the deterministic Murakumo did:web for a CID
   yataverse asset-did-index <jsonl|-> [--domain host] [--summary file]
                                        stream unique CID DIDs and bind input/index hashes
+  yataverse ontology schema            print Semantic UI noun.verb ontology operation catalog & schemas
+  yataverse ontology build <spec.json|-> [-o snapshot.car]
+                                       build & verify canonical DAG-CBOR IPLD ontology snapshot (CARv1)
+  yataverse ontology verify <snapshot.car|-> [--basis <cid>]
+                                       verify CAR ontology snapshot CIDs, DAG-CBOR, closure & provenance
+  yataverse ontology inspect <snapshot.car|-> [--basis <cid>]
+                                       inspect object types, connectors, tables, joins & CID links
+  yataverse ontology sql <snapshot.car|-> --query "<SQL>" [--basis <cid>] [--jurisdiction J] [--max-scan N] [--max-rows N]
+                                       run bounded read-only SQL SELECT on a pinned ontology snapshot
+  yataverse ontology sparql <snapshot.car|-> (--query "<SPARQL>" | --algebra-edn "<EDN>") [--basis <cid>] [--jurisdiction J]
+                                       run bounded read-only SPARQL query/EDN algebra on a pinned snapshot
+  yataverse ontology view <snapshot.car|-> [--format html|svg|json] [-o out] [--basis <cid>]
+                                       render Semantic UI Ontology Viewer (HTML, SVG, or JSON viewModel)
   yataverse status                     how this machine is configured (names only, no secrets)
   yataverse config init [--url U] [--read-url U] [--prefix P] [--tenant-id t_..] [--storage S]
                         [--sa-token-stdin]   write ~/.config/yataverse (secret from stdin, 0600)
@@ -307,6 +322,102 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         const manifest = canonicalTrainingRunManifest(readInput(f._[0]).toString('utf8'));
         stdout.write(manifest);
         return 0;
+      }
+      case 'ontology': {
+        const [sub, target] = f._;
+        if (sub === 'schema') {
+          out(getOntologySchema());
+          return 0;
+        }
+        if (sub === 'build') {
+          const spec = JSON.parse(readInput(target).toString('utf8'));
+          const snap = buildOntologySnapshot(spec);
+          if (f.o) fs.writeFileSync(f.o, snap.carBytes);
+          out({
+            basisCid: snap.basisCid,
+            schema: snap.schema,
+            id: snap.id,
+            blockCids: snap.blockCids,
+            stats: snap.stats,
+            carBytes: snap.carBytes.length,
+            ...(f.o ? { carFile: f.o } : {}),
+          });
+          return 0;
+        }
+        if (sub === 'verify') {
+          const carBytes = readInput(target);
+          const snap = verifyOntologySnapshot(carBytes, { expectedBasisCid: f.basis ?? null });
+          const res = await invokeOntologyOperation('ontology.verify', { basisCid: snap.basisCid }, { snapshot: snap });
+          out(res);
+          return 0;
+        }
+        if (sub === 'inspect') {
+          const carBytes = readInput(target);
+          const snap = verifyOntologySnapshot(carBytes, { expectedBasisCid: f.basis ?? null });
+          const res = await invokeOntologyOperation('ontology.inspect', { basisCid: snap.basisCid }, { snapshot: snap });
+          out(res);
+          return 0;
+        }
+        if (sub === 'sql') {
+          if (!f.query) { stderr.write('yataverse: ontology sql needs --query "<SQL>"\n'); return 2; }
+          const carBytes = readInput(target);
+          const snap = verifyOntologySnapshot(carBytes, { expectedBasisCid: f.basis ?? null });
+          const limits = {};
+          if (f.maxScan) limits.maxScanRows = Number(f.maxScan);
+          if (f.maxRows) limits.maxResultRows = Number(f.maxRows);
+          const res = await invokeOntologyOperation('ontology.query_sql', {
+            basisCid: f.basis ?? snap.basisCid,
+            query: f.query,
+            ...(f.jurisdiction ? { jurisdiction: f.jurisdiction } : {}),
+            ...(f.allowedSources ? { allowedSources: f.allowedSources.split(',').map((s) => s.trim()).filter(Boolean) } : {}),
+            ...(Object.keys(limits).length ? { limits } : {}),
+          }, { snapshot: snap });
+          out(res);
+          return 0;
+        }
+        if (sub === 'sparql') {
+          if (!f.query && !f.algebraEdn) {
+            stderr.write('yataverse: ontology sparql needs --query "<SPARQL>" or --algebra-edn "<EDN>"\n');
+            return 2;
+          }
+          const carBytes = readInput(target);
+          const snap = verifyOntologySnapshot(carBytes, { expectedBasisCid: f.basis ?? null });
+          const limits = {};
+          if (f.maxScan) limits.maxScanSteps = Number(f.maxScan);
+          if (f.maxRows) limits.maxSolutions = Number(f.maxRows);
+          const res = await invokeOntologyOperation('ontology.query_sparql', {
+            basisCid: f.basis ?? snap.basisCid,
+            ...(f.query ? { query: f.query } : { algebraEdn: f.algebraEdn }),
+            ...(f.jurisdiction ? { jurisdiction: f.jurisdiction } : {}),
+            ...(f.allowedSources ? { allowedSources: f.allowedSources.split(',').map((s) => s.trim()).filter(Boolean) } : {}),
+            ...(Object.keys(limits).length ? { limits } : {}),
+          }, { snapshot: snap });
+          out(res);
+          return 0;
+        }
+        if (sub === 'view') {
+          const format = f.format ?? 'html';
+          const carBytes = readInput(target);
+          const snap = verifyOntologySnapshot(carBytes, { expectedBasisCid: f.basis ?? null });
+          const res = await invokeOntologyOperation('ontology.view', {
+            basisCid: f.basis ?? snap.basisCid,
+            format,
+            ...(f.title ? { title: f.title } : {}),
+            ...(f.apiBase ? { apiBase: f.apiBase } : {}),
+          }, { snapshot: snap });
+          const payload = format === 'html' ? res.result.html
+            : format === 'svg' ? res.result.svg
+            : JSON.stringify(res, null, 2) + '\n';
+          if (f.o) {
+            fs.writeFileSync(f.o, payload, 'utf8');
+            out({ basisCid: snap.basisCid, format, wrote: f.o, bytes: Buffer.byteLength(payload, 'utf8') });
+          } else {
+            stdout.write(payload);
+          }
+          return 0;
+        }
+        stderr.write('usage: yataverse ontology schema|build|verify|inspect|sql|sparql|view ...\n');
+        return 2;
       }
       case 'site-pack': {
         if (!f._[0] || !f.o) throw new YataverseError('usage', 'site-pack <dir> -o <outdir> [--hidden true]');
