@@ -23,6 +23,14 @@ export const DEFAULT_NAME_MAX_FILE_BLOCKS = 128;
 export const DEFAULT_NAME_MAX_FILE_BYTES = 32 * 1024 * 1024;
 const LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
+const PREVIEW_HOSTS = new Set(['soudan.itonami.app', 'bengoshi.itonami.app']);
+// The HTTP CSP complements the app's HTML meta policy, which controls asset sources.
+const PREVIEW_HEADERS = {
+  'content-security-policy': "frame-ancestors 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
+  'referrer-policy': 'no-referrer',
+  'permissions-policy': 'camera=(), geolocation=(), microphone=()',
+};
+
 const TYPES = {
   html: 'text/html; charset=utf-8', htm: 'text/html; charset=utf-8', css: 'text/css; charset=utf-8',
   js: 'text/javascript; charset=utf-8', mjs: 'text/javascript; charset=utf-8', json: 'application/json; charset=utf-8',
@@ -147,7 +155,8 @@ export async function handleName(request, url, env, deps, readBlock, denied = nu
   const head = request.method === 'HEAD';
   const segments = segmentsOf(url.pathname);
   if (!segments) return fail(400, 'bad-path');
-  const link = await resolveDnslink(url.hostname.toLowerCase(), env, deps);
+  const host = url.hostname.toLowerCase();
+  const link = await resolveDnslink(host, env, deps);
   if (link.error) return fail(...link.error);
   const load = async (cid) => {
     const r = await readBlock(cid);
@@ -177,6 +186,10 @@ export async function handleName(request, url, env, deps, readBlock, denied = nu
       'x-ipfs-path': `/ipfs/${link.root}${[...link.base, ...segments].map((s) => `/${encodeURIComponent(s)}`).join('')}`,
       'x-ipfs-roots': link.root,
     };
+    if (PREVIEW_HOSTS.has(host)) {
+      Object.assign(headers, PREVIEW_HEADERS);
+      if (url.protocol === 'https:') headers['strict-transport-security'] = 'max-age=300';
+    }
     const inm = request.headers.get('if-none-match');
     if (inm && inm.split(',').some((t) => t.trim().replace(/^W\//, '') === headers.etag)) {
       const { 'content-type': _t, 'content-length': _l, ...rest } = headers;

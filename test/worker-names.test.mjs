@@ -8,8 +8,18 @@ import { encodeCarV1, parseCar, CAR_CONTENT_TYPE } from '../src/car.mjs';
 import { rawCid } from '../src/cid.mjs';
 
 const NAME_ENV = { ...ENV, NAME_PLANE_SUFFIXES: '.itonami.app', MAX_BLOCK_BYTES: '4096' };
-const FILES = { 'index.html': '<h1>home</h1>', 'app.js': 'console.log(1)', 'docs/index.html': 'docs', 'docs/big.bin': Buffer.alloc(20, 7), 'a b.txt': 'space' };
+const FILES = {
+  'index.html': `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; connect-src 'none'"><h1>home</h1><script src="/app.js"></script>`,
+  'app.js': 'console.log(1)', 'docs/index.html': 'docs', 'docs/big.bin': Buffer.alloc(20, 7), 'a b.txt': 'space',
+};
 const SITE = packFiles(FILES, { chunkBytes: 8 });
+const PREVIEW_HOSTS = ['soudan.itonami.app', 'bengoshi.itonami.app'];
+const PREVIEW_HEADERS = {
+  'content-security-policy': "frame-ancestors 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
+  'referrer-policy': 'no-referrer',
+  'permissions-policy': 'camera=(), geolocation=(), microphone=()',
+  'strict-transport-security': 'max-age=300',
+};
 
 /** A store holding SITE, plus a DoH answer per host. `txt` maps host -> [TXT data] | {status} | 'down'. */
 function world(txt = { 'demo.itonami.app': [`"dnslink=/ipfs/${SITE.root}"`] }) {
@@ -30,9 +40,11 @@ function world(txt = { 'demo.itonami.app': [`"dnslink=/ipfs/${SITE.root}"`] }) {
   };
   return { s, dns, deps: { fetchImpl, now: NOW } };
 }
-const req = (path, { host = 'demo.itonami.app', method = 'GET', headers = {}, body } = {}) =>
-  new Request(`https://${host}${path}`, { method, headers, body });
+const req = (path, { host = 'demo.itonami.app', protocol = 'https', method = 'GET', headers = {}, body } = {}) =>
+  new Request(`${protocol}://${host}${path}`, { method, headers, body });
 const err = async (res) => (await res.json()).error;
+const previewHeadersOf = (res) => Object.fromEntries(Object.keys(PREVIEW_HEADERS)
+  .filter((name) => res.headers.has(name)).map((name) => [name, res.headers.get(name)]));
 
 test('isNameHost: one label under a configured suffix, and nothing when the var is empty', () => {
   assert.equal(isNameHost('demo.itonami.app', NAME_ENV), true);
@@ -56,7 +68,7 @@ test('a name host serves files from its DNSLink with a type, an etag and the IPF
   assert.equal(home.headers.get('content-type'), 'text/html; charset=utf-8');
   assert.equal(home.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(home.headers.get('x-ipfs-roots'), SITE.root);
-  assert.equal(await home.text(), '<h1>home</h1>');
+  assert.equal(await home.text(), FILES['index.html']);
   const js = await handle(req('/app.js'), NAME_ENV, deps);
   assert.equal(js.headers.get('content-type'), 'text/javascript; charset=utf-8');
   assert.match(js.headers.get('etag'), /^"bafybei[a-z2-7]+"$/);          // 14 bytes over 8-byte chunks: a file node
@@ -71,6 +83,98 @@ test('a name host serves files from its DNSLink with a type, an etag and the IPF
   assert.equal(spaced.headers.get('x-ipfs-path'), `/ipfs/${SITE.root}/a%20b.txt`);
   assert.equal(await spaced.text(), 'space');
   assert.deepEqual(dns, ['_dnslink.demo.itonami.app']);       // one lookup, then the cache
+});
+
+test('Soudan and Bengoshi DNSLink files carry the preview policy with short HTTPS-only HSTS', async () => {
+  const { deps, dns } = world(Object.fromEntries(PREVIEW_HOSTS.map((host) => [host, [`"dnslink=/ipfs/${SITE.root}"`]])));
+  const { 'strict-transport-security': _sts, ...httpHeaders } = PREVIEW_HEADERS;
+  for (const host of PREVIEW_HOSTS) {
+    const get = await handle(req('/', { host }), NAME_ENV, deps);
+    assert.equal(get.status, 200, host);
+    assert.deepEqual(previewHeadersOf(get), PREVIEW_HEADERS, host);
+    assert.equal(get.headers.get('content-type'), 'text/html; charset=utf-8');
+    assert.equal(get.headers.get('content-length'), String(Buffer.byteLength(FILES['index.html'])));
+    assert.equal(get.headers.get('cache-control'), 'public, max-age=300');
+    assert.equal(get.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(get.headers.get('x-ipfs-path'), `/ipfs/${SITE.root}`);
+    assert.equal(get.headers.get('x-ipfs-roots'), SITE.root);
+    assert.equal(await get.text(), FILES['index.html']);
+    const etag = get.headers.get('etag');
+    assert.match(etag, /^"bafybei[a-z2-7]+"$/);
+    const head = await handle(req('/', { host, method: 'HEAD' }), NAME_ENV, deps);
+    assert.equal(head.status, 200, host);
+    assert.deepEqual([...head.headers], [...get.headers]);
+    assert.equal(await head.text(), '');
+    const same = await handle(req('/', { host, headers: { 'if-none-match': `W/${etag}` } }), NAME_ENV, deps);
+    assert.equal(same.status, 304, host);
+    assert.deepEqual(previewHeadersOf(same), PREVIEW_HEADERS, host);
+    assert.equal(same.headers.get('etag'), etag);
+    assert.equal(same.headers.get('cache-control'), 'public, max-age=300');
+    assert.equal(await same.text(), '');
+    const http = await handle(req('/', { host, protocol: 'http' }), NAME_ENV, deps);
+    assert.equal(http.status, 200, host);
+    assert.deepEqual(previewHeadersOf(http), httpHeaders, host);
+    const js = await handle(req('/app.js', { host }), NAME_ENV, deps);
+    assert.equal(js.status, 200, host);
+    assert.equal(js.headers.get('content-type'), 'text/javascript; charset=utf-8');
+    assert.equal(await js.text(), FILES['app.js']);
+    const redirect = await handle(req('/docs?x=1', { host }), NAME_ENV, deps);
+    assert.equal(redirect.status, 301, host);
+    assert.equal(redirect.headers.get('location'), '/docs/?x=1');
+    assert.deepEqual(previewHeadersOf(redirect), {});
+  }
+  assert.deepEqual(dns, PREVIEW_HOSTS.map((host) => `_dnslink.${host}`));
+});
+
+test('preview hosts still reject non-read methods and return 404 without DNSLink', async () => {
+  const { deps, dns, s } = world({});
+  for (const host of PREVIEW_HOSTS) {
+    for (const method of ['POST', 'PUT', 'DELETE', 'OPTIONS']) {
+      const res = await handle(req('/', { host, method }), NAME_ENV, deps);
+      assert.equal(res.status, 405, `${host} ${method}`);
+      assert.equal(res.headers.get('allow'), 'GET, HEAD');
+      assert.deepEqual(previewHeadersOf(res), {});
+      assert.equal(await err(res), 'method-not-allowed');
+    }
+  }
+  assert.deepEqual(dns, []);
+  for (const host of PREVIEW_HOSTS) {
+    const res = await handle(req('/', { host }), NAME_ENV, deps);
+    assert.equal(res.status, 404, host);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(previewHeadersOf(res), {});
+    assert.equal(await err(res), 'name-not-published');
+    const head = await handle(req('/', { host, method: 'HEAD' }), NAME_ENV, deps);
+    assert.equal(head.status, 404, host);
+    assert.deepEqual([...head.headers], [...res.headers]);
+  }
+  assert.deepEqual(dns, PREVIEW_HOSTS.map((host) => `_dnslink.${host}`));
+  assert.deepEqual(s.log, []);
+});
+
+test('Store, Tsukuru, similar names and the bytes-plane API do not receive the preview policy', async () => {
+  const hosts = ['store.itonami.app', 'tsukuru.itonami.app', 'soudan-preview.itonami.app', 'bengoshi.example.test'];
+  const { deps, dns } = world(Object.fromEntries(hosts.map((host) => [host, [`"dnslink=/ipfs/${SITE.root}"`]])));
+  const env = { ...NAME_ENV, NAME_PLANE_SUFFIXES: '.itonami.app,.example.test' };
+  for (const host of hosts) {
+    const get = await handle(req('/', { host }), env, deps);
+    assert.equal(get.status, 200, host);
+    assert.equal(get.headers.get('x-ipfs-roots'), SITE.root);
+    assert.equal(await get.text(), FILES['index.html']);
+    const head = await handle(req('/', { host, method: 'HEAD' }), env, deps);
+    assert.equal(head.status, 200, host);
+    assert.deepEqual([...head.headers], [...get.headers]);
+    assert.deepEqual(previewHeadersOf(get), {}, host);
+  }
+  const deep = await handle(req('/', { host: 'sub.soudan.itonami.app' }), env, deps);
+  assert.equal(deep.status, 404);
+  assert.equal(await err(deep), 'not-a-name-host');
+  assert.deepEqual(previewHeadersOf(deep), {});
+  const api = await handle(req('/health', { host: 'yataverse.com' }), env, deps);
+  assert.equal(api.status, 200);
+  assert.deepEqual(await api.json(), { ok: true, service: 'yataverse-bytes' });
+  assert.deepEqual(previewHeadersOf(api), {});
+  assert.deepEqual(dns, hosts.map((host) => `_dnslink.${host}`));
 });
 
 test('HEAD, If-None-Match, directory redirect and misses', async () => {
