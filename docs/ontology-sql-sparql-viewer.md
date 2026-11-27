@@ -1,0 +1,140 @@
+# IPLD Ontology, SQL, SPARQL & Semantic Viewer
+
+Yataverse provides pure, read-only, basis-pinned ontology storage, querying, and inspection over canonical DAG-CBOR IPLD blocks (`CIDv1`, `sha2-256`, tag-42 links) and CARv1 archives.
+
+## 1. IPLD DAG-CBOR Snapshot Structure (`src/ontology.mjs`)
+
+Every ontology snapshot is stored as a content-addressed 5-block DAG-CBOR graph:
+
+- **Root (`yataverse.ontology.snapshot/v1`)**: pins `id`, `baseIri`, `stats`, optional `parentBasis`, and tag-42 CID links to:
+  - `registry` (`yataverse.ontology.registry/v1`): object types and connectors, seeded with `kotoba.ontology` (`tender`) and `kotoba.ontology.connector` (`jp.kkj`, `jp.geps`).
+  - `facts` (`yataverse.ontology.facts/v1`): normalized facts carrying `ontology/type` and `ontology/source` provenance from registered connectors.
+  - `quads` (`yataverse.ontology.quads/v1`): deduplicated, deterministically sorted RDF quads projected from facts, explicit quads, and JSON-LD.
+  - `joins` (`yataverse.ontology.joins/v1`): declared relational join mappings between object types.
+
+### Fail-Closed Invariants
+
+- **Provenance & Conformance**: `tagFact` and `buildOntologySnapshot` refuse unregistered connectors (`unregistered-connector`) and facts missing required object-type attributes (`fact-does-not-conform`).
+- **No Remote JSON-LD `@context` Fetch**: `ingestJsonLd` never fetches remote `@context` or `@import` URLs over the network (`remote-context-refused`). Only inline contexts or caller-supplied `pinnedContexts` (optionally CID-verified) are accepted.
+- **Visibility Predicate**: `scanQuads(snapshot, pattern, visible)` requires an explicit `visible(quad)` function (`visibility-predicate-required`), matching `datalog.query`. High-level SQL/SPARQL execution also supports declarative `jurisdiction`, `allowedSources`, and custom `visible` predicates.
+- **Canonical DAG-CBOR**: All blocks pass `checkWritableBlock` (`CIDv1` `dag-cbor` `sha2-256`, canonical key ordering, complete closure, no unreachable stray blocks). Non-integer finite numbers use the versioned typed wrapper `{$awaiType: "decimal", value: "..."}` so strict DAG-CBOR integer guarantees stay intact.
+
+## 2. Bounded Read-Only SQL (`src/ontology-sql.mjs`)
+
+- **Supported**: `SELECT [DISTINCT]`, `FROM`, `INNER JOIN` / `LEFT [OUTER] JOIN ... ON`, `WHERE` (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS [NOT] NULL`), `GROUP BY`, `HAVING`, `ORDER BY [ASC|DESC]`, `LIMIT`, `OFFSET`, aggregates `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, and allowlisted scalar helpers (`LOWER`, `UPPER`, `LENGTH`, `COALESCE`).
+- **Refused (Fail-Closed)**: `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`, `TRUNCATE`, `PRAGMA`, `SELECT ... INTO`, stacked statements, `WITH`, `UNION`, subqueries, window functions, arbitrary unallowlisted functions, `basisCid` mismatch, and scans/results exceeding `maxScanRows` / `maxResultRows` / `maxOutputBytes`.
+
+## 3. Bounded Read-Only SPARQL & EDN Algebra (`src/ontology-sparql.mjs`)
+
+- **Supported**: `PREFIX`, `BASE`, `SELECT [DISTINCT]`, `ASK`, `CONSTRUCT`, `DESCRIBE`, BGP triple joins (`a`, `;`, `,`), `OPTIONAL`, `UNION`, `GRAPH`, `FILTER` (comparisons, boolean ops, `BOUND`, `ISIRI`, `ISLITERAL`, `ISBLANK`, `STR`, `LANG`, `DATATYPE`, `CONTAINS`, `STRSTARTS`, `STRENDS`, `LCASE`, `UCASE`, `STRLEN`, bounded `REGEX`), `GROUP BY`, aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `ORDER BY [ASC|DESC]`, `LIMIT`, `OFFSET`.
+- **EDN / JSON Algebra Bridge**: `algebraToEdn` and `ednToAlgebra` interoperate with `kotoba.sparql` (`:sparql/op :bgp | :filter | :join | :union | :optional | :group | :project | :distinct | :order-by | :slice`).
+- **Refused (Fail-Closed)**: `SERVICE`, `FROM` / `FROM NAMED`, SPARQL Update verbs (`INSERT`, `DELETE`, `LOAD`, `CLEAR`, `DROP`, `CREATE`, `ADD`, `MOVE`, `COPY`), unsupported clauses (`BIND`, `VALUES`, `MINUS`, nested `SELECT`), unallowlisted filter functions, ReDoS-prone nested quantifiers, `basisCid` mismatch, and `maxScanSteps` / `maxSolutions` / `maxOutputBytes` overflows.
+
+## 4. Reusable Visualization Library (`src/ontology-viz.mjs`) & Semantic UI (`noun.verb`) Viewer
+
+Visualization logic is factored into a standalone, zero-dependency ESM module (`src/ontology-viz.mjs`) that constructs a canonical layered graph model (`yataverse.ontology.graph/v1`), encodes it to canonical DAG-CBOR (`encodeOntologyGraphDagCbor`), and renders standalone SVG and interactive Semantic HTML5 viewers (ARIA `tablist`/`tab`/`tabpanel` with `ArrowLeft`/`ArrowRight`/`Home`/`End` keyboard navigation, live machine-readable `#yataverse-screen-state` JSON + `data-*` state attributes, clickable Node Detail Inspector, SQL/SPARQL consoles, and external join coverage table).
+
+### Canonical Graph Contract (`yataverse.ontology.graph/v1`, Kotoba Interop)
+
+Reference fixture: [`test/fixtures/ontology-graph-v1.json`](../test/fixtures/ontology-graph-v1.json)
+
+| Field | Type | Description |
+|---|---|---|
+| `schema` | `"yataverse.ontology.graph/v1"` | Versioned graph schema identifier |
+| `version` | `1` | Schema major version |
+| `basisCid` | `string` (CIDv1) | Pinned root CID of the verified ontology snapshot |
+| `nodeCount` | `integer` | Number of nodes in `nodes` |
+| `meta` | `object` | `{ id, snapshotSchema, stats, nodeCount, edgeCount, layerCount, truncated, edgesTruncated }` |
+| `layers` | `array` | Ordered layers `{ id, label, order, nodeCount }` |
+| `nodes` | `array` | `{ id, label, kind, layer, meta }` |
+| `edges` | `array` | `{ id, from, to, label, kind, meta }` |
+| `joins` | `array` | External join coverage `{ name, leftType, rightType, leftKey, rightKey, kind, leftCount, rightCount, matchedLeft, matchedRows, coverageRatio }` |
+| `coverage` | `object` | `{ byConnector, byObjectType, byJurisdiction, totalJoins, totalMatchedJoinRows }` |
+
+### Canonical Array Ordering & `graphCid` Verification Contract (KotobaSpec v1.0.1, 2026-11-27)
+
+`graphCid` is the **CIDv1 (`dag-cbor` `0x71`, `sha2-256`)** of the canonical DAG-CBOR encoding of the `yataverse.ontology.graph/v1` body (excluding the outer `graphCid` field itself).
+
+**Numeric / Type Normalization (`toDagCborSafe`)**:
+- Safe integers (e.g. `version: 1`, `coverageRatio: 1`) encode as CBOR integers.
+- Non-integer finite decimals (e.g. `ontology/confidence: 0.92`, `0.96`, `coverageRatio: 0.5`) NEVER encode as CBOR floats; they encode as `{"$awaiType": "decimal", "value": "<canonical-decimal-string>"}` (`NaN` / `±Infinity` refused).
+
+**Two-Layer String Ordering Separation**:
+- **Array element sorting** uses locale-independent **UTF-16 code-unit lexicographical order** (`a < b ? -1 : a > b ? 1 : 0`, `compareCodeUnits`, Clojure `compare`): e.g. `U+10000` (`"\uD800\uDC00"`) sorts **before** `U+E000` (`"\uE000"`).
+- **DAG-CBOR map key sorting** uses RFC 8949 / IPLD DAG-CBOR **UTF-8 byte length ascending, then unsigned UTF-8 byte order**: `"\uE000"` (3B: `EE 80 80`) → `"\uE000a"` (4B: `EE 80 80 61`) → `"\uD800\uDC00"` (4B: `F0 90 80 80`). Non-canonical UTF-16 key order in CBOR bytes is rejected with `map-keys-not-sorted`.
+
+Because DAG-CBOR encodes arrays in exact element order, **the array ordering of `layers`, `nodes`, `edges`, and `joins` is cryptographically bound into `graphCid`**:
+
+1. **`layers`**: fixed ascending `order`: `connector` (`0`), `object-type` (`1`), `fact` (`2`), optional `rdf-subject` (`3`). The 3 standard layers (`connector`, `object-type`, `fact`) are preserved even when `nodeCount: 0`.
+2. **`nodes`**: grouped by layer `order`:
+   - `connector`: sorted in UTF-16 code-unit ascending order by connector `id`
+   - `object-type`: sorted in UTF-16 code-unit ascending order by object type `id`
+   - `fact`: sorted in UTF-16 code-unit ascending order by `(ontology/type, id)`
+   - `rdf-subject` (optional): encounter order of sorted snapshot quads
+3. **`edges`**: sequential numeric IDs `e1`, `e2`, ..., `eN` (integer order matching array index `i + 1`, **never** lexicographical `e1, e10, ...`):
+   - Connector provenance edges (`connector -> object-type`, `produces`) in connector `id` order
+   - Schema join edges (`object-type -> object-type`, `join`) in `joinMappings` `name` order
+   - Fact edges (`fact -> object-type` `instance`, immediately followed by `fact -> connector` `provenance`) in fact `(ontology/type, id)` order
+   - Fact-to-fact `join-instance` edges in `joinMappings` `name` order, then included left-fact order, then included right-fact order
+4. **`joins`**: sorted in UTF-16 code-unit ascending order by join `name`.
+
+**Fail-Closed Verification & Two-Axis Separation (`verifyOntologyGraphCid` vs `verifyOntologySnapshot`)**:
+- Any external consumer/renderer receiving a `yataverse.ontology.graph/v1` payload carrying `graphCid` MUST verify that `encodeOntologyGraphDagCbor(graph).cid === graph.graphCid` (automatically enforced by `verifyOntologyGraphCid` and `renderOntologySvg`).
+- Reordering any array (for example sorting `edges` lexicographically as `e1, e10, e11, ..., e2` or reversing UTF-16 node order) while retaining the original `graphCid` MUST fail closed with `OntologyError('graph-cid-mismatch')`.
+- Any transform/filter/projection output MUST recompute a fresh `graphCid` from the output body and never reuse an input `graphCid`.
+- `verifyOntologyGraphCid` returns `{ verified: true, graphCidVerified: true, basisCidVerified: false, verificationScope: 'graph-cid-only', graphVerification, basisVerification, ... }` by default: a matching `graphCid` authenticates ONLY the graph payload and NEVER marks the underlying `basisCid` snapshot body verified (full snapshot block closure verification is the separate responsibility of `verifyOntologySnapshot`).
+- **Wire non-inclusion**: verification status fields (`graphCidVerified`, `basisCidVerified`, `verificationScope`, `graphVerification`, `basisVerification`) live strictly on verification return values / internal metadata and MUST NEVER be mixed into the `yataverse.ontology.graph/v1` wire JSON or `graphCid`-hashed body.
+- Reference fixture `test/fixtures/ontology-graph-v1.json` binds `basisCid = bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em` to `graphCid = bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq` (lexicographically reordered `e1,e10,...` graph hashes to `bafyreid2ie7idv5vljfojdocazd4a4zqixz7di2nshjvvdbkknnitrye2i`).
+
+Standalone SVG output (`renderOntologySvg` with default `interactive: false`) omits `role="button"` and `tabindex` on static graph nodes; interactive keyboard/button roles are emitted only inside the interactive Viewer HTML (`interactive: true`).
+
+All viewer and API actions follow the `noun.verb` contract with machine-readable JSON Schemas (`src/ontology-viewer.mjs`):
+
+| Operation | Mode | Description |
+|---|---|---|
+| `ontology.graph` | read-only | Project snapshot into canonical layered graph (`nodes/edges/layers/joins/coverage`) + DAG-CBOR `graphCid` |
+| `ontology.build` | read-only | Build & verify canonical DAG-CBOR snapshot + CARv1 |
+| `ontology.verify` | read-only | Verify CARv1/CARv2 snapshot CIDs, closure, and provenance |
+| `ontology.inspect` | read-only | Inspect object types, connectors, tables, joins, and block CIDs |
+| `ontology.query_sql` | read-only | Execute bounded SQL SELECT against pinned `basisCid` |
+| `ontology.query_sparql` | read-only | Execute bounded SPARQL or EDN algebra against pinned `basisCid` |
+| `ontology.view` | read-only | Render Semantic UI viewModel JSON, SVG graph, and HTML5 viewer |
+
+### CLI
+
+```sh
+yataverse ontology schema
+yataverse ontology build spec.json -o snapshot.car
+yataverse ontology verify snapshot.car --basis bafyrei...
+yataverse ontology inspect snapshot.car
+yataverse ontology graph snapshot.car --format json
+yataverse ontology graph snapshot.car --format dag-cbor -o graph.cbor
+yataverse ontology sql snapshot.car --query "SELECT id, status FROM tender ORDER BY id"
+yataverse ontology sparql snapshot.car --query "SELECT ?s ?p ?o WHERE { ?s ?p ?o . } LIMIT 10"
+yataverse ontology view snapshot.car --format html -o viewer.html
+```
+
+### MCP Tools
+
+- `yataverse_ontology_schema`
+- `yataverse_ontology_graph`
+- `yataverse_ontology_build`
+- `yataverse_ontology_verify`
+- `yataverse_ontology_inspect`
+- `yataverse_ontology_query_sql`
+- `yataverse_ontology_query_sparql`
+- `yataverse_ontology_view`
+
+### Worker HTTP Routes (`https://yataverse.com/`)
+
+Snapshots are stored with existing verified block/CAR routes (`POST /ipfs/` with storage receipts) and visualized/queried read-only via:
+
+- `GET /` — Yataverse landing page + immediate Ontology Viewer entry (with `?cid=<bafy...>`, loads & renders that verified DAG-CBOR snapshot)
+- `GET /ontology`, `GET /ontology/viewer[?cid=<bafy...>&format=html|svg|json]` — Interactive Ontology Viewer (SVG graph, Node Detail Inspector, SQL/SPARQL console, external join coverage)
+- `GET /ontology/graph[?cid=<bafy...>&format=json|dag-cbor]` — Canonical layered graph model as JSON or canonical DAG-CBOR (`yataverse-graph-cid` header & CIDv1 ETag)
+- `POST /ontology/sql` — Bounded read-only SQL SELECT (`{ query, cid|basisCid|carBase64 }`)
+- `POST /ontology/sparql` — Bounded read-only SPARQL / EDN algebra (`{ query|algebraEdn|algebra, cid|basisCid|carBase64 }`)
+- `GET /ontology/v1/schema`
+- `GET /ontology/v1/inspect/<basisCid>`
+- `GET /ontology/v1/view/<basisCid>?format=html|svg|json`
+- `POST /ontology/v1/ops/<noun.verb>` (JSON body with `{ basisCid, ... }` or `{ carBase64, ... }`)

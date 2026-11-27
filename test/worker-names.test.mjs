@@ -133,7 +133,8 @@ test('with the name plane off, the same host gets the ordinary API and no DNS lo
   const { deps, dns } = world();
   const res = await handle(req('/health'), ENV, deps);
   assert.equal(res.status, 200); assert.equal((await res.json()).service, 'yataverse-bytes');
-  assert.equal((await handle(req('/'), ENV, deps)).status, 404);
+  assert.equal((await handle(req('/'), ENV, deps)).status, 200);
+  assert.equal((await handle(req('/no-such-route'), ENV, deps)).status, 404);
   assert.equal(dns.length, 0);
   // And the API host is unaffected when it is on.
   assert.equal((await handle(new Request('https://yataverse.com/health'), NAME_ENV, deps)).status, 200);
