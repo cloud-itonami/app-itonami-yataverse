@@ -162,6 +162,9 @@ function normalizeObjectType(raw) {
       attrs[nk] = nv;
     }
   }
+  if (raw.key !== undefined && !Array.isArray(raw.key)) {
+    bad('invalid-object-type-key', `${id}: key must be an array`);
+  }
   const key = Array.isArray(raw.key)
     ? raw.key.map((k) => {
       const nk = normalizeKeyword(k);
@@ -190,6 +193,8 @@ function normalizeConnector(raw, typeIds) {
 
 /** Build a combined ontology + connector registry, seeded with kotoba.ontology defaults unless opted out. */
 export function createRegistry({ objectTypes = [], connectors = [], includeDefaults = true } = {}) {
+  if (!Array.isArray(objectTypes)) bad('invalid-object-types', 'objectTypes must be an array');
+  if (!Array.isArray(connectors)) bad('invalid-connectors', 'connectors must be an array');
   const typeMap = new Map();
   if (includeDefaults) {
     for (const t of DEFAULT_ONTOLOGY_REGISTRY.objectTypes) {
@@ -891,6 +896,19 @@ function defineLazyCarBytes(target, rootCid, blockList) {
  * Build a canonical multi-block DAG-CBOR IPLD ontology snapshot with tag-42 CID links.
  */
 export function buildOntologySnapshot(input = {}, opts = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    bad('invalid-snapshot-input', 'snapshot build input must be an object');
+  }
+  if (input.id !== undefined && typeof input.id !== 'string') bad('invalid-snapshot-input', 'id must be a string');
+  if (input.baseIri !== undefined && typeof input.baseIri !== 'string') bad('invalid-snapshot-input', 'baseIri must be a string');
+  if (input.objectTypes !== undefined && !Array.isArray(input.objectTypes)) bad('invalid-object-types', 'objectTypes must be an array');
+  if (input.connectors !== undefined && !Array.isArray(input.connectors)) bad('invalid-connectors', 'connectors must be an array');
+  if (input.facts !== undefined && !Array.isArray(input.facts)) bad('invalid-facts', 'facts must be an array');
+  if (input.quads !== undefined && !Array.isArray(input.quads)) bad('invalid-quads', 'quads must be an array');
+  if (input.joinMappings !== undefined && !Array.isArray(input.joinMappings)) bad('invalid-join-mappings', 'joinMappings must be an array');
+  if (input.pinnedContexts !== undefined && (input.pinnedContexts === null || typeof input.pinnedContexts !== 'object' || Array.isArray(input.pinnedContexts))) {
+    bad('invalid-pinned-contexts', 'pinnedContexts must be an object');
+  }
   const limits = { ...DEFAULT_LIMITS, ...opts.limits };
   const id = typeof input.id === 'string' && input.id.trim() ? input.id.trim() : 'default';
   const baseIri = typeof input.baseIri === 'string' && input.baseIri.trim() ? input.baseIri.trim() : DEFAULT_BASE_IRI;

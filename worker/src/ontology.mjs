@@ -359,6 +359,9 @@ export async function handleOntology(request, url, storeCtx) {
       return failRes(405, 'method-not-allowed', null, { allow: 'GET, HEAD' });
     }
     const cidParam = url.searchParams.get('cid');
+    const activeLayersParam = url.searchParams.has('activeLayers')
+      ? url.searchParams.get('activeLayers').split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
     const format = url.searchParams.get('format')
       ?? ((request.headers.get('accept') ?? '').includes('application/json') ? 'json' : 'html');
     if (!['html', 'svg', 'json'].includes(format)) {
@@ -366,7 +369,12 @@ export async function handleOntology(request, url, storeCtx) {
     }
     try {
       const { snapshot, isSeededDefault } = await resolveSnapshotByQuery(cidParam, storeCtx);
-      const rendered = renderOntologyViewer(snapshot, { format, apiBase: '/ontology/v1', isSeededDefault });
+      const rendered = renderOntologyViewer(snapshot, {
+        format,
+        apiBase: '/ontology/v1',
+        isSeededDefault,
+        ...(activeLayersParam !== undefined ? { activeLayers: activeLayersParam } : {}),
+      });
       return viewerResponse(rendered, format, snapshot, head, !isSeededDefault);
     } catch (e) { return errorToResponse(e); }
   }
@@ -377,6 +385,9 @@ export async function handleOntology(request, url, storeCtx) {
       return failRes(405, 'method-not-allowed', null, { allow: 'GET, HEAD' });
     }
     const cidParam = url.searchParams.get('cid');
+    const activeLayersParam = url.searchParams.has('activeLayers')
+      ? url.searchParams.get('activeLayers').split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
     const accept = (request.headers.get('accept') ?? '').toLowerCase();
     const format = url.searchParams.get('format') ?? (accept.includes(DAG_CBOR_CT) ? 'dag-cbor' : 'json');
     if (format !== 'json' && format !== 'dag-cbor') {
@@ -392,6 +403,7 @@ export async function handleOntology(request, url, storeCtx) {
       const graph = buildOntologyGraph(snapshot, {
         maxNodes,
         includeRdfSubjects: url.searchParams.get('includeRdfSubjects') === 'true',
+        ...(activeLayersParam !== undefined ? { activeLayers: activeLayersParam } : {}),
       });
       const { cid: graphCid, bytes: cborBytes } = encodeOntologyGraphDagCbor(graph);
       assertCidsAllowed([graphCid], storeCtx);

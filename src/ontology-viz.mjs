@@ -83,7 +83,57 @@ export const VIEWER_CLIENT_SCRIPT = `
         document.body.setAttribute('data-status', String(screenState.status || ''));
         document.body.setAttribute('data-active-tab', String(screenState.activeTab || ''));
         document.body.setAttribute('data-selected-node-id', String(screenState.selectedNodeId || ''));
+        document.body.setAttribute('data-active-layers', Array.isArray(screenState.activeLayers) ? screenState.activeLayers.join(',') : '');
         if (stateEl) stateEl.textContent = JSON.stringify(screenState);
+      }
+
+      var layerBoxes = Array.prototype.slice.call(document.querySelectorAll('[data-layer-toggle]'));
+      function applyLayerFilter(activeList) {
+        var activeSet = Object.create(null);
+        activeList.forEach(function (id) { activeSet[id] = true; });
+        var visibleNodeIds = Object.create(null);
+        var visibleNodeCount = 0;
+        document.querySelectorAll('.yv-node').forEach(function (el) {
+          var layer = el.getAttribute('data-layer');
+          var show = Boolean(activeSet[layer]);
+          el.style.display = show ? '' : 'none';
+          if (show) {
+            visibleNodeIds[el.getAttribute('data-node-id')] = true;
+            visibleNodeCount += 1;
+          }
+        });
+        var visibleEdgeCount = 0;
+        edges.forEach(function (e) {
+          var show = Boolean(visibleNodeIds[e.from] && visibleNodeIds[e.to]);
+          document.querySelectorAll('[data-edge-id="' + e.id + '"]').forEach(function (el) {
+            el.style.display = show ? '' : 'none';
+          });
+          if (show) visibleEdgeCount += 1;
+        });
+        layerBoxes.forEach(function (cb) { cb.checked = Boolean(activeSet[cb.getAttribute('data-layer-toggle')]); });
+        var nextSelected = screenState.selectedNodeId && visibleNodeIds[screenState.selectedNodeId] ? screenState.selectedNodeId : null;
+        if (!nextSelected) {
+          document.getElementById('yv-inspector-summary').textContent = visibleNodeCount === 0
+            ? 'No active layers selected (0 nodes, 0 edges).'
+            : 'Select any connector, object type, or fact node in the graph.';
+          document.getElementById('yv-inspector-json').textContent = '{}';
+        }
+        syncScreenState({ activeLayers: activeList, visibleNodeCount: visibleNodeCount, visibleEdgeCount: visibleEdgeCount, selectedNodeId: nextSelected });
+      }
+
+      if (layerBoxes.length) {
+        layerBoxes.forEach(function (cb) {
+          cb.addEventListener('change', function () {
+            var selected = layerBoxes.filter(function (b) { return b.checked; }).map(function (b) { return b.getAttribute('data-layer-toggle'); });
+            applyLayerFilter(selected);
+          });
+        });
+        var allBtn = document.getElementById('yv-layers-all');
+        var clearBtn = document.getElementById('yv-layers-clear');
+        if (allBtn) allBtn.addEventListener('click', function () {
+          applyLayerFilter(layerBoxes.map(function (b) { return b.getAttribute('data-layer-toggle'); }));
+        });
+        if (clearBtn) clearBtn.addEventListener('click', function () { applyLayerFilter([]); });
       }
 
       var tabs = Array.prototype.slice.call(document.querySelectorAll('[role="tab"]'));
@@ -329,12 +379,20 @@ export function computeJoinCoverage(snapshot) {
  * Build the canonical layered ontology graph model (`nodes`, `edges`, `layers`, `joins`, `coverage`).
  * Pure function, deterministic ordering, bounded by `maxNodes` (1..500) and `maxEdges = maxNodes * 8`.
  */
-export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeRdfSubjects = false } = {}) {
+export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeRdfSubjects = false, activeLayers } = {}) {
   const boundNodes = clampLimit(maxNodes, 64, MAX_GRAPH_NODES, 'maxNodes', OntologyError);
   const hardMaxEdges = boundNodes * 8;
   const boundEdges = maxEdges === undefined
     ? hardMaxEdges
     : clampLimit(maxEdges, hardMaxEdges, hardMaxEdges, 'maxEdges', OntologyError);
+
+  let activeLayerSet = null;
+  if (activeLayers !== undefined && activeLayers !== null) {
+    if (!Array.isArray(activeLayers) || !activeLayers.every((x) => typeof x === 'string')) {
+      throw new OntologyError('invalid-active-layers', 'activeLayers must be an array of layer ids');
+    }
+    activeLayerSet = new Set(activeLayers);
+  }
 
   const nodes = [];
   const edges = [];
@@ -342,6 +400,7 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
   let edgesTruncated = false;
 
   const addNode = (id, label, layer, meta = {}) => {
+    if (activeLayerSet !== null && !activeLayerSet.has(layer)) return false;
     if (nodeMap.has(id) || nodes.length >= boundNodes) return false;
     const node = { id, label, kind: layer, layer, meta };
     nodeMap.set(id, node);
@@ -686,7 +745,7 @@ export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64, interactive 
     const stroke = isJoin ? '#2563eb' : '#64748b';
     const dash = isJoin ? ' stroke-dasharray="5,3"' : '';
     parts.push(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-width="1.5"${dash} marker-end="url(#yv-arrow)" data-edge-id="${escapeXml(e.id)}" data-edge-kind="${escapeXml(e.kind)}"/>`);
-    parts.push(`<text x="${mx}" y="${my}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#475569">${escapeXml(e.label)}</text>`);
+    parts.push(`<text x="${mx}" y="${my}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#475569" data-edge-id="${escapeXml(e.id)}">${escapeXml(e.label)}</text>`);
   }
 
   for (const n of graph.nodes) {
@@ -710,6 +769,7 @@ export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64, interactive 
 export function renderOntologyHtml(snapshot, {
   title,
   maxNodes = 64,
+  activeLayers,
   apiBase = '/ontology/v1',
   sqlEndpoint = '/ontology/sql',
   sparqlEndpoint = '/ontology/sparql',
@@ -725,7 +785,7 @@ export function renderOntologyHtml(snapshot, {
   assertSafeEndpointPath(viewerPath, 'viewerPath');
   assertSafeEndpointPath(graphEndpoint, 'graphEndpoint');
 
-  const graph = buildOntologyGraph(snapshot, { maxNodes });
+  const graph = buildOntologyGraph(snapshot, { maxNodes, ...(activeLayers !== undefined ? { activeLayers } : {}) });
   const svg = renderOntologySvg(graph, { maxNodes, interactive: true });
   const safeTitle = title ?? `Yataverse Ontology Viewer — ${snapshot.id}`;
   const defaultSqlTable = snapshot.registry.objectTypes[0]?.id ?? 'ontology_facts';
@@ -733,14 +793,24 @@ export function renderOntologyHtml(snapshot, {
   const defaultSparql = 'SELECT ?s ?p ?o WHERE { ?s ?p ?o . } LIMIT 25';
   const initialSelectedNodeId = graph.nodes[0]?.id ?? null;
   const opsList = schema?.operations ?? [];
+  const resolvedActiveLayers = activeLayers === undefined || activeLayers === null
+    ? graph.layers.map((l) => l.id)
+    : [...activeLayers];
   const initialScreenState = {
     screenId: 'yataverse.ontology.viewer',
     status: 'ready',
     basisCid: snapshot.basisCid,
     activeTab: 'graph',
+    activeLayers: resolvedActiveLayers,
+    visibleNodeCount: graph.nodes.length,
+    visibleEdgeCount: graph.edges.length,
     selectedNodeId: initialSelectedNodeId,
     ops: opsList.map((o) => o.operation),
   };
+  const layerFilterControls = graph.layers.map((l) => {
+    const checked = resolvedActiveLayers.includes(l.id) ? ' checked' : '';
+    return `<label><input type="checkbox" data-layer-toggle="${escapeXml(l.id)}"${checked}> ${escapeXml(l.label)}</label>`;
+  }).join(' ');
 
   const typeRows = snapshot.registry.objectTypes.map((t) =>
     `<tr><td><code>${escapeXml(t.id)}</code></td><td>${escapeXml(t.name)}</td><td><code>${escapeXml(Object.keys(t.attributes).join(', '))}</code></td></tr>`
@@ -820,7 +890,7 @@ export function renderOntologyHtml(snapshot, {
     .yv-result-table { margin-top: 0.6rem; overflow-x: auto; }
   </style>
 </head>
-<body data-basis-cid="${escapeXml(snapshot.basisCid)}" data-schema="${escapeXml(snapshot.schema)}" data-screen-id="yataverse.ontology.viewer" data-status="ready" data-active-tab="graph" data-selected-node-id="${escapeXml(initialSelectedNodeId ?? '')}">
+<body data-basis-cid="${escapeXml(snapshot.basisCid)}" data-schema="${escapeXml(snapshot.schema)}" data-screen-id="yataverse.ontology.viewer" data-status="ready" data-active-tab="graph" data-active-layers="${escapeXml(resolvedActiveLayers.join(','))}" data-selected-node-id="${escapeXml(initialSelectedNodeId ?? '')}">
   <header>
     <h1>${escapeXml(safeTitle)}</h1>
     <div class="yv-meta">basisCid: <code>${escapeXml(snapshot.basisCid)}</code> · schema: <code>${escapeXml(snapshot.schema)}</code> · read-only${isSeededDefault ? ' · seeded kotoba.ontology demo' : ' · verified IPLD block closure'}</div>
@@ -858,6 +928,12 @@ export function renderOntologyHtml(snapshot, {
       <div class="yv-split" id="graph">
         <section aria-labelledby="graph-heading" data-operation="ontology.graph">
           <h2 id="graph-heading">Ontology Graph (Click a node to inspect)</h2>
+          <fieldset id="yv-layer-filters" aria-label="Layer filters" style="border:1px solid var(--yv-border);border-radius:6px;padding:0.4rem 0.6rem;margin-bottom:0.6rem;display:flex;gap:0.75rem;flex-wrap:wrap;align-items:center;">
+            <legend style="font-size:0.82rem;color:var(--yv-muted);">Layers</legend>
+            ${layerFilterControls}
+            <button type="button" id="yv-layers-all">All</button>
+            <button type="button" id="yv-layers-clear">Clear</button>
+          </fieldset>
           <div class="yv-graph">${svg}</div>
         </section>
         <aside aria-labelledby="inspector-heading" id="yv-node-inspector" data-operation="ontology.inspect">

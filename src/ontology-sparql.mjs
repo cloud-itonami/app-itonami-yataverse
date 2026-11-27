@@ -60,9 +60,9 @@ export const isLogicVar = (x) => typeof x === 'string' && x.startsWith('?') && x
 // quantifiers `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (n <= 20), anchors `^` / `$`, and `i` flag.
 // Explicitly refuses backreferences (\1..\9) and lookarounds ((?= (?! (?<= (?<!).
 
-function makeMatcher(spec, ignoreCase) {
+function makeMatcher(spec, { ignoreCase = false, dotAll = false } = {}) {
   const norm = (c) => (ignoreCase ? c.toLowerCase() : c);
-  if (spec.kind === 'any') return (c) => c !== '\n';
+  if (spec.kind === 'any') return dotAll ? () => true : (c) => c !== '\n';
   if (spec.kind === 'lit') {
     const target = norm(spec.ch);
     return (c) => norm(c) === target;
@@ -83,7 +83,7 @@ function makeMatcher(spec, ignoreCase) {
     const { negated, ranges, chars, shorthands } = spec;
     const normChars = new Set(chars.map(norm));
     const normRanges = ranges.map(([a, b]) => [norm(a), norm(b)]);
-    const shortFns = shorthands.map((code) => makeMatcher({ kind: 'shorthand', code }, ignoreCase));
+    const shortFns = shorthands.map((code) => makeMatcher({ kind: 'shorthand', code }, { ignoreCase, dotAll }));
     return (c) => {
       const nc = norm(c);
       let hit = normChars.has(nc);
@@ -109,6 +109,7 @@ export function compileLinearRegex(pattern, flags = '') {
   const flagStr = typeof flags === 'string' ? flags : '';
   if (!/^[is]*$/.test(flagStr)) bad('sparql-bad-regex', `unsupported regex flags "${flagStr}"`);
   const ignoreCase = flagStr.includes('i');
+  const dotAll = flagStr.includes('s');
 
   let pos = 0;
   const n = pattern.length;
@@ -256,7 +257,7 @@ export function compileLinearRegex(pattern, flags = '') {
     }
     if (node.type === 'char') {
       const end = newState({ kind: 'eps', out: [] });
-      const start = newState({ kind: 'match', fn: makeMatcher(node.spec, ignoreCase), out: [end] });
+      const start = newState({ kind: 'match', fn: makeMatcher(node.spec, { ignoreCase, dotAll }), out: [end] });
       return { start, end };
     }
     if (node.type === 'seq') {
@@ -1172,12 +1173,19 @@ function ednTermToJson(x) {
 function ednFilterToJson(x, depth = 0) {
   if (depth > MAX_DEPTH) bad('edn-too-deep', String(depth));
   if (Array.isArray(x)) {
-    const tag = String(x[0]).replace(/^:/, '');
+    if (x.length < 2 || typeof x[0] !== 'string') bad('edn-invalid-filter', 'filter vector requires operator and operand');
+    const tag = x[0].replace(/^:/, '');
     if (tag === 'not') return { kind: 'not', expr: ednFilterToJson(x[1], depth + 1) };
-    if (tag === 'and') return { kind: 'and', left: ednFilterToJson(x[1], depth + 1), right: ednFilterToJson(x[2], depth + 1) };
-    if (tag === 'or') return { kind: 'or', left: ednFilterToJson(x[1], depth + 1), right: ednFilterToJson(x[2], depth + 1) };
-    if (tag === 'fn') return { kind: 'fn', fn: String(x[1]).replace(/^:/, '').toUpperCase(), args: x.slice(2).map((a) => ednFilterToJson(a, depth + 1)) };
+    if (tag === 'and' || tag === 'or') {
+      if (x.length < 3) bad('edn-invalid-filter', `${tag} requires 2 operands`);
+      return { kind: tag, left: ednFilterToJson(x[1], depth + 1), right: ednFilterToJson(x[2], depth + 1) };
+    }
+    if (tag === 'fn') {
+      if (typeof x[1] !== 'string') bad('edn-invalid-filter', 'fn requires function keyword');
+      return { kind: 'fn', fn: x[1].replace(/^:/, '').toUpperCase(), args: x.slice(2).map((a) => ednFilterToJson(a, depth + 1)) };
+    }
     if (ALLOWED_CMP_OPS.has(tag)) {
+      if (x.length < 3) bad('edn-invalid-filter', `${tag} requires 2 operands`);
       return { kind: 'cmp', op: tag, left: ednFilterToJson(x[1], depth + 1), right: ednFilterToJson(x[2], depth + 1) };
     }
     bad('edn-invalid-filter', tag);
@@ -1192,15 +1200,24 @@ export function ednToAlgebra(edn, { maxQueryBytes = DEFAULT_SPARQL_LIMITS.maxQue
     bad('sparql-query-too-large', `EDN algebra exceeds ${maxQueryBytes} bytes`);
   }
   const raw = parseEdnValue(edn);
+  const expectArr = (v, label) => {
+    if (!Array.isArray(v)) bad('edn-invalid-algebra', `${label} must be a vector`);
+    return v;
+  };
   function convert(node, depth) {
     if (depth > MAX_DEPTH) bad('edn-too-deep', String(depth));
-    if (!node || typeof node !== 'object' || typeof node[':sparql/op'] !== 'string') {
+    if (!node || typeof node !== 'object' || Array.isArray(node) || typeof node[':sparql/op'] !== 'string') {
       bad('edn-invalid-algebra', 'missing :sparql/op');
     }
     const op = node[':sparql/op'].replace(/^:/, '');
     switch (op) {
-      case 'bgp':
-        return { op: 'bgp', patterns: (node[':patterns'] ?? []).map((p) => p.map(ednTermToJson)) };
+      case 'bgp': {
+        const pats = expectArr(node[':patterns'] ?? [], ':patterns');
+        return {
+          op: 'bgp',
+          patterns: pats.map((p) => expectArr(p, ':patterns[]').map(ednTermToJson)),
+        };
+      }
       case 'filter':
         return { op: 'filter', expr: ednFilterToJson(node[':expr'], depth + 1), pattern: convert(node[':pattern'], depth + 1) };
       case 'join':
@@ -1208,29 +1225,38 @@ export function ednToAlgebra(edn, { maxQueryBytes = DEFAULT_SPARQL_LIMITS.maxQue
       case 'optional':
         return { op, left: convert(node[':left'], depth + 1), right: convert(node[':right'], depth + 1) };
       case 'project':
-        return { op: 'project', vars: (node[':vars'] ?? []).map(String), pattern: convert(node[':pattern'], depth + 1) };
+        return { op: 'project', vars: expectArr(node[':vars'] ?? [], ':vars').map(String), pattern: convert(node[':pattern'], depth + 1) };
       case 'distinct':
         return { op: 'distinct', pattern: convert(node[':pattern'], depth + 1) };
       case 'order-by': {
-        const descSet = new Set((node[':desc']?.$ednSet ?? node[':desc'] ?? []).map(String));
+        const descRaw = node[':desc'] === undefined ? [] : (Array.isArray(node[':desc']?.$ednSet) ? node[':desc'].$ednSet : expectArr(node[':desc'], ':desc'));
+        const descSet = new Set(descRaw.map(String));
         return {
           op: 'order-by',
-          keys: (node[':vars'] ?? []).map((v) => ({ var: String(v), desc: descSet.has(String(v)) })),
+          keys: expectArr(node[':vars'] ?? [], ':vars').map((v) => ({ var: String(v), desc: descSet.has(String(v)) })),
           pattern: convert(node[':pattern'], depth + 1),
         };
       }
-      case 'group':
+      case 'group': {
+        const byArr = expectArr(node[':by'] ?? [], ':by').map(String);
+        const aggsArr = expectArr(node[':aggregates'] ?? [], ':aggregates');
         return {
           op: 'group',
-          by: (node[':by'] ?? []).map(String),
-          aggregates: (node[':aggregates'] ?? []).map((a) => ({
-            fn: String(a[':fn']).replace(/^:/, ''),
-            arg: a[':arg'] === ':*' ? '*' : String(a[':arg']),
-            var: String(a[':var']),
-            distinct: Boolean(a[':distinct?']),
-          })),
+          by: byArr,
+          aggregates: aggsArr.map((a) => {
+            if (!a || typeof a !== 'object' || Array.isArray(a) || typeof a[':fn'] !== 'string') {
+              bad('edn-invalid-algebra', 'aggregate entry must be a map with :fn');
+            }
+            return {
+              fn: a[':fn'].replace(/^:/, ''),
+              arg: a[':arg'] === ':*' ? '*' : String(a[':arg']),
+              var: String(a[':var']),
+              distinct: Boolean(a[':distinct?']),
+            };
+          }),
           pattern: convert(node[':pattern'], depth + 1),
         };
+      }
       case 'slice':
         return {
           op: 'slice',

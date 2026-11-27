@@ -85,6 +85,7 @@ export const ONTOLOGY_OPERATIONS = Object.freeze([
         carBase64: { type: 'string', description: 'Optional base64 CAR when evaluating statelessly.' },
         maxNodes: { type: 'integer', minimum: 1, maximum: MAX_GRAPH_NODES, description: 'Maximum graph nodes returned (default 64, max 500).' },
         includeRdfSubjects: { type: 'boolean', description: 'Include standalone RDF subjects outside fact projections.' },
+        activeLayers: { type: 'array', items: { type: 'string' }, description: 'Optional layer allowlist (empty [] yields 0 nodes and 0 edges; omit/null for all layers).' },
       },
       additionalProperties: false,
     },
@@ -285,6 +286,7 @@ export const ONTOLOGY_OPERATIONS = Object.freeze([
         format: { type: 'string', enum: ['json', 'svg', 'html', 'all'], description: 'Output representation (default all).' },
         title: { type: 'string', description: 'Optional viewer title.' },
         maxNodes: { type: 'integer', minimum: 1, maximum: MAX_GRAPH_NODES, description: 'Maximum graph nodes rendered (default 64, max 500).' },
+        activeLayers: { type: 'array', items: { type: 'string' }, description: 'Optional layer allowlist (empty [] renders 0 nodes and 0 edges; omit/null for all layers).' },
         apiBase: { type: 'string', description: 'Relative base path for interactive viewer calls (default /ontology/v1).' },
       },
       additionalProperties: false,
@@ -359,6 +361,7 @@ export function renderOntologyViewer(snapshot, {
   format = 'all',
   title,
   maxNodes = 64,
+  activeLayers,
   apiBase = '/ontology/v1',
   sqlEndpoint = '/ontology/sql',
   sparqlEndpoint = '/ontology/sparql',
@@ -377,7 +380,7 @@ export function renderOntologyViewer(snapshot, {
   assertSafeEndpointPath(graphEndpoint, 'graphEndpoint');
 
   const inspection = inspectOntology(snapshot);
-  const graph = buildOntologyGraph(snapshot, { maxNodes: boundNodes });
+  const graph = buildOntologyGraph(snapshot, { maxNodes: boundNodes, ...(activeLayers !== undefined ? { activeLayers } : {}) });
   const semanticSchema = getOntologySchema();
   const viewModel = {
     basisCid: snapshot.basisCid,
@@ -399,6 +402,7 @@ export function renderOntologyViewer(snapshot, {
     out.html = renderOntologyHtml(snapshot, {
       title,
       maxNodes: boundNodes,
+      activeLayers,
       apiBase,
       sqlEndpoint,
       sparqlEndpoint,
@@ -493,14 +497,25 @@ export async function invokeOntologyOperation(operation, input = {}, context = {
     throw new OntologyError('missing-snapshot', 'provide carBase64, context.snapshot, or basisCid with a loader');
   }
 
+  if (input.basisCid !== undefined && input.basisCid !== null && typeof input.basisCid !== 'string') {
+    throw new OntologyError('invalid-input-type', `${operation}.basisCid must be a string`);
+  }
+  if (input.carBase64 !== undefined && typeof input.carBase64 !== 'string') {
+    throw new OntologyError('invalid-input-type', `${operation}.carBase64 must be a string`);
+  }
+
   let result;
   if (operation === 'ontology.graph') {
     const boundNodes = clampLimit(input.maxNodes, 64, MAX_GRAPH_NODES, 'maxNodes', OntologyError);
     const graph = buildOntologyGraph(snapshot, {
       maxNodes: boundNodes,
       includeRdfSubjects: Boolean(input.includeRdfSubjects),
+      ...(input.activeLayers !== undefined ? { activeLayers: input.activeLayers } : {}),
     });
     const { cid: graphCid } = encodeOntologyGraphDagCbor(graph);
+    if (typeof context.checkBlockCids === 'function') {
+      context.checkBlockCids([graphCid]);
+    }
     result = { ...graph, graphCid };
   } else if (operation === 'ontology.verify') {
     result = {
@@ -514,6 +529,7 @@ export async function invokeOntologyOperation(operation, input = {}, context = {
   } else if (operation === 'ontology.inspect') {
     result = inspectOntology(snapshot);
   } else if (operation === 'ontology.query_sql') {
+    if (typeof input.query !== 'string') throw new OntologyError('invalid-input-type', 'ontology.query_sql.query must be a string');
     // context.sqlLimits acts as the hard upper bound; input.limits can ONLY tighten below it.
     const hardLimits = { ...DEFAULT_SQL_LIMITS, ...(context.sqlLimits ?? {}) };
     result = executeSql(snapshot, input.query, {
@@ -525,6 +541,15 @@ export async function invokeOntologyOperation(operation, input = {}, context = {
       limits: input.limits,
     });
   } else if (operation === 'ontology.query_sparql') {
+    if (input.query !== undefined && typeof input.query !== 'string') {
+      throw new OntologyError('invalid-input-type', 'ontology.query_sparql.query must be a string');
+    }
+    if (input.algebraEdn !== undefined && typeof input.algebraEdn !== 'string') {
+      throw new OntologyError('invalid-input-type', 'ontology.query_sparql.algebraEdn must be a string');
+    }
+    if (input.algebra !== undefined && (input.algebra === null || typeof input.algebra !== 'object' || Array.isArray(input.algebra))) {
+      throw new OntologyError('invalid-input-type', 'ontology.query_sparql.algebra must be an object');
+    }
     const hasQuery = typeof input.query === 'string';
     const hasEdn = typeof input.algebraEdn === 'string';
     const hasAlg = input.algebra && typeof input.algebra === 'object';
@@ -548,6 +573,7 @@ export async function invokeOntologyOperation(operation, input = {}, context = {
       format: input.format ?? 'all',
       title: input.title,
       maxNodes: boundNodes,
+      ...(input.activeLayers !== undefined ? { activeLayers: input.activeLayers } : {}),
       apiBase: input.apiBase ?? '/ontology/v1',
     });
   }

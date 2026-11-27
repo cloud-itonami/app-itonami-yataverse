@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,8 +16,10 @@ import { executeSql, SqlError } from '../src/ontology-sql.mjs';
 import { executeSparql, compileLinearRegex, SparqlError } from '../src/ontology-sparql.mjs';
 import {
   buildOntologyGraph,
+  encodeOntologyGraphDagCbor,
   renderOntologyHtml,
   safeJsonScript,
+  createDefaultOntologySnapshot,
 } from '../src/ontology-viz.mjs';
 import { invokeOntologyOperation } from '../src/ontology-viewer.mjs';
 import { main as cliMain } from '../src/cli.mjs';
@@ -567,4 +570,146 @@ test('L-1/L-2/L-3: child link codec enforcement, strict CSP without unsafe-inlin
     const tool = TOOLS.find((t) => t.name === toolName);
     assert.match(tool.description, /network/i, `${toolName} should mention network gateway fetch`);
   }
+});
+
+// --- N-1, N-2, N-3 & G2 activeLayers:[] Consistency ---
+
+test('N-1/N-2/N-3: malformed-type EDN/build return 400 (never 502), POST ontology.graph checks derived graphCid 451, REGEX s flag works, CSP SHA-256 matches inline script', async () => {
+  const s = fakeStore();
+  const deps = { fetchImpl: s.fetchImpl, now: NOW };
+  const env = { ...ENV, MAX_BLOCK_BYTES: '65536' };
+
+  // N-1: malformed-type ontology.build inputs -> 400 (never TypeError -> 502)
+  for (const badBody of [
+    { objectTypes: 123 },
+    { connectors: { bad: true } },
+    { facts: 'not-an-array' },
+    { quads: 42 },
+    { joinMappings: 'nope' },
+    { pinnedContexts: 99 },
+    { objectTypes: [{ id: 'custom', key: 'not-array' }] },
+  ]) {
+    const res = await workerHandle(
+      new Request('https://yataverse.com/ontology/v1/ops/ontology.build', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(badBody),
+      }),
+      env,
+      deps,
+    );
+    assert.equal(res.status, 400, `expected 400 for build body ${JSON.stringify(badBody)}`);
+  }
+
+  // N-1: malformed-type EDN inputs -> 400 (never TypeError -> 502)
+  for (const badEdn of [
+    '{:sparql/op :bgp :patterns 123}',
+    '{:sparql/op :bgp :patterns [123]}',
+    '{:sparql/op :project :vars 999 :pattern {:sparql/op :bgp :patterns []}}',
+    '{:sparql/op :group :by [] :aggregates [123] :pattern {:sparql/op :bgp :patterns []}}',
+    '{:sparql/op :filter :expr [:and ?x] :pattern {:sparql/op :bgp :patterns []}}',
+  ]) {
+    const res = await workerHandle(
+      new Request('https://yataverse.com/ontology/sparql', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ algebraEdn: badEdn }),
+      }),
+      env,
+      deps,
+    );
+    assert.equal(res.status, 400, `expected 400 for EDN ${badEdn}`);
+  }
+
+  // N-2: POST /ontology/v1/ops/ontology.graph enforces READ_DENY_CIDS on derived graphCid alone -> 451
+  const snap = buildOntologySnapshot(securityFixtureSpec());
+  const { cid: derivedGraphCid } = encodeOntologyGraphDagCbor(buildOntologyGraph(snap));
+  const deniedGraphOp = await workerHandle(
+    new Request('https://yataverse.com/ontology/v1/ops/ontology.graph', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ carBase64: Buffer.from(snap.carBytes).toString('base64') }),
+    }),
+    { ...env, READ_DENY_CIDS: derivedGraphCid },
+    deps,
+  );
+  assert.equal(deniedGraphOp.status, 451);
+
+  // N-3: compileLinearRegex dotAll 's' flag
+  assert.equal(compileLinearRegex('a.b').test('a\nb'), false);
+  assert.equal(compileLinearRegex('a.b', 's').test('a\nb'), true);
+  assert.equal(compileLinearRegex('a.b', 'is').test('A\nB'), true);
+
+  const nlSnap = buildOntologySnapshot({
+    facts: [{ id: 'nl1', connectorId: 'jp.kkj', status: 'open', title: 'line1\nline2' }],
+  });
+  const noS = executeSparql(
+    nlSnap,
+    `PREFIX onto: <${DEFAULT_BASE_IRI}> SELECT ?t WHERE { ?s onto:title ?t . FILTER(REGEX(?t, "line1.line2")) }`,
+  );
+  assert.equal(noS.rowCount, 0);
+  const withS = executeSparql(
+    nlSnap,
+    `PREFIX onto: <${DEFAULT_BASE_IRI}> SELECT ?t WHERE { ?s onto:title ?t . FILTER(REGEX(?t, "line1.line2", "s")) }`,
+  );
+  assert.equal(withS.rowCount, 1);
+
+  // Verify VIEWER_CSP script-src sha256 matches the actual <script> tag body in GET /ontology/viewer HTML
+  const viewerRes = await workerHandle(new Request('https://yataverse.com/ontology/viewer'), env, deps);
+  assert.equal(viewerRes.status, 200);
+  const csp = viewerRes.headers.get('content-security-policy');
+  const html = await viewerRes.text();
+  const scriptMatch = /<script>([\s\S]*?)<\/script>\s*<\/body>/.exec(html);
+  assert.ok(scriptMatch, 'viewer HTML missing inline <script>');
+  const actualSha = crypto.createHash('sha256').update(scriptMatch[1], 'utf8').digest('base64');
+  assert.ok(csp.includes(`'sha256-${actualSha}'`), `CSP ${csp} did not match script sha256 ${actualSha}`);
+});
+
+test('G2 activeLayers: [] yields 0 nodes / 0 edges consistently across buildOntologyGraph, ontology.graph, ontology.view, and Worker routes', async () => {
+  const seeded = createDefaultOntologySnapshot();
+  const allGraph = buildOntologyGraph(seeded);
+  const nullGraph = buildOntologyGraph(seeded, { activeLayers: null });
+  assert.equal(allGraph.nodeCount, 9);
+  assert.equal(nullGraph.nodeCount, 9);
+
+  // Empty array activeLayers: [] -> 0 nodes, 0 edges (distinct from undefined/null!)
+  const emptyGraph = buildOntologyGraph(seeded, { activeLayers: [] });
+  assert.equal(emptyGraph.nodeCount, 0);
+  assert.equal(emptyGraph.nodes.length, 0);
+  assert.equal(emptyGraph.edges.length, 0);
+  assert.equal(emptyGraph.meta.nodeCount, 0);
+  assert.equal(emptyGraph.meta.edgeCount, 0);
+
+  // Agent/API operations: ontology.graph & ontology.view with activeLayers: []
+  const opGraph = await invokeOntologyOperation('ontology.graph', { activeLayers: [] }, { snapshot: seeded });
+  assert.equal(opGraph.result.nodeCount, 0);
+  assert.equal(opGraph.result.nodes.length, 0);
+  assert.equal(opGraph.result.edges.length, 0);
+
+  const opView = await invokeOntologyOperation('ontology.view', { activeLayers: [], format: 'all' }, { snapshot: seeded });
+  assert.equal(opView.result.viewModel.graph.nodeCount, 0);
+  assert.equal(opView.result.viewModel.graph.edges.length, 0);
+  assert.ok(!opView.result.svg.includes('class="yv-node"'));
+  const stMatch = /id="yataverse-screen-state">([\s\S]*?)<\/script>/.exec(opView.result.html);
+  assert.ok(stMatch);
+  const st = JSON.parse(stMatch[1]);
+  assert.deepEqual(st.activeLayers, []);
+  assert.equal(st.visibleNodeCount, 0);
+  assert.equal(st.visibleEdgeCount, 0);
+  assert.equal(st.selectedNodeId, null);
+
+  // Worker GET /ontology/graph?activeLayers= & GET /ontology/viewer?activeLayers= match
+  const s = fakeStore();
+  const deps = { fetchImpl: s.fetchImpl, now: NOW };
+  const wGraph = await workerHandle(new Request('https://yataverse.com/ontology/graph?activeLayers='), ENV, deps);
+  assert.equal(wGraph.status, 200);
+  const wGraphJson = await wGraph.json();
+  assert.equal(wGraphJson.result.nodeCount, 0);
+  assert.equal(wGraphJson.result.edges.length, 0);
+
+  const wViewer = await workerHandle(new Request('https://yataverse.com/ontology/viewer?activeLayers='), ENV, deps);
+  assert.equal(wViewer.status, 200);
+  const wHtml = await wViewer.text();
+  assert.match(wHtml, /data-active-layers=""/);
+  assert.ok(!wHtml.includes('class="yv-node"'));
 });
