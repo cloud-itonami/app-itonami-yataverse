@@ -306,7 +306,7 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
   - **未確認・未実装:** 本物の B2 bucket に対しては一度も実行していない。HEAD の応答に lock の header（`x-amz-object-lock-mode`、`x-amz-object-lock-retain-until-date`）が含まれるか、どの鍵の権限が要るかは、bucket を作ってから確かめる。状態と根拠の公開（§6 の endpoint）、定期実行、検証役を別の主体として動かす運用は未実装で、command は結果を出力するだけである。
 - **S1-2a Object Lock の有効化と実測（[AWAI-3673](https://linear.app/kotobalabs/issue/AWAI-3673)、2026-11-21）:** owner の承認を得て、`yataverse-blocks` で Object Lock を有効にした（`b2_update_bucket` の `fileLockEnabled: true`、revision 2 → 3）。既定の保持期間は設定していない。この操作は戻せない。
   - **有効化の前後:** 複製の設定なし、lifecycle rule なし、暗号化 SSE-B2 は変わらない。有効化の後も、yataverse.com 経由の既存 block の読み出しと、既に書いた内容の再書き込みは成功した（受領証は従来どおり `storeClass 1`、`retentionUntil` 0）。
-  - **試験ファイル:** `retention-test/bafkreifvebjgohuatxem7xjaczvxcrcr6zitxu3dohi6s6jgvbqdgaz3pa`（50 bytes）を compliance、期限 2026-11-22T06:21:50Z で置いた。期限まで消せないので、期限の後に消す。
+  - **試験ファイル:** `retention-test/bafkreifvebjgohuatxem7xjaczvxcrcr6zitxu3dohi6s6jgvbqdgaz3pa`（50 bytes）を compliance、期限 2026-11-22T06:21:50Z で置いた。期限まで消せないので、期限の後に消す。（2026-11-27T04:15:32Z 追記: Decision 承認（item 48）のもと、事前の一覧確認（2 件・50/51 bytes・retainUntil 過去・legal hold なし）のうえ `b2_delete_file_version` を version 指定・`bypassGovernance` なしで実行し、`retention-test/` の version 一覧が 0 件であることを同時刻に確認済み。削除した version ID: `4_z3d597f561c90ebaaa1120518_f103dc9f7960d4534_d20261121_m052051_c004_v0402026_t0017_u01795238451725`（50 bytes）、`4_z3d597f561c90ebaaa1120518_f102310e508092aad_d20261121_m053226_c004_v0402031_t0034_u01795239146411`（51 bytes）。）
   - **lock の実測（master key で実行）:** その version の削除は拒否された（`bypassGovernance` を付けても同じ）。期限の短縮、governance への変更、lock の解除も拒否された。期限の延長は成功した。
   - **version についての発見（設計に影響する）:**
     - 同じ名前に lock なしで書き直すと、lock のない新しい version ができ、名前での参照はその新しい version を返す。lock された古い version は残る。入口は再送のたびに保存をやり直すので、lock をかけた後に同じ block が書き直されると、名前で見た lock は「なし」になる。
@@ -335,7 +335,7 @@ B2 は challenge に答える主体ではないので、PoSt は使わない。�
   - **native API での確認:** その version は `compliance`、期限 2026-11-22T06:32:25Z。master key での削除は拒否された。
   - **見つかったこと: 入口の通常の鍵には `listFiles` が要る。（訂正 2026-11-21、AWAI-3754: 要るのは `listBuckets` で、`listFiles` は効かない。下の「入口の鍵の絞り込み」を参照。）** 一覧の権限のない鍵では、存在しない object への GET と HEAD が 404 ではなく 403 になる。Worker は 404 を「まだ無い」と読むので（受領証の記録、policy の block）、403 では書込みが 502 で止まる。最初の試行は、通常の呼び出しにも lock 用の鍵を使ったためにここで止まった（何も保存されなかった）。入口の鍵をこの bucket だけに絞るときは、`listFiles` を含める。lock 用の鍵は、lock つきの PutObject と version を指した HEAD・GET にしか使わないので、`listFiles` は要らない。
   - **試験で使わなかった部分:** 通常の資格情報での呼び出し（受領証の記録と policy の block の読み書き）は、手元の memory で受けた。この部分は今の本番で動いている経路と同じ code である。
-  - **bucket に残っているもの:** `retention-test/` の下に、lock された試験ファイルが 2 件（50 bytes、期限 2026-11-22T06:21:50Z。51 bytes、期限 2026-11-22T06:32:25Z）。期限の後に消す。lock のない試験用の object は bucket に書いていない。
+  - **bucket に残っているもの:** `retention-test/` の下に、lock された試験ファイルが 2 件（50 bytes、期限 2026-11-22T06:21:50Z。51 bytes、期限 2026-11-22T06:32:25Z）。期限の後に消す。lock のない試験用の object は bucket に書いていない。（2026-11-27T04:15:32Z 追記: 上記 2 件を事前確認のうえ version 指定・`bypassGovernance` なしで削除し、`b2_list_file_versions` で `retention-test/` が 0 件であることを同時刻に確認済み。）
   - **まだ無いもの:** Worker の deploy、本番の鍵の一覧への保持用の署名鍵と検証役の鍵の追加、検証役の定期実行と状態の公開、lease つきの書込みを行う CLI の command。
 - **S1-4 利用者側の command（[AWAI-3679](https://linear.app/kotobalabs/issue/AWAI-3679)）:** §11 の使い方を CLI に入れた。
   - `yataverse retention-keygen <file>`: 要求者または検証役の Ed25519 鍵を作る。秘密鍵は file にだけ置き（所有者だけが読める、既存の file は上書きしない）、keyId と公開鍵を表示する。
