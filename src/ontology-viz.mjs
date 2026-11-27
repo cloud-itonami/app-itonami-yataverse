@@ -13,7 +13,7 @@
 //
 // Zero external UI frameworks; pure semantic HTML5 + minimal inline CSS/JS; read-only & fail-closed.
 
-import { cidFor, CODEC_DAG_CBOR } from './cid.mjs';
+import { cidFor, parseCid, CODEC_DAG_CBOR, SHA2_256 } from './cid.mjs';
 import { encodeDagCbor } from './dag-cbor.mjs';
 import {
   buildOntologySnapshot,
@@ -360,8 +360,17 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
     return true;
   };
 
+  // Canonical input ordering (independent of caller array order):
+  // connectors by id, objectTypes by id, facts by (ontology/type, id), joins by name.
+  const sortedConnectors = [...snapshot.registry.connectors].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const sortedObjectTypes = [...snapshot.registry.objectTypes].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const sortedFacts = [...snapshot.facts].sort((a, b) => {
+    const t = String(a['ontology/type']).localeCompare(String(b['ontology/type']));
+    return t !== 0 ? t : String(a.id).localeCompare(String(b.id));
+  });
+
   // Layer 1: Connectors
-  for (const c of snapshot.registry.connectors) {
+  for (const c of sortedConnectors) {
     addNode(`connector:${c.id}`, c.id, 'connector', {
       name: c.name,
       objectType: c.objectType,
@@ -371,7 +380,7 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
   }
 
   // Layer 2: Object Types
-  for (const t of snapshot.registry.objectTypes) {
+  for (const t of sortedObjectTypes) {
     addNode(`type:${t.id}`, t.id, 'object-type', {
       name: t.name,
       requiredAttributes: Object.keys(t.attributes).sort(),
@@ -380,7 +389,7 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
   }
 
   // Connector -> ObjectType provenance edges
-  for (const c of snapshot.registry.connectors) {
+  for (const c of sortedConnectors) {
     addEdge(`connector:${c.id}`, `type:${c.objectType}`, 'produces', 'provenance', {
       connectorId: c.id,
       objectType: c.objectType,
@@ -388,7 +397,7 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
   }
 
   // External join coverage + ObjectType <-> ObjectType join edges
-  const joins = computeJoinCoverage(snapshot);
+  const joins = computeJoinCoverage(snapshot).sort((a, b) => String(a.name).localeCompare(String(b.name)));
   for (const j of joins) {
     addEdge(`type:${j.leftType}`, `type:${j.rightType}`, `${j.name} (${j.leftKey}=${j.rightKey})`, 'join', {
       joinName: j.name,
@@ -400,7 +409,7 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
 
   // Layer 3: Facts (only keep references to facts actually added into nodeMap)
   const includedFacts = [];
-  for (const f of snapshot.facts) {
+  for (const f of sortedFacts) {
     if (nodes.length >= boundNodes) break;
     const typeId = f['ontology/type'];
     const nid = `fact:${typeId}:${f.id}`;
@@ -536,22 +545,96 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
   };
 }
 
-/** Encode a canonical OntologyGraph to canonical DAG-CBOR bytes and compute its CIDv1 (sha2-256). */
+/**
+ * Strip the outer self-referential `graphCid` envelope field (if present) so the canonical
+ * DAG-CBOR payload hashes the exact `yataverse.ontology.graph/v1` body including array order
+ * of `layers`, `nodes`, `edges`, and `joins`.
+ */
+function canonicalGraphPayload(graph) {
+  if (!graph || typeof graph !== 'object' || Array.isArray(graph)) {
+    throw new OntologyError('invalid-graph', 'graph must be an object');
+  }
+  if (!Object.hasOwn(graph, 'graphCid')) return graph;
+  const copy = {};
+  for (const [k, v] of Object.entries(graph)) {
+    if (k === 'graphCid') continue;
+    copy[k] = v;
+  }
+  return copy;
+}
+
+/**
+ * Encode a canonical `yataverse.ontology.graph/v1` object to canonical DAG-CBOR bytes and compute
+ * its CIDv1 (`dag-cbor`, `sha2-256`).
+ *
+ * Canonical contract: array order of `layers`, `nodes`, `edges` (`e1, e2, ..., eN` sequential
+ * numeric order), and `joins` is part of the hashed DAG-CBOR byte stream. Any reordering produces
+ * different canonical bytes and a different `graphCid`.
+ */
 export function encodeOntologyGraphDagCbor(graph) {
-  const bytes = encodeDagCbor(toDagCborSafe(graph));
+  const bytes = encodeDagCbor(toDagCborSafe(canonicalGraphPayload(graph)));
   const cid = cidFor(bytes, CODEC_DAG_CBOR);
   return { cid, bytes };
+}
+
+/**
+ * Verify a `yataverse.ontology.graph/v1` object against its declared `graphCid` (and/or caller
+ * `expectedGraphCid`). Fails closed on missing CID, invalid CID shape/codec, schema mismatch,
+ * or digest mismatch (including any array reordering such as `e1, e10, ...` vs `e1, e2, ...`).
+ */
+export function verifyOntologyGraphCid(graph, { expectedGraphCid = null } = {}) {
+  if (!graph || typeof graph !== 'object' || Array.isArray(graph)) {
+    throw new OntologyError('invalid-graph', 'graph must be an object');
+  }
+  if (graph.schema !== ONTOLOGY_GRAPH_SCHEMA || graph.version !== 1) {
+    throw new OntologyError('invalid-graph-schema', String(graph.schema));
+  }
+  if (!Array.isArray(graph.layers) || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges) || !Array.isArray(graph.joins)) {
+    throw new OntologyError('invalid-graph', 'graph requires layers, nodes, edges, and joins arrays');
+  }
+  const declaredCid = graph.graphCid ?? null;
+  if (!declaredCid && !expectedGraphCid) {
+    throw new OntologyError('missing-graph-cid', 'graphCid or expectedGraphCid is required for verification');
+  }
+  const checkCidShape = (c, label) => {
+    const parsed = parseCid(c);
+    if (!parsed || parsed.version !== 1 || parsed.codec !== CODEC_DAG_CBOR || parsed.hashCode !== SHA2_256) {
+      throw new OntologyError('invalid-graph-cid', `${label}: ${String(c)}`);
+    }
+  };
+  if (declaredCid) checkCidShape(declaredCid, 'graphCid');
+  if (expectedGraphCid) checkCidShape(expectedGraphCid, 'expectedGraphCid');
+
+  const { cid: computedCid, bytes } = encodeOntologyGraphDagCbor(graph);
+  if (declaredCid && declaredCid !== computedCid) {
+    throw new OntologyError('graph-cid-mismatch', `declared ${declaredCid} !== computed ${computedCid}`);
+  }
+  if (expectedGraphCid && expectedGraphCid !== computedCid) {
+    throw new OntologyError('graph-cid-mismatch', `expected ${expectedGraphCid} !== computed ${computedCid}`);
+  }
+  return { verified: true, graphCid: computedCid, bytes, graph };
 }
 
 /**
  * Deterministic, standalone, XSS-safe SVG graph renderer for an OntologySnapshot or OntologyGraph.
  * Standalone SVGs omit interactive role="button" / tabindex attributes unless `interactive: true`
  * is explicitly passed by an interactive HTML host.
+ * When passed an external `yataverse.ontology.graph/v1` carrying `graphCid` (or `expectedGraphCid`),
+ * verifies `graphCid` via `verifyOntologyGraphCid` (fail-closed) before rendering.
  */
-export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64, interactive = false } = {}) {
-  const graph = snapshotOrGraph?.schema === ONTOLOGY_GRAPH_SCHEMA
-    ? snapshotOrGraph
-    : buildOntologyGraph(snapshotOrGraph, { maxNodes });
+export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64, interactive = false, expectedGraphCid = null } = {}) {
+  let graph;
+  if (snapshotOrGraph?.schema === ONTOLOGY_GRAPH_SCHEMA) {
+    if (snapshotOrGraph.graphCid !== undefined || expectedGraphCid !== null) {
+      verifyOntologyGraphCid(snapshotOrGraph, { expectedGraphCid });
+    }
+    graph = snapshotOrGraph;
+  } else {
+    graph = buildOntologyGraph(snapshotOrGraph, { maxNodes });
+    if (expectedGraphCid !== null) {
+      verifyOntologyGraphCid(graph, { expectedGraphCid });
+    }
+  }
 
   const cols = { connector: 120, 'object-type': 420, fact: 740, 'rdf-subject': 1020 };
   const hasRdfLayer = graph.nodes.some((n) => n.layer === 'rdf-subject');

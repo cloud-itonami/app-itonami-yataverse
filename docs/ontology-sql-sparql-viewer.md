@@ -51,6 +51,28 @@ Reference fixture: [`test/fixtures/ontology-graph-v1.json`](../test/fixtures/ont
 | `joins` | `array` | External join coverage `{ name, leftType, rightType, leftKey, rightKey, kind, leftCount, rightCount, matchedLeft, matchedRows, coverageRatio }` |
 | `coverage` | `object` | `{ byConnector, byObjectType, byJurisdiction, totalJoins, totalMatchedJoinRows }` |
 
+### Canonical Array Ordering & `graphCid` Verification Contract
+
+`graphCid` is the **CIDv1 (`dag-cbor` `0x71`, `sha2-256`)** of the canonical DAG-CBOR encoding of the `yataverse.ontology.graph/v1` body (excluding the outer `graphCid` field itself). Because DAG-CBOR encodes arrays in exact element order, **the array ordering of `layers`, `nodes`, `edges`, and `joins` is cryptographically bound into `graphCid`**:
+
+1. **`layers`**: fixed ascending `order`: `connector` (`0`), `object-type` (`1`), `fact` (`2`), optional `rdf-subject` (`3`).
+2. **`nodes`**: grouped by layer order:
+   - `connector`: sorted lexicographically by connector `id`
+   - `object-type`: sorted lexicographically by object type `id`
+   - `fact`: sorted by `(ontology/type, id)`
+   - `rdf-subject` (optional): encounter order of sorted snapshot quads
+3. **`edges`**: sequential numeric IDs `e1`, `e2`, ..., `eN` (integer order matching array index `i + 1`, **never** lexicographical `e1, e10, ...`):
+   - Connector provenance edges (`connector -> object-type`, `produces`) in connector `id` order
+   - Schema join edges (`object-type -> object-type`, `join`) in `joinMappings` `name` order
+   - Fact edges (`fact -> object-type` `instance`, immediately followed by `fact -> connector` `provenance`) in fact `(ontology/type, id)` order
+   - Fact-to-fact `join-instance` edges in `joinMappings` `name` order, then included left-fact order, then included right-fact order
+4. **`joins`**: sorted lexicographically by join `name`.
+
+**Fail-closed verification (`verifyOntologyGraphCid`)**:
+- Any external consumer/renderer receiving a `yataverse.ontology.graph/v1` payload carrying `graphCid` MUST verify that `encodeOntologyGraphDagCbor(graph).cid === graph.graphCid` (automatically enforced by `verifyOntologyGraphCid` and `renderOntologySvg`).
+- Reordering any array (for example sorting `edges` lexicographically as `e1, e10, e11, ..., e2`) while retaining the original `graphCid` MUST fail closed with `OntologyError('graph-cid-mismatch')`.
+- Reference fixture `test/fixtures/ontology-graph-v1.json` binds `basisCid = bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em` to `graphCid = bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq`.
+
 Standalone SVG output (`renderOntologySvg` with default `interactive: false`) omits `role="button"` and `tabindex` on static graph nodes; interactive keyboard/button roles are emitted only inside the interactive Viewer HTML (`interactive: true`).
 
 All viewer and API actions follow the `noun.verb` contract with machine-readable JSON Schemas (`src/ontology-viewer.mjs`):

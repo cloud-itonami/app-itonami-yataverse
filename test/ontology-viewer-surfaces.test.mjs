@@ -7,6 +7,7 @@ import { buildOntologySnapshot, DEFAULT_BASE_IRI } from '../src/ontology.mjs';
 import {
   buildOntologyGraph,
   encodeOntologyGraphDagCbor,
+  verifyOntologyGraphCid,
   renderOntologySvg,
   renderYataverseHomeHtml,
   createDefaultOntologySnapshot,
@@ -129,10 +130,49 @@ test('Semantic UI contract: noun.verb operations, schemas, XSS-safe viewer, and 
 
   // Kotoba PR #1383 compatibility: exact match against checked-in canonical fixture & 7 operations
   const fixture = JSON.parse(fs.readFileSync(path.resolve('test/fixtures/ontology-graph-v1.json'), 'utf8'));
+  const EXPECTED_FIXTURE_GRAPH_CID = 'bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq';
   const seededSnap = createDefaultOntologySnapshot();
   const seededGraph = buildOntologyGraph(seededSnap);
-  const { cid: seededGraphCid } = encodeOntologyGraphDagCbor(seededGraph);
+  const { cid: seededGraphCid, bytes: seededGraphBytes } = encodeOntologyGraphDagCbor(seededGraph);
+  assert.equal(seededGraphCid, EXPECTED_FIXTURE_GRAPH_CID);
+  assert.equal(fixture.graphCid, EXPECTED_FIXTURE_GRAPH_CID);
   assert.deepEqual({ ...seededGraph, graphCid: seededGraphCid }, fixture);
+  // Edges are in strict sequential numeric order e1, e2, ..., e14 (not lexicographical e1, e10, ...)
+  assert.deepEqual(
+    fixture.edges.map((e) => e.id),
+    Array.from({ length: fixture.edges.length }, (_, i) => `e${i + 1}`),
+  );
+  // encodeOntologyGraphDagCbor on fixture (with outer graphCid present) yields identical canonical bytes & CID
+  const fromFixture = encodeOntologyGraphDagCbor(fixture);
+  assert.equal(fromFixture.cid, EXPECTED_FIXTURE_GRAPH_CID);
+  assert.deepEqual(fromFixture.bytes, seededGraphBytes);
+  assert.equal(checkWritableBlock(fromFixture.cid, fromFixture.bytes), null);
+  const verifiedFixture = verifyOntologyGraphCid(fixture);
+  assert.equal(verifiedFixture.verified, true);
+  assert.equal(verifiedFixture.graphCid, EXPECTED_FIXTURE_GRAPH_CID);
+  // Rendering external fixture SVG succeeds when graphCid matches
+  const fixtureSvg = renderOntologySvg(fixture);
+  assert.match(fixtureSvg, /^<svg /);
+
+  // Negative: reordering edges lexicographically (e1, e10, e11, ..., e2) while keeping stale graphCid MUST fail closed
+  const lexReorderedFixture = {
+    ...fixture,
+    edges: [...fixture.edges].sort((a, b) => a.id.localeCompare(b.id)),
+  };
+  assert.equal(lexReorderedFixture.edges[1].id, 'e10');
+  assert.notEqual(encodeOntologyGraphDagCbor(lexReorderedFixture).cid, EXPECTED_FIXTURE_GRAPH_CID);
+  assert.throws(
+    () => verifyOntologyGraphCid(lexReorderedFixture),
+    (e) => e.code === 'graph-cid-mismatch',
+  );
+  assert.throws(
+    () => renderOntologySvg(lexReorderedFixture),
+    (e) => e.code === 'graph-cid-mismatch',
+  );
+  assert.throws(
+    () => verifyOntologyGraphCid({ ...fixture, graphCid: undefined }),
+    (e) => e.code === 'missing-graph-cid',
+  );
   assert.deepEqual(
     ONTOLOGY_OPERATIONS.map((o) => o.operation).sort(),
     [
