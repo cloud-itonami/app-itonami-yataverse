@@ -62,9 +62,65 @@ export function safeJsonScript(obj) {
 export const VIEWER_CLIENT_SCRIPT = `
     (function () {
       var meta = JSON.parse(document.getElementById('yataverse-semantic-schema').textContent);
+      var stateEl = document.getElementById('yataverse-screen-state');
+      var screenState = stateEl ? JSON.parse(stateEl.textContent) : {
+        screenId: 'yataverse.ontology.viewer',
+        status: 'ready',
+        basisCid: meta.basisCid,
+        activeTab: 'graph',
+        selectedNodeId: null,
+        ops: (meta.schema && meta.schema.operations ? meta.schema.operations.map(function (o) { return o.operation; }) : []),
+      };
       var nodesById = Object.create(null);
       (meta.graph.nodes || []).forEach(function (n) { nodesById[n.id] = n; });
       var edges = meta.graph.edges || [];
+
+      function syncScreenState(patch) {
+        if (patch) {
+          Object.keys(patch).forEach(function (k) { screenState[k] = patch[k]; });
+        }
+        document.body.setAttribute('data-screen-id', String(screenState.screenId || ''));
+        document.body.setAttribute('data-status', String(screenState.status || ''));
+        document.body.setAttribute('data-active-tab', String(screenState.activeTab || ''));
+        document.body.setAttribute('data-selected-node-id', String(screenState.selectedNodeId || ''));
+        if (stateEl) stateEl.textContent = JSON.stringify(screenState);
+      }
+
+      var tabs = Array.prototype.slice.call(document.querySelectorAll('[role="tab"]'));
+      var panels = Array.prototype.slice.call(document.querySelectorAll('[role="tabpanel"]'));
+
+      function activateTab(tabName, shouldFocus) {
+        tabs.forEach(function (t) {
+          var active = t.getAttribute('data-tab') === tabName;
+          t.setAttribute('aria-selected', active ? 'true' : 'false');
+          t.setAttribute('tabindex', active ? '0' : '-1');
+          if (active && shouldFocus) t.focus();
+        });
+        panels.forEach(function (p) {
+          var active = p.getAttribute('data-tab-panel') === tabName;
+          p.hidden = !active;
+        });
+        syncScreenState({ activeTab: tabName });
+      }
+
+      var tablist = document.getElementById('yv-tablist');
+      if (tablist && tabs.length) {
+        tabs.forEach(function (t) {
+          t.addEventListener('click', function () { activateTab(t.getAttribute('data-tab'), false); });
+        });
+        tablist.addEventListener('keydown', function (ev) {
+          var idx = tabs.indexOf(document.activeElement);
+          if (idx < 0) return;
+          var nextIdx = idx;
+          if (ev.key === 'ArrowRight') nextIdx = (idx + 1) % tabs.length;
+          else if (ev.key === 'ArrowLeft') nextIdx = (idx - 1 + tabs.length) % tabs.length;
+          else if (ev.key === 'Home') nextIdx = 0;
+          else if (ev.key === 'End') nextIdx = tabs.length - 1;
+          else return;
+          ev.preventDefault();
+          activateTab(tabs[nextIdx].getAttribute('data-tab'), true);
+        });
+      }
 
       function showNode(id) {
         var n = Object.prototype.hasOwnProperty.call(nodesById, id) ? nodesById[id] : null;
@@ -75,6 +131,7 @@ export const VIEWER_CLIENT_SCRIPT = `
         var rel = edges.filter(function (e) { return e.from === id || e.to === id; });
         document.getElementById('yv-inspector-summary').textContent = n.layer + ' · ' + n.label + ' (' + rel.length + ' edges)';
         document.getElementById('yv-inspector-json').textContent = JSON.stringify({ node: n, edges: rel }, null, 2);
+        syncScreenState({ selectedNodeId: id });
       }
 
       document.querySelectorAll('.yv-node').forEach(function (el) {
@@ -84,6 +141,7 @@ export const VIEWER_CLIENT_SCRIPT = `
         });
       });
       if (meta.graph.nodes && meta.graph.nodes.length > 0) showNode(meta.graph.nodes[0].id);
+      syncScreenState({ status: 'ready' });
 
       function renderResultTable(container, columns, rows) {
         container.textContent = '';
@@ -117,6 +175,7 @@ export const VIEWER_CLIENT_SCRIPT = `
         if (!form) return;
         form.addEventListener('submit', async function (ev) {
           ev.preventDefault();
+          syncScreenState({ status: 'running' });
           out.textContent = 'Running ' + op + '...';
           try {
             var payload = { query: input.value };
@@ -133,8 +192,10 @@ export const VIEWER_CLIENT_SCRIPT = `
               tableEl.textContent = '';
             }
             out.textContent = JSON.stringify(data, null, 2);
+            syncScreenState({ status: res.ok ? 'ready' : 'error' });
           } catch (err) {
             out.textContent = 'Error: ' + String(err);
+            syncScreenState({ status: 'error' });
           }
         });
       }
@@ -441,12 +502,24 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
   ];
 
   const totalCandidates = snapshot.registry.objectTypes.length + snapshot.registry.connectors.length + snapshot.facts.length;
+  const truncated = totalCandidates > nodes.length || edgesTruncated;
   return {
     schema: ONTOLOGY_GRAPH_SCHEMA,
     version: 1,
     basisCid: snapshot.basisCid,
     id: snapshot.id,
     stats: snapshot.stats,
+    nodeCount: nodes.length,
+    meta: {
+      id: snapshot.id,
+      snapshotSchema: snapshot.schema,
+      stats: snapshot.stats,
+      nodeCount: nodes.length,
+      edgeCount: edges.length,
+      layerCount: layers.length,
+      truncated,
+      edgesTruncated,
+    },
     layers,
     nodes,
     edges,
@@ -458,7 +531,7 @@ export function buildOntologyGraph(snapshot, { maxNodes = 64, maxEdges, includeR
       totalJoins: joins.length,
       totalMatchedJoinRows: joins.reduce((s, j) => s + j.matchedRows, 0),
     },
-    truncated: totalCandidates > nodes.length || edgesTruncated,
+    truncated,
     edgesTruncated,
   };
 }
@@ -470,8 +543,12 @@ export function encodeOntologyGraphDagCbor(graph) {
   return { cid, bytes };
 }
 
-/** Deterministic, standalone, XSS-safe SVG graph renderer for an OntologySnapshot or OntologyGraph. */
-export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64 } = {}) {
+/**
+ * Deterministic, standalone, XSS-safe SVG graph renderer for an OntologySnapshot or OntologyGraph.
+ * Standalone SVGs omit interactive role="button" / tabindex attributes unless `interactive: true`
+ * is explicitly passed by an interactive HTML host.
+ */
+export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64, interactive = false } = {}) {
   const graph = snapshotOrGraph?.schema === ONTOLOGY_GRAPH_SCHEMA
     ? snapshotOrGraph
     : buildOntologyGraph(snapshotOrGraph, { maxNodes });
@@ -533,7 +610,10 @@ export function renderOntologySvg(snapshotOrGraph, { maxNodes = 64 } = {}) {
     const p = positions.get(n.id);
     const st = palette[n.layer] ?? { bg: '#ffffff', stroke: '#334155' };
     const text = n.label.length > 24 ? `${n.label.slice(0, 21)}...` : n.label;
-    parts.push(`<g class="yv-node" tabindex="0" role="button" aria-label="${escapeXml(n.label)}" data-node-id="${escapeXml(n.id)}" data-node-kind="${escapeXml(n.kind)}" data-layer="${escapeXml(n.layer)}">`);
+    const interactiveAttrs = interactive
+      ? ` tabindex="0" role="button" aria-label="${escapeXml(n.label)}"`
+      : '';
+    parts.push(`<g class="yv-node"${interactiveAttrs} data-node-id="${escapeXml(n.id)}" data-node-kind="${escapeXml(n.kind)}" data-layer="${escapeXml(n.layer)}">`);
     parts.push(`<rect x="${p.x - 92}" y="${p.y - 20}" width="184" height="40" rx="6" fill="${st.bg}" stroke="${st.stroke}" stroke-width="1.5"/>`);
     parts.push(`<text x="${p.x}" y="${p.y + 4}" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#0f172a">${escapeXml(text)}</text>`);
     parts.push('</g>');
@@ -563,11 +643,21 @@ export function renderOntologyHtml(snapshot, {
   assertSafeEndpointPath(graphEndpoint, 'graphEndpoint');
 
   const graph = buildOntologyGraph(snapshot, { maxNodes });
-  const svg = renderOntologySvg(graph, { maxNodes });
+  const svg = renderOntologySvg(graph, { maxNodes, interactive: true });
   const safeTitle = title ?? `Yataverse Ontology Viewer — ${snapshot.id}`;
   const defaultSqlTable = snapshot.registry.objectTypes[0]?.id ?? 'ontology_facts';
   const defaultSql = `SELECT * FROM ${defaultSqlTable} LIMIT 25`;
   const defaultSparql = 'SELECT ?s ?p ?o WHERE { ?s ?p ?o . } LIMIT 25';
+  const initialSelectedNodeId = graph.nodes[0]?.id ?? null;
+  const opsList = schema?.operations ?? [];
+  const initialScreenState = {
+    screenId: 'yataverse.ontology.viewer',
+    status: 'ready',
+    basisCid: snapshot.basisCid,
+    activeTab: 'graph',
+    selectedNodeId: initialSelectedNodeId,
+    ops: opsList.map((o) => o.operation),
+  };
 
   const typeRows = snapshot.registry.objectTypes.map((t) =>
     `<tr><td><code>${escapeXml(t.id)}</code></td><td>${escapeXml(t.name)}</td><td><code>${escapeXml(Object.keys(t.attributes).join(', '))}</code></td></tr>`
@@ -592,7 +682,6 @@ export function renderOntologyHtml(snapshot, {
     `<tr><td><code>${escapeXml(t.name)}</code></td><td>${t.rowCount}</td><td><code>${escapeXml(t.columns.join(', '))}</code></td></tr>`
   ).join('\n');
 
-  const opsList = schema?.operations ?? [];
   const opRows = opsList.map((op) =>
     `<tr><td><code>${escapeXml(op.operation)}</code></td><td>${escapeXml(op.noun)}</td><td>${escapeXml(op.verb)}</td><td>${op.readOnly ? 'read-only' : 'write'}</td><td>${escapeXml(op.summary)}</td></tr>`
   ).join('\n');
@@ -635,6 +724,9 @@ export function renderOntologyHtml(snapshot, {
     .yv-inline-form { display: flex; gap: 0.5rem; margin-top: 0.6rem; flex-wrap: wrap; }
     .yv-inline-form input[type="text"] { flex: 1 1 320px; }
     button { padding: 0.45rem 0.9rem; border: 1px solid var(--yv-accent); background: var(--yv-accent); color: #ffffff; border-radius: 6px; cursor: pointer; font-weight: 600; }
+    .yv-tablist { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.75rem 0; border-bottom: 1px solid var(--yv-border); padding-bottom: 0.5rem; }
+    .yv-tablist button[role="tab"] { background: var(--yv-surface); color: var(--yv-ink); border-color: var(--yv-border); }
+    .yv-tablist button[role="tab"][aria-selected="true"] { background: var(--yv-accent); color: #ffffff; border-color: var(--yv-accent); }
     pre { background: #0f172a; color: #e2e8f0; padding: 0.75rem; border-radius: 6px; overflow: auto; font-size: 0.8rem; max-height: 320px; }
     .yv-graph { overflow-x: auto; }
     .yv-node { cursor: pointer; }
@@ -645,19 +737,15 @@ export function renderOntologyHtml(snapshot, {
     .yv-result-table { margin-top: 0.6rem; overflow-x: auto; }
   </style>
 </head>
-<body data-basis-cid="${escapeXml(snapshot.basisCid)}" data-schema="${escapeXml(snapshot.schema)}">
+<body data-basis-cid="${escapeXml(snapshot.basisCid)}" data-schema="${escapeXml(snapshot.schema)}" data-screen-id="yataverse.ontology.viewer" data-status="ready" data-active-tab="graph" data-selected-node-id="${escapeXml(initialSelectedNodeId ?? '')}">
   <header>
     <h1>${escapeXml(safeTitle)}</h1>
     <div class="yv-meta">basisCid: <code>${escapeXml(snapshot.basisCid)}</code> · schema: <code>${escapeXml(snapshot.schema)}</code> · read-only${isSeededDefault ? ' · seeded kotoba.ontology demo' : ' · verified IPLD block closure'}</div>
     <nav aria-label="Viewer navigation">
       <a href="/">Home</a>
-      <a href="#graph">Graph &amp; Inspector</a>
-      <a href="#consoles">SQL &amp; SPARQL Console</a>
-      <a href="#joins">External Joins</a>
-      <a href="#registry">Registry &amp; Tables</a>
-      <a href="#operations">Semantic Operations</a>
       <a href="${escapeXml(graphUrl)}">Graph JSON</a>
       <a href="${escapeXml(graphCborUrl)}">Graph DAG-CBOR</a>
+      <a href="${escapeXml(apiBase)}/schema">Semantic Schema</a>
     </nav>
     <form class="yv-inline-form" method="get" action="${escapeXml(viewerPath)}" data-operation="ontology.view">
       <label for="yv-cid-input" style="position:absolute;width:1px;height:1px;overflow:hidden;">Load Ontology CID</label>
@@ -675,66 +763,85 @@ export function renderOntologyHtml(snapshot, {
       <article class="yv-card"><span>Join Mappings</span><strong>${snapshot.stats.joins}</strong></article>
     </div>
 
-    <div class="yv-split" id="graph">
-      <section aria-labelledby="graph-heading" data-operation="ontology.graph">
-        <h2 id="graph-heading">Ontology Graph (Click a node to inspect)</h2>
-        <div class="yv-graph">${svg}</div>
-      </section>
-      <aside aria-labelledby="inspector-heading" id="yv-node-inspector" data-operation="ontology.inspect">
-        <h2 id="inspector-heading">Node Detail Inspector</h2>
-        <p class="yv-meta" id="yv-inspector-summary">Select any connector, object type, or fact node in the graph.</p>
-        <pre id="yv-inspector-json">{}</pre>
-      </aside>
+    <div class="yv-tablist" role="tablist" aria-label="Ontology viewer panels" id="yv-tablist">
+      <button type="button" role="tab" id="yv-tab-graph" aria-selected="true" aria-controls="yv-panel-graph" tabindex="0" data-tab="graph">Graph &amp; Inspector</button>
+      <button type="button" role="tab" id="yv-tab-consoles" aria-selected="false" aria-controls="yv-panel-consoles" tabindex="-1" data-tab="consoles">SQL &amp; SPARQL Console</button>
+      <button type="button" role="tab" id="yv-tab-joins" aria-selected="false" aria-controls="yv-panel-joins" tabindex="-1" data-tab="joins">External Joins</button>
+      <button type="button" role="tab" id="yv-tab-registry" aria-selected="false" aria-controls="yv-panel-registry" tabindex="-1" data-tab="registry">Registry &amp; Tables</button>
+      <button type="button" role="tab" id="yv-tab-operations" aria-selected="false" aria-controls="yv-panel-operations" tabindex="-1" data-tab="operations">Semantic Operations</button>
     </div>
 
-    <div class="yv-console-grid" id="consoles">
-      <section aria-labelledby="sql-heading">
-        <h2 id="sql-heading">SQL Query Console (Read-Only)</h2>
-        <form data-operation="ontology.query_sql" id="yv-sql-form">
-          <label for="yv-sql-input">SQL SELECT (pinned to basisCid)</label>
-          <textarea id="yv-sql-input" name="query">${escapeXml(defaultSql)}</textarea>
-          <button type="submit">Run ontology.query_sql</button>
-        </form>
-        <div class="yv-result-table" id="yv-sql-table"></div>
-        <pre id="yv-sql-out" aria-live="polite">Submit a SQL SELECT query against ${escapeXml(snapshot.basisCid)}.</pre>
-      </section>
+    <div role="tabpanel" id="yv-panel-graph" aria-labelledby="yv-tab-graph" data-tab-panel="graph">
+      <div class="yv-split" id="graph">
+        <section aria-labelledby="graph-heading" data-operation="ontology.graph">
+          <h2 id="graph-heading">Ontology Graph (Click a node to inspect)</h2>
+          <div class="yv-graph">${svg}</div>
+        </section>
+        <aside aria-labelledby="inspector-heading" id="yv-node-inspector" data-operation="ontology.inspect">
+          <h2 id="inspector-heading">Node Detail Inspector</h2>
+          <p class="yv-meta" id="yv-inspector-summary">Select any connector, object type, or fact node in the graph.</p>
+          <pre id="yv-inspector-json">{}</pre>
+        </aside>
+      </div>
+    </div>
 
-      <section aria-labelledby="sparql-heading">
-        <h2 id="sparql-heading">SPARQL Query Console (Read-Only)</h2>
-        <form data-operation="ontology.query_sparql" id="yv-sparql-form">
-          <label for="yv-sparql-input">SPARQL (SELECT / ASK / CONSTRUCT / DESCRIBE)</label>
-          <textarea id="yv-sparql-input" name="query">${escapeXml(defaultSparql)}</textarea>
-          <button type="submit">Run ontology.query_sparql</button>
-        </form>
-        <div class="yv-result-table" id="yv-sparql-table"></div>
-        <pre id="yv-sparql-out" aria-live="polite">Submit a SPARQL query against ${escapeXml(snapshot.basisCid)}.</pre>
+    <div role="tabpanel" id="yv-panel-consoles" aria-labelledby="yv-tab-consoles" data-tab-panel="consoles" hidden>
+      <div class="yv-console-grid" id="consoles">
+        <section aria-labelledby="sql-heading">
+          <h2 id="sql-heading">SQL Query Console (Read-Only)</h2>
+          <form data-operation="ontology.query_sql" id="yv-sql-form">
+            <label for="yv-sql-input">SQL SELECT (pinned to basisCid)</label>
+            <textarea id="yv-sql-input" name="query">${escapeXml(defaultSql)}</textarea>
+            <button type="submit">Run ontology.query_sql</button>
+          </form>
+          <div class="yv-result-table" id="yv-sql-table"></div>
+          <pre id="yv-sql-out" aria-live="polite">Submit a SQL SELECT query against ${escapeXml(snapshot.basisCid)}.</pre>
+        </section>
+
+        <section aria-labelledby="sparql-heading">
+          <h2 id="sparql-heading">SPARQL Query Console (Read-Only)</h2>
+          <form data-operation="ontology.query_sparql" id="yv-sparql-form">
+            <label for="yv-sparql-input">SPARQL (SELECT / ASK / CONSTRUCT / DESCRIBE)</label>
+            <textarea id="yv-sparql-input" name="query">${escapeXml(defaultSparql)}</textarea>
+            <button type="submit">Run ontology.query_sparql</button>
+          </form>
+          <div class="yv-result-table" id="yv-sparql-table"></div>
+          <pre id="yv-sparql-out" aria-live="polite">Submit a SPARQL query against ${escapeXml(snapshot.basisCid)}.</pre>
+        </section>
+      </div>
+    </div>
+
+    <div role="tabpanel" id="yv-panel-joins" aria-labelledby="yv-tab-joins" data-tab-panel="joins" hidden>
+      <section id="joins" aria-labelledby="joins-heading">
+        <h2 id="joins-heading">External Join Coverage</h2>
+        <table>
+          <thead><tr><th>Join</th><th>Left</th><th>Right</th><th>Kind</th><th>Left / Right Rows</th><th>Matched</th><th>Coverage</th></tr></thead>
+          <tbody>${joinRows}</tbody>
+        </table>
       </section>
     </div>
 
-    <section id="joins" aria-labelledby="joins-heading">
-      <h2 id="joins-heading">External Join Coverage</h2>
-      <table>
-        <thead><tr><th>Join</th><th>Left</th><th>Right</th><th>Kind</th><th>Left / Right Rows</th><th>Matched</th><th>Coverage</th></tr></thead>
-        <tbody>${joinRows}</tbody>
-      </table>
-    </section>
+    <div role="tabpanel" id="yv-panel-registry" aria-labelledby="yv-tab-registry" data-tab-panel="registry" hidden>
+      <section id="registry" aria-labelledby="registry-heading" data-operation="ontology.inspect">
+        <h2 id="registry-heading">Vocabulary Registry &amp; Relational Tables</h2>
+        <h3>Object Types</h3>
+        <table><thead><tr><th>ID</th><th>Name</th><th>Required Attributes</th></tr></thead><tbody>${typeRows}</tbody></table>
+        <h3>Registered Connectors</h3>
+        <table><thead><tr><th>ID</th><th>Name</th><th>Object Type</th><th>Status</th></tr></thead><tbody>${connectorRows}</tbody></table>
+        <h3>Projected Tables</h3>
+        <table><thead><tr><th>Table</th><th>Rows</th><th>Columns</th></tr></thead><tbody>${tableRows}</tbody></table>
+      </section>
+    </div>
 
-    <section id="registry" aria-labelledby="registry-heading" data-operation="ontology.inspect">
-      <h2 id="registry-heading">Vocabulary Registry &amp; Relational Tables</h2>
-      <h3>Object Types</h3>
-      <table><thead><tr><th>ID</th><th>Name</th><th>Required Attributes</th></tr></thead><tbody>${typeRows}</tbody></table>
-      <h3>Registered Connectors</h3>
-      <table><thead><tr><th>ID</th><th>Name</th><th>Object Type</th><th>Status</th></tr></thead><tbody>${connectorRows}</tbody></table>
-      <h3>Projected Tables</h3>
-      <table><thead><tr><th>Table</th><th>Rows</th><th>Columns</th></tr></thead><tbody>${tableRows}</tbody></table>
-    </section>
-
-    <section id="operations" aria-labelledby="ops-heading">
-      <h2 id="ops-heading">Semantic UI Operations (noun.verb Contract)</h2>
-      <table><thead><tr><th>Operation</th><th>Noun</th><th>Verb</th><th>Mode</th><th>Summary</th></tr></thead><tbody>${opRows}</tbody></table>
-    </section>
+    <div role="tabpanel" id="yv-panel-operations" aria-labelledby="yv-tab-operations" data-tab-panel="operations" hidden>
+      <section id="operations" aria-labelledby="ops-heading">
+        <h2 id="ops-heading">Semantic UI Operations (noun.verb Contract)</h2>
+        <table><thead><tr><th>Operation</th><th>Noun</th><th>Verb</th><th>Mode</th><th>Summary</th></tr></thead><tbody>${opRows}</tbody></table>
+      </section>
+    </div>
   </main>
 
+  <script type="application/json" id="yataverse-screen-state">${safeJsonScript(initialScreenState)}</script>
   <script type="application/json" id="yataverse-semantic-schema">${safeJsonScript({
     basisCid: snapshot.basisCid,
     isSeededDefault,
@@ -753,8 +860,16 @@ export function renderOntologyHtml(snapshot, {
 /** Render the Yataverse root landing page (`GET /`) — zero executable script tags. */
 export function renderYataverseHomeHtml(defaultSnapshot, { schema } = {}) {
   const graph = buildOntologyGraph(defaultSnapshot, { maxNodes: 24 });
-  const previewSvg = renderOntologySvg(graph, { maxNodes: 24 });
+  const previewSvg = renderOntologySvg(graph, { maxNodes: 24, interactive: false });
   const ops = schema?.operations ?? [];
+  const homeScreenState = {
+    screenId: 'yataverse.home',
+    status: 'ready',
+    basisCid: defaultSnapshot.basisCid,
+    activeTab: null,
+    selectedNodeId: null,
+    ops: ops.map((o) => o.operation),
+  };
 
   return `<!doctype html>
 <html lang="en">
@@ -783,7 +898,7 @@ export function renderYataverseHomeHtml(defaultSnapshot, { schema } = {}) {
     .yv-graph { overflow-x: auto; }
   </style>
 </head>
-<body data-service="yataverse-bytes" data-default-basis-cid="${escapeXml(defaultSnapshot.basisCid)}">
+<body data-service="yataverse-bytes" data-default-basis-cid="${escapeXml(defaultSnapshot.basisCid)}" data-screen-id="yataverse.home" data-status="ready">
   <header>
     <h1>Yataverse</h1>
     <p class="lead">Verified content-addressed IPLD bytes plane (CIDv1 / DAG-CBOR / CARv1-v2 / signed storage receipts) and read-only Ontology SQL/SPARQL Viewer.</p>
@@ -823,6 +938,7 @@ export function renderYataverseHomeHtml(defaultSnapshot, { schema } = {}) {
     </section>
   </main>
 
+  <script type="application/json" id="yataverse-screen-state">${safeJsonScript(homeScreenState)}</script>
   <script type="application/json" id="yataverse-semantic-schema">${safeJsonScript({ service: 'yataverse-bytes', defaultBasisCid: defaultSnapshot.basisCid, schema })}</script>
 </body>
 </html>`;

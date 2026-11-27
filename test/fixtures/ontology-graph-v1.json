@@ -1,0 +1,363 @@
+{
+  "schema": "yataverse.ontology.graph/v1",
+  "version": 1,
+  "basisCid": "bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em",
+  "id": "yataverse-seeded-kotoba-ontology",
+  "stats": {
+    "objectTypes": 2,
+    "connectors": 3,
+    "facts": 4,
+    "quads": 34,
+    "joins": 1
+  },
+  "nodeCount": 9,
+  "meta": {
+    "id": "yataverse-seeded-kotoba-ontology",
+    "snapshotSchema": "yataverse.ontology.snapshot/v1",
+    "stats": {
+      "objectTypes": 2,
+      "connectors": 3,
+      "facts": 4,
+      "quads": 34,
+      "joins": 1
+    },
+    "nodeCount": 9,
+    "edgeCount": 14,
+    "layerCount": 3,
+    "truncated": false,
+    "edgesTruncated": false
+  },
+  "layers": [
+    {
+      "id": "connector",
+      "label": "Connectors",
+      "order": 0,
+      "nodeCount": 3
+    },
+    {
+      "id": "object-type",
+      "label": "Object Types",
+      "order": 1,
+      "nodeCount": 2
+    },
+    {
+      "id": "fact",
+      "label": "Facts (Provenance-Tagged)",
+      "order": 2,
+      "nodeCount": 4
+    }
+  ],
+  "nodes": [
+    {
+      "id": "connector:jp.agencies",
+      "label": "jp.agencies",
+      "kind": "connector",
+      "layer": "connector",
+      "meta": {
+        "name": "Japan Public Agency Registry",
+        "objectType": "agency",
+        "status": "implemented"
+      }
+    },
+    {
+      "id": "connector:jp.geps",
+      "label": "jp.geps",
+      "kind": "connector",
+      "layer": "connector",
+      "meta": {
+        "name": "GEPS 落札実績オープンデータ",
+        "objectType": "tender",
+        "status": "implemented",
+        "repo": "https://github.com/kotoba-lang/goyoukiki"
+      }
+    },
+    {
+      "id": "connector:jp.kkj",
+      "label": "jp.kkj",
+      "kind": "connector",
+      "layer": "connector",
+      "meta": {
+        "name": "kkj.go.jp 官公需情報ポータル 検索API",
+        "objectType": "tender",
+        "status": "implemented",
+        "repo": "https://github.com/kotoba-lang/goyoukiki"
+      }
+    },
+    {
+      "id": "type:agency",
+      "label": "agency",
+      "kind": "object-type",
+      "layer": "object-type",
+      "meta": {
+        "name": "Procurement Agency",
+        "requiredAttributes": [
+          "jurisdiction",
+          "name"
+        ],
+        "key": [
+          "name"
+        ]
+      }
+    },
+    {
+      "id": "type:tender",
+      "label": "tender",
+      "kind": "object-type",
+      "layer": "object-type",
+      "meta": {
+        "name": "Procurement Tender / Opportunity",
+        "requiredAttributes": [
+          "status"
+        ],
+        "key": [
+          "status"
+        ]
+      }
+    },
+    {
+      "id": "fact:agency:ag-digital",
+      "label": "agency:ag-digital",
+      "kind": "fact",
+      "layer": "fact",
+      "meta": {
+        "id": "ag-digital",
+        "ontology/type": "agency",
+        "ontology/source": "jp.agencies",
+        "name": "Digital Agency",
+        "jurisdiction": "jp-national"
+      }
+    },
+    {
+      "id": "fact:agency:ag-tokyo",
+      "label": "agency:ag-tokyo",
+      "kind": "fact",
+      "layer": "fact",
+      "meta": {
+        "id": "ag-tokyo",
+        "ontology/type": "agency",
+        "ontology/source": "jp.agencies",
+        "name": "Tokyo Metropolitan Government",
+        "jurisdiction": "jp-tokyo"
+      }
+    },
+    {
+      "id": "fact:tender:geps-2026-042",
+      "label": "tender:geps-2026-042",
+      "kind": "fact",
+      "layer": "fact",
+      "meta": {
+        "id": "geps-2026-042",
+        "ontology/type": "tender",
+        "ontology/source": "jp.geps",
+        "ontology/fetched-at": "2026-11-27T00:00:00Z",
+        "ontology/confidence": 0.92,
+        "status": "awarded",
+        "title": "Municipal Open-Data Catalog Federation",
+        "jurisdiction": "jp-tokyo",
+        "amount": 8500000
+      }
+    },
+    {
+      "id": "fact:tender:kkj-2026-001",
+      "label": "tender:kkj-2026-001",
+      "kind": "fact",
+      "layer": "fact",
+      "meta": {
+        "id": "kkj-2026-001",
+        "ontology/type": "tender",
+        "ontology/source": "jp.kkj",
+        "ontology/fetched-at": "2026-11-27T00:00:00Z",
+        "ontology/confidence": 0.96,
+        "status": "open",
+        "title": "Content-Addressed Archive Gateway Pilot",
+        "jurisdiction": "jp-national",
+        "amount": 12000000
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "from": "connector:jp.agencies",
+      "to": "type:agency",
+      "label": "produces",
+      "kind": "provenance",
+      "meta": {
+        "connectorId": "jp.agencies",
+        "objectType": "agency"
+      }
+    },
+    {
+      "id": "e2",
+      "from": "connector:jp.geps",
+      "to": "type:tender",
+      "label": "produces",
+      "kind": "provenance",
+      "meta": {
+        "connectorId": "jp.geps",
+        "objectType": "tender"
+      }
+    },
+    {
+      "id": "e3",
+      "from": "connector:jp.kkj",
+      "to": "type:tender",
+      "label": "produces",
+      "kind": "provenance",
+      "meta": {
+        "connectorId": "jp.kkj",
+        "objectType": "tender"
+      }
+    },
+    {
+      "id": "e4",
+      "from": "type:tender",
+      "to": "type:agency",
+      "label": "tender_with_agency (agency_id=id)",
+      "kind": "join",
+      "meta": {
+        "joinName": "tender_with_agency",
+        "kind": "inner",
+        "matchedRows": 2,
+        "coverageRatio": 1
+      }
+    },
+    {
+      "id": "e5",
+      "from": "fact:agency:ag-digital",
+      "to": "type:agency",
+      "label": "ontology/type",
+      "kind": "instance",
+      "meta": {
+        "source": "jp.agencies"
+      }
+    },
+    {
+      "id": "e6",
+      "from": "fact:agency:ag-digital",
+      "to": "connector:jp.agencies",
+      "label": "ontology/source",
+      "kind": "provenance",
+      "meta": {
+        "source": "jp.agencies"
+      }
+    },
+    {
+      "id": "e7",
+      "from": "fact:agency:ag-tokyo",
+      "to": "type:agency",
+      "label": "ontology/type",
+      "kind": "instance",
+      "meta": {
+        "source": "jp.agencies"
+      }
+    },
+    {
+      "id": "e8",
+      "from": "fact:agency:ag-tokyo",
+      "to": "connector:jp.agencies",
+      "label": "ontology/source",
+      "kind": "provenance",
+      "meta": {
+        "source": "jp.agencies"
+      }
+    },
+    {
+      "id": "e9",
+      "from": "fact:tender:geps-2026-042",
+      "to": "type:tender",
+      "label": "ontology/type",
+      "kind": "instance",
+      "meta": {
+        "source": "jp.geps"
+      }
+    },
+    {
+      "id": "e10",
+      "from": "fact:tender:geps-2026-042",
+      "to": "connector:jp.geps",
+      "label": "ontology/source",
+      "kind": "provenance",
+      "meta": {
+        "source": "jp.geps"
+      }
+    },
+    {
+      "id": "e11",
+      "from": "fact:tender:kkj-2026-001",
+      "to": "type:tender",
+      "label": "ontology/type",
+      "kind": "instance",
+      "meta": {
+        "source": "jp.kkj"
+      }
+    },
+    {
+      "id": "e12",
+      "from": "fact:tender:kkj-2026-001",
+      "to": "connector:jp.kkj",
+      "label": "ontology/source",
+      "kind": "provenance",
+      "meta": {
+        "source": "jp.kkj"
+      }
+    },
+    {
+      "id": "e13",
+      "from": "fact:tender:geps-2026-042",
+      "to": "fact:agency:ag-tokyo",
+      "label": "tender_with_agency",
+      "kind": "join-instance",
+      "meta": {
+        "leftKey": "agency_id",
+        "rightKey": "id"
+      }
+    },
+    {
+      "id": "e14",
+      "from": "fact:tender:kkj-2026-001",
+      "to": "fact:agency:ag-digital",
+      "label": "tender_with_agency",
+      "kind": "join-instance",
+      "meta": {
+        "leftKey": "agency_id",
+        "rightKey": "id"
+      }
+    }
+  ],
+  "joins": [
+    {
+      "name": "tender_with_agency",
+      "leftType": "tender",
+      "rightType": "agency",
+      "leftKey": "agency_id",
+      "rightKey": "id",
+      "kind": "inner",
+      "leftCount": 2,
+      "rightCount": 2,
+      "matchedLeft": 2,
+      "matchedRows": 2,
+      "coverageRatio": 1
+    }
+  ],
+  "coverage": {
+    "byConnector": {
+      "jp.agencies": 2,
+      "jp.geps": 1,
+      "jp.kkj": 1
+    },
+    "byObjectType": {
+      "agency": 2,
+      "tender": 2
+    },
+    "byJurisdiction": {
+      "jp-national": 2,
+      "jp-tokyo": 2
+    },
+    "totalJoins": 1,
+    "totalMatchedJoinRows": 2
+  },
+  "truncated": false,
+  "edgesTruncated": false,
+  "graphCid": "bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq"
+}

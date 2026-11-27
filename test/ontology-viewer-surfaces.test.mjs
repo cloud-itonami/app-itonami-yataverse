@@ -7,6 +7,7 @@ import { buildOntologySnapshot, DEFAULT_BASE_IRI } from '../src/ontology.mjs';
 import {
   buildOntologyGraph,
   encodeOntologyGraphDagCbor,
+  renderOntologySvg,
   renderYataverseHomeHtml,
   createDefaultOntologySnapshot,
 } from '../src/ontology-viz.mjs';
@@ -112,21 +113,72 @@ test('Semantic UI contract: noun.verb operations, schemas, XSS-safe viewer, and 
   // Reusable src/ontology-viz.mjs canonical graph model + DAG-CBOR CID + home HTML
   const graph = buildOntologyGraph(snap);
   assert.equal(graph.schema, 'yataverse.ontology.graph/v1');
+  assert.equal(graph.version, 1);
+  assert.equal(graph.nodeCount, graph.nodes.length);
+  assert.equal(graph.meta.nodeCount, graph.nodes.length);
+  assert.equal(graph.meta.edgeCount, graph.edges.length);
   assert.ok(graph.layers.length >= 3);
   assert.ok(graph.nodes.length >= 4);
   assert.ok(graph.edges.length >= 4);
+  assert.ok(graph.edges.every((e) => typeof e.from === 'string' && typeof e.to === 'string'));
   assert.equal(graph.joins.length, 1);
   assert.equal(graph.joins[0].matchedRows, 1);
   assert.equal(graph.joins[0].coverageRatio, 1);
   const { cid: graphCid, bytes: graphBytes } = encodeOntologyGraphDagCbor(graph);
   assert.equal(checkWritableBlock(graphCid, graphBytes), null);
 
+  // Kotoba PR #1383 compatibility: exact match against checked-in canonical fixture & 7 operations
+  const fixture = JSON.parse(fs.readFileSync(path.resolve('test/fixtures/ontology-graph-v1.json'), 'utf8'));
+  const seededSnap = createDefaultOntologySnapshot();
+  const seededGraph = buildOntologyGraph(seededSnap);
+  const { cid: seededGraphCid } = encodeOntologyGraphDagCbor(seededGraph);
+  assert.deepEqual({ ...seededGraph, graphCid: seededGraphCid }, fixture);
+  assert.deepEqual(
+    ONTOLOGY_OPERATIONS.map((o) => o.operation).sort(),
+    [
+      'ontology.build',
+      'ontology.graph',
+      'ontology.inspect',
+      'ontology.query_sparql',
+      'ontology.query_sql',
+      'ontology.verify',
+      'ontology.view',
+    ],
+  );
+
+  // Standalone SVG MUST NOT put role="button" or tabindex on static elements
+  const standaloneSvg = renderOntologySvg(snap);
+  assert.ok(!/role="button"/.test(standaloneSvg), 'standalone SVG must not contain role="button"');
+  assert.ok(!/tabindex=/.test(standaloneSvg), 'standalone SVG must not contain tabindex');
+
+  // Viewer HTML G2 accessibility: ARIA tablist/tab/tabpanel, ArrowLeft/Right/Home/End, live screen state
+  assert.match(viewer.html, /role="tablist"/);
+  assert.match(viewer.html, /role="tab"[^>]*aria-selected="true"[^>]*aria-controls="yv-panel-graph"/);
+  assert.match(viewer.html, /role="tabpanel"[^>]*id="yv-panel-graph"/);
+  assert.match(viewer.html, /ArrowRight/);
+  assert.match(viewer.html, /ArrowLeft/);
+  assert.match(viewer.html, /Home/);
+  assert.match(viewer.html, /End/);
+  assert.match(viewer.html, /data-screen-id="yataverse\.ontology\.viewer"/);
+  assert.match(viewer.html, /data-status="ready"/);
+  assert.match(viewer.html, /data-active-tab="graph"/);
+  const screenStateMatch = /id="yataverse-screen-state">([\s\S]*?)<\/script>/.exec(viewer.html);
+  assert.ok(screenStateMatch, 'missing #yataverse-screen-state JSON');
+  const screenState = JSON.parse(screenStateMatch[1]);
+  assert.equal(screenState.screenId, 'yataverse.ontology.viewer');
+  assert.equal(screenState.status, 'ready');
+  assert.equal(screenState.activeTab, 'graph');
+  assert.equal(screenState.selectedNodeId, graph.nodes[0].id);
+  assert.equal(screenState.ops.length, 7);
+
   const graphOp = await invokeOntologyOperation('ontology.graph', { basisCid: snap.basisCid }, { snapshot: snap });
   assert.equal(graphOp.result.graphCid, graphCid);
 
-  const homeHtml = renderYataverseHomeHtml(createDefaultOntologySnapshot(), { schema });
+  const homeHtml = renderYataverseHomeHtml(seededSnap, { schema });
   assert.match(homeHtml, /\/ontology\/viewer/);
   assert.match(homeHtml, /\/ontology\/graph/);
+  assert.match(homeHtml, /id="yataverse-screen-state"/);
+  assert.ok(!/role="button"/.test(homeHtml), 'home landing static SVG must not contain role="button"');
   assert.ok(!FORBIDDEN_TOKENS.test(homeHtml));
 
   // Unknown operation or unknown input field fails closed

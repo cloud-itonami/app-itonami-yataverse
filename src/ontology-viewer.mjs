@@ -88,11 +88,14 @@ export const ONTOLOGY_OPERATIONS = Object.freeze([
     },
     outputSchema: {
       type: 'object',
-      required: ['schema', 'basisCid', 'graphCid', 'layers', 'nodes', 'edges', 'joins', 'coverage'],
+      required: ['schema', 'version', 'basisCid', 'graphCid', 'nodeCount', 'meta', 'layers', 'nodes', 'edges', 'joins', 'coverage'],
       properties: {
         schema: { type: 'string' },
+        version: { type: 'integer' },
         basisCid: BASIS_CID_PROP,
         graphCid: { type: 'string' },
+        nodeCount: { type: 'integer' },
+        meta: { type: 'object' },
         layers: { type: 'array' },
         nodes: { type: 'array' },
         edges: { type: 'array' },

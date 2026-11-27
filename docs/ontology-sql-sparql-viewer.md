@@ -32,7 +32,26 @@ Every ontology snapshot is stored as a content-addressed 5-block DAG-CBOR graph:
 
 ## 4. Reusable Visualization Library (`src/ontology-viz.mjs`) & Semantic UI (`noun.verb`) Viewer
 
-Visualization logic is factored into a standalone, zero-dependency ESM module (`src/ontology-viz.mjs`) that constructs a canonical layered graph model (`yataverse.ontology.graph/v1` with `nodes`, `edges`, `layers`, `joins`, and `coverage`), encodes it to canonical DAG-CBOR (`encodeOntologyGraphDagCbor`), and renders standalone SVG and interactive Semantic HTML5 viewers (SVG graph, clickable node detail inspector, SQL/SPARQL consoles, and external join coverage table).
+Visualization logic is factored into a standalone, zero-dependency ESM module (`src/ontology-viz.mjs`) that constructs a canonical layered graph model (`yataverse.ontology.graph/v1`), encodes it to canonical DAG-CBOR (`encodeOntologyGraphDagCbor`), and renders standalone SVG and interactive Semantic HTML5 viewers (ARIA `tablist`/`tab`/`tabpanel` with `ArrowLeft`/`ArrowRight`/`Home`/`End` keyboard navigation, live machine-readable `#yataverse-screen-state` JSON + `data-*` state attributes, clickable Node Detail Inspector, SQL/SPARQL consoles, and external join coverage table).
+
+### Canonical Graph Contract (`yataverse.ontology.graph/v1`, Kotoba Interop)
+
+Reference fixture: [`test/fixtures/ontology-graph-v1.json`](../test/fixtures/ontology-graph-v1.json)
+
+| Field | Type | Description |
+|---|---|---|
+| `schema` | `"yataverse.ontology.graph/v1"` | Versioned graph schema identifier |
+| `version` | `1` | Schema major version |
+| `basisCid` | `string` (CIDv1) | Pinned root CID of the verified ontology snapshot |
+| `nodeCount` | `integer` | Number of nodes in `nodes` |
+| `meta` | `object` | `{ id, snapshotSchema, stats, nodeCount, edgeCount, layerCount, truncated, edgesTruncated }` |
+| `layers` | `array` | Ordered layers `{ id, label, order, nodeCount }` |
+| `nodes` | `array` | `{ id, label, kind, layer, meta }` |
+| `edges` | `array` | `{ id, from, to, label, kind, meta }` |
+| `joins` | `array` | External join coverage `{ name, leftType, rightType, leftKey, rightKey, kind, leftCount, rightCount, matchedLeft, matchedRows, coverageRatio }` |
+| `coverage` | `object` | `{ byConnector, byObjectType, byJurisdiction, totalJoins, totalMatchedJoinRows }` |
+
+Standalone SVG output (`renderOntologySvg` with default `interactive: false`) omits `role="button"` and `tabindex` on static graph nodes; interactive keyboard/button roles are emitted only inside the interactive Viewer HTML (`interactive: true`).
 
 All viewer and API actions follow the `noun.verb` contract with machine-readable JSON Schemas (`src/ontology-viewer.mjs`):
 
