@@ -51,7 +51,7 @@ Reference fixture: [`test/fixtures/ontology-graph-v1.json`](../test/fixtures/ont
 | `joins` | `array` | External join coverage `{ name, leftType, rightType, leftKey, rightKey, kind, leftCount, rightCount, matchedLeft, matchedRows, coverageRatio }` |
 | `coverage` | `object` | `{ byConnector, byObjectType, byJurisdiction, totalJoins, totalMatchedJoinRows }` |
 
-### Canonical Array Ordering & `graphCid` Verification Contract (KotobaSpec v1.0, 2026-11-27)
+### Canonical Array Ordering & `graphCid` Verification Contract (KotobaSpec v1.0.1, 2026-11-27)
 
 `graphCid` is the **CIDv1 (`dag-cbor` `0x71`, `sha2-256`)** of the canonical DAG-CBOR encoding of the `yataverse.ontology.graph/v1` body (excluding the outer `graphCid` field itself).
 
@@ -59,9 +59,9 @@ Reference fixture: [`test/fixtures/ontology-graph-v1.json`](../test/fixtures/ont
 - Safe integers (e.g. `version: 1`, `coverageRatio: 1`) encode as CBOR integers.
 - Non-integer finite decimals (e.g. `ontology/confidence: 0.92`, `0.96`, `coverageRatio: 0.5`) NEVER encode as CBOR floats; they encode as `{"$awaiType": "decimal", "value": "<canonical-decimal-string>"}` (`NaN` / `±Infinity` refused).
 
-**String Ordering Distinction**:
-- **Array element sorting** uses locale-independent **UTF-16 code-unit order** (`a < b ? -1 : a > b ? 1 : 0`, `compareCodeUnits`): e.g. `U+10000` (`0xD800 0xDC00`) sorts **before** `U+E000` (`0xE000`).
-- **DAG-CBOR map key sorting** uses RFC 8949 / IPLD DAG-CBOR **length-first UTF-8 byte order**: e.g. `U+E000` (3 UTF-8 bytes) sorts **before** `U+10000` (4 UTF-8 bytes).
+**Two-Layer String Ordering Separation**:
+- **Array element sorting** uses locale-independent **UTF-16 code-unit lexicographical order** (`a < b ? -1 : a > b ? 1 : 0`, `compareCodeUnits`, Clojure `compare`): e.g. `U+10000` (`"\uD800\uDC00"`) sorts **before** `U+E000` (`"\uE000"`).
+- **DAG-CBOR map key sorting** uses RFC 8949 / IPLD DAG-CBOR **UTF-8 byte length ascending, then unsigned UTF-8 byte order**: `"\uE000"` (3B: `EE 80 80`) → `"\uE000a"` (4B: `EE 80 80 61`) → `"\uD800\uDC00"` (4B: `F0 90 80 80`). Non-canonical UTF-16 key order in CBOR bytes is rejected with `map-keys-not-sorted`.
 
 Because DAG-CBOR encodes arrays in exact element order, **the array ordering of `layers`, `nodes`, `edges`, and `joins` is cryptographically bound into `graphCid`**:
 
@@ -78,11 +78,12 @@ Because DAG-CBOR encodes arrays in exact element order, **the array ordering of 
    - Fact-to-fact `join-instance` edges in `joinMappings` `name` order, then included left-fact order, then included right-fact order
 4. **`joins`**: sorted in UTF-16 code-unit ascending order by join `name`.
 
-**Fail-closed verification & `graphVerification` vs `basisVerification` (`verifyOntologyGraphCid`)**:
+**Fail-Closed Verification & Two-Axis Separation (`verifyOntologyGraphCid` vs `verifyOntologySnapshot`)**:
 - Any external consumer/renderer receiving a `yataverse.ontology.graph/v1` payload carrying `graphCid` MUST verify that `encodeOntologyGraphDagCbor(graph).cid === graph.graphCid` (automatically enforced by `verifyOntologyGraphCid` and `renderOntologySvg`).
-- Reordering any array (for example sorting `edges` lexicographically as `e1, e10, e11, ..., e2`) while retaining the original `graphCid` MUST fail closed with `OntologyError('graph-cid-mismatch')`.
+- Reordering any array (for example sorting `edges` lexicographically as `e1, e10, e11, ..., e2` or reversing UTF-16 node order) while retaining the original `graphCid` MUST fail closed with `OntologyError('graph-cid-mismatch')`.
 - Any transform/filter/projection output MUST recompute a fresh `graphCid` from the output body and never reuse an input `graphCid`.
-- `verifyOntologyGraphCid` explicitly separates `graphVerification` (`status: 'verified'`) from `basisVerification` (`status: 'unverified-by-graph-check'` by default): verifying `graphCid` authenticates the graph payload only and does NOT imply that the underlying `basisCid` snapshot block closure was verified (which requires `verifyOntologySnapshot`).
+- `verifyOntologyGraphCid` returns `{ verified: true, graphCidVerified: true, basisCidVerified: false, verificationScope: 'graph-cid-only', graphVerification, basisVerification, ... }` by default: a matching `graphCid` authenticates ONLY the graph payload and NEVER marks the underlying `basisCid` snapshot body verified (full snapshot block closure verification is the separate responsibility of `verifyOntologySnapshot`).
+- **Wire non-inclusion**: verification status fields (`graphCidVerified`, `basisCidVerified`, `verificationScope`, `graphVerification`, `basisVerification`) live strictly on verification return values / internal metadata and MUST NEVER be mixed into the `yataverse.ontology.graph/v1` wire JSON or `graphCid`-hashed body.
 - Reference fixture `test/fixtures/ontology-graph-v1.json` binds `basisCid = bafyreiguv25njqmgq3nksfula2pkkflztdcltyrc4jzo3gv4yonfnfa4em` to `graphCid = bafyreie3xwjslrn6pyi67spmdclzdqtdqq3xkpo5oz6nt7b6almfid72pq` (lexicographically reordered `e1,e10,...` graph hashes to `bafyreid2ie7idv5vljfojdocazd4a4zqixz7di2nshjvvdbkknnitrye2i`).
 
 Standalone SVG output (`renderOntologySvg` with default `interactive: false`) omits `role="button"` and `tabindex` on static graph nodes; interactive keyboard/button roles are emitted only inside the interactive Viewer HTML (`interactive: true`).

@@ -13,7 +13,8 @@ import {
   createDefaultOntologySnapshot,
 } from '../src/ontology-viz.mjs';
 import { checkWritableBlock } from '../src/block.mjs';
-import { encodeDagCbor, decodeDagCbor } from '../src/dag-cbor.mjs';
+import { encodeDagCbor, decodeDagCbor, validateDagCbor } from '../src/dag-cbor.mjs';
+import { cidFor, CODEC_DAG_CBOR } from '../src/cid.mjs';
 import { toDagCborSafe, compareCodeUnits } from '../src/ontology.mjs';
 import {
   ONTOLOGY_OPERATIONS,
@@ -152,11 +153,21 @@ test('Semantic UI contract: noun.verb operations, schemas, XSS-safe viewer, and 
   const verifiedFixture = verifyOntologyGraphCid(fixture);
   assert.equal(verifiedFixture.verified, true);
   assert.equal(verifiedFixture.graphCid, EXPECTED_FIXTURE_GRAPH_CID);
-  // Kougi condition (2): graphVerification vs basisVerification MUST be distinct
+  // KotobaSpec v1.0.1: two-axis verification separation & wire non-inclusion
+  assert.equal(verifiedFixture.graphCidVerified, true);
+  assert.equal(verifiedFixture.basisCidVerified, false);
+  assert.equal(verifiedFixture.verificationScope, 'graph-cid-only');
   assert.equal(verifiedFixture.graphVerification.status, 'verified');
   assert.equal(verifiedFixture.basisVerification.status, 'unverified-by-graph-check');
   assert.equal(verifiedFixture.basisVerification.basisCid, fixture.basisCid);
-  assert.equal(verifyOntologyGraphCid(fixture, { basisVerified: true }).basisVerification.status, 'verified');
+  for (const internalField of ['graphCidVerified', 'basisCidVerified', 'verificationScope', 'graphVerification', 'basisVerification']) {
+    assert.equal(Object.hasOwn(fixture, internalField), false, `wire graph must not contain ${internalField}`);
+    assert.equal(Object.hasOwn(seededGraph, internalField), false, `wire graph must not contain ${internalField}`);
+  }
+  const verifiedBoth = verifyOntologyGraphCid(fixture, { basisVerified: true });
+  assert.equal(verifiedBoth.basisCidVerified, true);
+  assert.equal(verifiedBoth.verificationScope, 'graph-and-basis');
+  assert.equal(verifiedBoth.basisVerification.status, 'verified');
 
   // Rendering external fixture SVG succeeds when graphCid matches
   const fixtureSvg = renderOntologySvg(fixture);
@@ -203,13 +214,15 @@ test('Semantic UI contract: noun.verb operations, schemas, XSS-safe viewer, and 
   );
   const emptyCid = encodeOntologyGraphDagCbor(emptyLayersGraph).cid;
   assert.notEqual(emptyCid, EXPECTED_FIXTURE_GRAPH_CID);
-  assert.equal(verifyOntologyGraphCid({ ...emptyLayersGraph, graphCid: emptyCid }).graphVerification.status, 'verified');
+  assert.equal(verifyOntologyGraphCid({ ...emptyLayersGraph, graphCid: emptyCid }).graphCidVerified, true);
 
-  // Kougi condition (1): UTF-16 code-unit array order (U+10000 before U+E000)
-  // vs DAG-CBOR map key order (U+E000 [3 UTF-8 bytes] before U+10000 [4 UTF-8 bytes])
-  const u10000 = '\u{10000}';
-  const uE000 = '\uE000';
+  // KotobaSpec v1.0.1 mandatory 4 Unicode ordering tests (a)-(d):
+  const u10000 = '\uD800\uDC00'; // U+10000 (UTF-16: 0xD800 0xDC00; UTF-8 4B: F0 90 80 80)
+  const uE000 = '\uE000';        // U+E000  (UTF-16: 0xE000;        UTF-8 3B: EE 80 80)
+  const uE000a = '\uE000a';      // U+E000+'a' (UTF-8 4B: EE 80 80 61)
   assert.equal(compareCodeUnits(u10000, uE000), -1);
+
+  // (a) Array sort UTF-16 positive: [...U+10000..., ...U+E000...] deterministic bytes & CID match
   const unicodeSnap = buildOntologySnapshot({
     id: 'unicode-order-fixture',
     facts: [
@@ -220,10 +233,44 @@ test('Semantic UI contract: noun.verb operations, schemas, XSS-safe viewer, and 
   const unicodeGraph = buildOntologyGraph(unicodeSnap);
   const factNodeIds = unicodeGraph.nodes.filter((n) => n.layer === 'fact').map((n) => n.id);
   assert.deepEqual(factNodeIds, [`fact:tender:${u10000}`, `fact:tender:${uE000}`]);
-  const unicodeCbor = decodeDagCbor(encodeDagCbor(toDagCborSafe({ [u10000]: 1, [uE000]: 2 }))).value;
-  assert.deepEqual([...unicodeCbor.keys()], [uE000, u10000]);
-  const decodedUnicodeGraph = decodeDagCbor(encodeOntologyGraphDagCbor(unicodeGraph).bytes).value;
+  const { cid: unicodeGraphCid, bytes: unicodeGraphBytes } = encodeOntologyGraphDagCbor(unicodeGraph);
+  const unicodeWire = { ...unicodeGraph, graphCid: unicodeGraphCid };
+  const unicodeVerified = verifyOntologyGraphCid(unicodeWire);
+  assert.equal(unicodeVerified.graphCidVerified, true);
+  assert.equal(unicodeVerified.basisCidVerified, false);
+  assert.equal(unicodeVerified.verificationScope, 'graph-cid-only');
+  assert.deepEqual(unicodeVerified.bytes, unicodeGraphBytes);
+
+  // (b) Array sort UTF-16 negative: [...U+E000..., ...U+10000...] with stale graphCid -> graph-cid-mismatch
+  const nonFactNodes = unicodeGraph.nodes.filter((n) => n.layer !== 'fact');
+  const reversedFactNodes = unicodeGraph.nodes.filter((n) => n.layer === 'fact').reverse();
+  const reorderedUnicodeWire = { ...unicodeWire, nodes: [...nonFactNodes, ...reversedFactNodes] };
+  assert.throws(
+    () => verifyOntologyGraphCid(reorderedUnicodeWire),
+    (e) => e.code === 'graph-cid-mismatch',
+  );
+  assert.throws(
+    () => renderOntologySvg(reorderedUnicodeWire),
+    (e) => e.code === 'graph-cid-mismatch',
+  );
+
+  // (c) DAG-CBOR map key UTF-8 positive: "\uE000" (3B) -> "\uE000a" (4B EE 80 80 61) -> "\uD800\uDC00" (4B F0 90 80 80)
+  const mapObj = { [u10000]: 3, [uE000a]: 2, [uE000]: 1 };
+  const mapBytes = encodeDagCbor(toDagCborSafe(mapObj));
+  const mapCid = cidFor(mapBytes, CODEC_DAG_CBOR);
+  assert.equal(checkWritableBlock(mapCid, mapBytes), null);
+  const decodedMap = decodeDagCbor(mapBytes).value;
+  assert.deepEqual([...decodedMap.keys()], [uE000, uE000a, u10000]);
+  const decodedUnicodeGraph = decodeDagCbor(unicodeGraphBytes).value;
   assert.deepEqual([...decodedUnicodeGraph.get('coverage').get('byJurisdiction').keys()], [uE000, u10000]);
+
+  // (d) Non-canonical UTF-16 key order in raw CBOR bytes (4B U+10000 before 3B U+E000) -> map-keys-not-sorted
+  const nonCanonicalUtf16Cbor = Buffer.from('a264f09080800163ee808002', 'hex');
+  assert.equal(validateDagCbor(nonCanonicalUtf16Cbor), 'map-keys-not-sorted');
+  assert.throws(() => decodeDagCbor(nonCanonicalUtf16Cbor), (e) => e.code === 'map-keys-not-sorted');
+  // Also same-length 4B keys out of UTF-8 unsigned byte order (F0 90 80 80 before EE 80 80 61) -> map-keys-not-sorted
+  const nonCanonicalSameLenCbor = Buffer.from('a264f09080800164ee80806102', 'hex');
+  assert.equal(validateDagCbor(nonCanonicalSameLenCbor), 'map-keys-not-sorted');
   assert.deepEqual(
     ONTOLOGY_OPERATIONS.map((o) => o.operation).sort(),
     [

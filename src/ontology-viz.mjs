@@ -678,6 +678,9 @@ export function verifyOntologyGraphCid(graph, { expectedGraphCid = null, basisVe
   }
   return {
     verified: true,
+    graphCidVerified: true,
+    basisCidVerified: Boolean(basisVerified),
+    verificationScope: basisVerified ? 'graph-and-basis' : 'graph-cid-only',
     graphCid: computedCid,
     basisCid: graph.basisCid ?? null,
     graphVerification: {
